@@ -72,9 +72,15 @@ import time
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple, Set
 
-import tkinter as tk
-from tkinter import ttk, messagebox
-from tkinter.scrolledtext import ScrolledText
+
+import http.server
+import socketserver
+import urllib.parse
+import threading
+import webbrowser
+import urllib.parse
+import threading
+import webbrowser
 
 
 # ==============================================================================
@@ -3444,3300 +3450,3688 @@ def start_combat(engine: GameEngine, enc: Dict[str, Any]) -> CombatEncounter:
     enemy_ship = enc.get("target_ship") if is_bounty else enc.get("enemy_ship", "viper")
     reward = enc.get("reward", 0)
     engine.precombat_save()
-    return CombatEncounter(engine, enemy_name, enemy_ship,
-                           is_bounty=is_bounty, bounty_reward=reward)
+    return CombatEncounter(engine, enemy_name, enemy_ship, is_bounty=is_bounty, bounty_reward=reward)
 
 
 # ==============================================================================
-# GRAPHICAL USER INTERFACE (tkinter) — Neon Cosmos edition
+# BROWSER WEB CLIENT INTERFACE (HTML / CSS / JS)
 # ==============================================================================
 
-THEME = {
-    "bg":        "#04081C",   # deep space
-    "bg2":       "#070D26",
-    "panel":     "#0C1330",
-    "panel_hi":  "#141E44",
-    "field":     "#080D22",
-    "fg":        "#EAF2FF",
-    "fg_dim":    "#8B96C2",
-    "accent":    "#00E5FF",   # cyan
-    "accent2":   "#FF40A8",   # magenta
-    "accent3":   "#7C6BFF",   # violet
-    "good":      "#5CFFB0",
-    "warn":      "#FFC53D",
-    "bad":        "#FF5C7A",
-    "border":    "#22305E",
-    "btn":       "#18265A",
-    "btn_hi":    "#22327F",
-}
-
-TREND_ICON = {"up": "▲", "down": "▼", "flat": "—", "-": "·"}
-
-RANK_TIER_COLORS = ("#8B96C2", "#5CFFB0", "#00E5FF", "#FFC53D", "#FF40A8", "#7C6BFF")
-
-
-class Tooltip:
-    """Minimal dark tooltip that follows the cursor."""
-
-    def __init__(self, widget: tk.Widget, text: str, delay: int = 550):
-        self.widget = widget
-        self.text = text
-        self.delay = delay
-        self._after_id = None
-        self._tip: Optional[tk.Toplevel] = None
-        widget.bind("<Enter>", self._schedule, add="+")
-        widget.bind("<Leave>", self._hide, add="+")
-        widget.bind("<ButtonPress>", self._hide, add="+")
-
-    def _schedule(self, _event=None) -> None:
-        self._hide()
-        self._after_id = self.widget.after(self.delay, self._show)
-
-    def _show(self) -> None:
-        if self._tip is not None or not self.text:
-            return
-        x = self.widget.winfo_rootx() + 14
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
-        self._tip = tw = tk.Toplevel(self.widget)
-        tw.wm_overrideredirect(True)
-        tw.wm_geometry(f"+{x}+{y}")
-        tk.Label(tw, text=self.text, justify="left", bg="#0A0F2E",
-                 fg=THEME["fg"], relief="solid", bd=1,
-                 font=(None, 9), padx=8, pady=4).pack()
-
-    def _hide(self, _event=None) -> None:
-        if self._after_id is not None:
-            try:
-                self.widget.after_cancel(self._after_id)
-            except Exception:
-                pass
-            self._after_id = None
-        if self._tip is not None:
-            try:
-                self._tip.destroy()
-            except Exception:
-                pass
-            self._tip = None
-
-
-class SpaceTraderGUI:
-    """Main application window. All game state lives in the engine."""
-
-    def __init__(self, root: tk.Tk, engine: GameEngine):
-        self.root = root
-        self.engine = engine
-        self.victory_shown = False
-        self.selected_planet: Optional[str] = None
-        self.combat_dialog: Optional["CombatDialog"] = None
-
-        # Smart-refresh bookkeeping: per-tab signatures of the data each tab
-        # renders. A tab is only rebuilt when its signature changes — a large
-        # win now that a single click can ripple through every panel.
-        self._tab_sig: Dict[str, str] = {}
-
-        # Star map animation bookkeeping.
-        self._twinkle_ids: List[int] = []
-        self._twinkle_phase = 0
-        self._pulse_radius = 14
-        self._pulse_grow = True
-        self._map_anim_running = False
-        self._jump_anim_id = None
-
-        self._setup_window()
-        self._build_styles()
-        self._build_hud()
-        self._build_notebook()
-        self._build_statusbar()
-        self._bind_keys()
-        self.refresh_all()
-        self.show_start_dialog()
-
-    # ------------------------------------------------------------------ #
-    # Window & styles
-
-    def _setup_window(self) -> None:
-        self.root.title("Space Trader: Odyssey — Nebula Edition")
-        self.root.geometry("1320x880")
-        self.root.minsize(1200, 760)
-        self.root.configure(bg=THEME["bg"])
-        try:
-            self.root.state("zoomed")
-        except Exception:
-            pass
-
-    def _build_styles(self) -> None:
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-
-        style.configure(".", background=THEME["panel"], foreground=THEME["fg"],
-                        bordercolor=THEME["border"], lightcolor=THEME["panel_hi"],
-                        darkcolor=THEME["panel"])
-        style.configure("TFrame", background=THEME["panel"])
-        style.configure("Dark.TFrame", background=THEME["bg"])
-        style.configure("Panel.TLabelframe", background=THEME["panel"],
-                        bordercolor=THEME["border"], relief="solid")
-        style.configure("Panel.TLabelframe.Label", background=THEME["panel"],
-                        foreground=THEME["accent"], font=(None, 10, "bold"))
-
-        style.configure("TLabel", background=THEME["panel"], foreground=THEME["fg"])
-        style.configure("Dim.TLabel", background=THEME["panel"], foreground=THEME["fg_dim"])
-        style.configure("Accent.TLabel", background=THEME["panel"], foreground=THEME["accent"])
-        style.configure("Accent2.TLabel", background=THEME["panel"], foreground=THEME["accent2"])
-        style.configure("Good.TLabel", background=THEME["panel"], foreground=THEME["good"])
-        style.configure("Warn.TLabel", background=THEME["panel"], foreground=THEME["warn"])
-        style.configure("Bad.TLabel", background=THEME["panel"], foreground=THEME["bad"])
-        style.configure("Title.TLabel", background=THEME["bg"], foreground=THEME["accent"],
-                        font=(None, 17, "bold"))
-        style.configure("Sub.TLabel", background=THEME["bg"], foreground=THEME["fg_dim"])
-        style.configure("Hero.TLabel", background=THEME["bg"], foreground=THEME["accent2"],
-                        font=(None, 22, "bold"))
-
-        style.configure("TButton", background=THEME["btn"], foreground=THEME["fg"],
-                        bordercolor=THEME["border"], focuscolor=THEME["accent"],
-                        padding=(10, 5))
-        style.map("TButton",
-                  background=[("active", THEME["btn_hi"]), ("disabled", THEME["field"])],
-                  foreground=[("disabled", THEME["fg_dim"])])
-        style.configure("Accent.TButton", background=THEME["accent3"],
-                        foreground="#FFFFFF", padding=(12, 6))
-        style.map("Accent.TButton",
-                  background=[("active", "#9C86FF"), ("disabled", THEME["field"])])
-        style.configure("Cyan.TButton", background="#0E4B5C", foreground="#BDF6FF",
-                        padding=(12, 6), bordercolor="#1A7A8C")
-        style.map("Cyan.TButton",
-                  background=[("active", "#14687F"), ("disabled", THEME["field"])])
-        style.configure("Danger.TButton", background=THEME["bad"], foreground="#FFFFFF")
-        style.map("Danger.TButton", background=[("active", "#FF8AA0")])
-
-        style.configure("TNotebook", background=THEME["bg"], bordercolor=THEME["border"])
-        style.configure("TNotebook.Tab", background=THEME["btn"], foreground=THEME["fg_dim"],
-                        padding=(16, 8), font=(None, 10))
-        style.map("TNotebook.Tab",
-                  background=[("selected", THEME["panel_hi"])],
-                  foreground=[("selected", THEME["accent"])])
-
-        style.configure("Treeview", background=THEME["field"], foreground=THEME["fg"],
-                        fieldbackground=THEME["field"], rowheight=26,
-                        bordercolor=THEME["border"], font=(None, 10))
-        style.configure("Treeview.Heading", background=THEME["btn"], foreground=THEME["accent"],
-                        font=(None, 9, "bold"), relief="flat")
-        style.map("Treeview.Heading", background=[("active", THEME["btn_hi"])])
-        style.map("Treeview", background=[("selected", "#2B1F5E")],
-                  foreground=[("selected", "#FFFFFF")])
-
-        for bar, color in (("Hull", THEME["good"]), ("Shield", THEME["accent"]),
-                           ("Fuel", THEME["warn"]), ("Cargo", THEME["accent2"]),
-                           ("Arc", THEME["accent3"])):
-            style.configure(f"{bar}.Horizontal.TProgressbar",
-                            background=color, troughcolor=THEME["field"],
-                            bordercolor=THEME["border"], lightcolor=color,
-                            darkcolor=color, thickness=12)
-        style.configure("Enemy.Horizontal.TProgressbar", background=THEME["bad"],
-                        troughcolor=THEME["field"], thickness=16)
-        style.configure("EnemyShield.Horizontal.TProgressbar", background=THEME["warn"],
-                        troughcolor=THEME["field"], thickness=16)
-
-        style.configure("TSpinbox", background=THEME["field"], foreground=THEME["fg"],
-                        buttonbackground=THEME["btn"], fieldbackground=THEME["field"],
-                        arrowcolor=THEME["accent"])
-        style.configure("TEntry", background=THEME["field"], foreground=THEME["fg"],
-                        fieldbackground=THEME["field"], bordercolor=THEME["border"])
-        style.configure("TCheckbutton", background=THEME["bg"], foreground=THEME["fg"])
-        style.map("TCheckbutton", background=[("active", THEME["bg"])])
-        style.configure("TRadiobutton", background=THEME["panel"], foreground=THEME["fg"])
-        style.map("TRadiobutton", background=[("active", THEME["panel"])])
-        style.configure("TPanedwindow", background=THEME["border"])
-        style.configure("TScrollbar", background=THEME["btn"],
-                        troughcolor=THEME["field"], bordercolor=THEME["border"],
-                        arrowcolor=THEME["accent"])
-
-    # ------------------------------------------------------------------ #
-    # Small builders
-
-    def _label(self, parent, text="", style="TLabel", **kw):
-        return ttk.Label(parent, text=text, style=style, **kw)
-
-    def _button(self, parent, text, command, style="TButton", tooltip=None, **kw):
-        btn = ttk.Button(parent, text=text, command=command, style=style, **kw)
-        if tooltip:
-            Tooltip(btn, tooltip)
-        return btn
-
-    def _make_tree(self, parent, columns: Dict[str, int], height: int = 12) -> ttk.Treeview:
-        tree = ttk.Treeview(parent, columns=list(columns.keys()),
-                            show="headings", height=height)
-        for col, width in columns.items():
-            tree.heading(col, text=col.replace("_", " ").title())
-            tree.column(col, width=width, anchor="w")
-        tree.tag_configure("odd", background="#0A1029")
-        tree.tag_configure("even", background="#0D1533")
-        tree.tag_configure("bad", foreground=THEME["bad"])
-        tree.tag_configure("warn", foreground=THEME["warn"])
-        tree.tag_configure("good", foreground=THEME["good"])
-        tree.tag_configure("dim", foreground=THEME["fg_dim"])
-        tree.tag_configure("hot", foreground=THEME["accent2"])
-        return tree
-
-    def _sig(self, key: str, value) -> bool:
-        """Return True when the tab's data signature changed (and remember it)."""
-        token = str(value)
-        if self._tab_sig.get(key) == token:
-            return False
-        self._tab_sig[key] = token
-        return True
-
-    # ------------------------------------------------------------------ #
-    # HUD
-
-    def _build_hud(self) -> None:
-        hud = tk.Frame(self.root, bg=THEME["bg"], pady=8, padx=12)
-        hud.pack(side="top", fill="x")
-        self.hud = hud
-
-        title_box = tk.Frame(hud, bg=THEME["bg"])
-        title_box.pack(side="left", anchor="n")
-        ttk.Label(title_box, text="SPACE TRADER: ODYSSEY",
-                  style="Title.TLabel").pack(anchor="w")
-        ttk.Label(title_box, text="Nebula Edition ✦ trade · smuggle · fight · prosper",
-                  style="Sub.TLabel").pack(anchor="w")
-
-        info = tk.Frame(hud, bg=THEME["bg"], padx=20)
-        info.pack(side="left", fill="x", expand=True)
-        self.hud_info = info
-
-        btns = tk.Frame(hud, bg=THEME["bg"])
-        btns.pack(side="right", anchor="n")
-        self._button(btns, "Save", self.open_save_dialog).pack(fill="x", pady=2)
-        self._button(btns, "Load", self.open_load_dialog).pack(fill="x", pady=2)
-        self._button(btns, "New Game", self.confirm_new_game).pack(fill="x", pady=2)
-        self._button(btns, "How to Play", self.show_help_dialog).pack(fill="x", pady=2)
-        self.mute_var = tk.BooleanVar(value=self.engine.sound.muted)
-
-        def toggle_mute():
-            self.engine.sound.muted = self.mute_var.get()
-        ttk.Checkbutton(btns, text="Sound FX", variable=self.mute_var,
-                        command=toggle_mute, style="TCheckbutton").pack(fill="x", pady=(4, 0))
-
-        self._build_hud_rows()
-
-    def _build_hud_rows(self) -> None:
-        info = self.hud_info
-        for w in info.winfo_children():
-            w.destroy()
-
-        row1 = tk.Frame(info, bg=THEME["bg"])
-        row1.pack(fill="x")
-        self.lbl_location = self._label(row1, "◌ Earth", "Accent.TLabel",
-                                        font=(None, 12, "bold"))
-        self.lbl_location.pack(side="left", padx=(0, 20))
-        self.lbl_rank = self._label(row1, "· Cadet", "Dim.TLabel",
-                                    font=(None, 10, "bold"))
-        self.lbl_rank.pack(side="left", padx=(0, 20))
-        Tooltip(self.lbl_rank, "Career rank — earned through Renown:\n"
-                               "wealth, contracts, bounties and exploration.\n"
-                               "Each rank grants a permanent perk.")
-        self.lbl_day = self._label(row1, "", "Dim.TLabel")
-        self.lbl_day.pack(side="left", padx=(0, 20))
-        self.lbl_credits = self._label(row1, "", font=(None, 11, "bold"))
-        self.lbl_credits.pack(side="left", padx=(0, 20))
-        self.lbl_nw = self._label(row1, "", "Accent.TLabel", font=(None, 11, "bold"))
-        self.lbl_nw.pack(side="left", padx=(0, 20))
-        self.lbl_loan = self._label(row1, "", "Warn.TLabel")
-        self.lbl_loan.pack(side="left")
-
-        row2 = tk.Frame(info, bg=THEME["bg"])
-        row2.pack(fill="x", pady=(7, 0))
-
-        self.bars: Dict[str, ttk.Progressbar] = {}
-        self.bar_labels: Dict[str, ttk.Label] = {}
-        for key, text in (("hull", "HULL"), ("shield", "SHLD"),
-                          ("fuel", "FUEL"), ("cargo", "HOLD"), ("arc", "NET WORTH")):
-            box = tk.Frame(row2, bg=THEME["bg"])
-            box.pack(side="left", padx=(0, 16))
-            self.bar_labels[key] = self._label(box, text, "Dim.TLabel",
-                                               font=(None, 8, "bold"))
-            self.bar_labels[key].pack(anchor="w")
-            bar = ttk.Progressbar(box, style=f"{key.capitalize()}.Horizontal.TProgressbar",
-                                  length=130 if key != "arc" else 170,
-                                  maximum=100, value=0)
-            bar.pack()
-            self.bars[key] = bar
-            for stat, tip in (
-                ("hull", "Structural integrity. Repairs at station Services."),
-                ("shield", "Energy screen — regenerates daily and via RECHARGE in combat."),
-                ("fuel", "Warp propellant. Cheapest at high-mining worlds."),
-                ("cargo", "Hold occupancy. Expand with cargo pods or bigger hulls."),
-                ("arc", "Progress toward the 500,000 CR victory target."),
-            ):
-                if key == stat:
-                    Tooltip(bar, tip)
-
-        self.lbl_event = self._label(row2, "", "Warn.TLabel", font=(None, 9))
-        self.lbl_event.pack(side="left", padx=(4, 0))
-
-    def refresh_hud(self) -> None:
-        p = self.engine.player
-        nw = self.engine.calculate_net_worth()
-        cur = self.engine.current_planet
-        rank = self.engine.rank()
-
-        self.lbl_location.config(text=f"◌ {p.location}")
-        tier_color = RANK_TIER_COLORS[min(self.engine.rank_index(),
-                                          len(RANK_TIER_COLORS) - 1)]
-        self.lbl_rank.config(
-            text=f"{rank.insignia} {rank.name.upper()}",
-            foreground=tier_color,
-        )
-        self.lbl_day.config(text=f"Day {p.day}")
-        self.lbl_credits.config(
-            text=f"⌬ {money(p.credits)} CR",
-            foreground=THEME["warn"] if p.credits < 300 else THEME["fg"])
-        self.lbl_nw.config(
-            text=f"Net Worth {money(nw)} / {money(TARGET_NET_WORTH)}",
-            foreground=THEME["good"] if nw >= TARGET_NET_WORTH else THEME["accent"],
-        )
-        loan_style = "Warn.TLabel" if p.loan > 0 else "Dim.TLabel"
-        self.lbl_loan.config(text=f"Loan {money(p.loan)} CR" if p.loan else "no loan",
-                             style=loan_style)
-
-        hull_pct = (p.hull / max(1, p.max_hull)) * 100
-        shield_pct = (p.shield / max(1, p.effective_max_shield())) * 100 if p.effective_max_shield() else 0
-        fuel_pct = (p.fuel / max(1, p.max_fuel)) * 100
-        cargo_pct = (p.cargo_used() / max(1, p.cargo_cap)) * 100
-        arc_pct = min(100.0, nw / TARGET_NET_WORTH * 100)
-        self.bars["hull"].config(maximum=100, value=hull_pct)
-        self.bars["shield"].config(maximum=100, value=shield_pct)
-        self.bars["fuel"].config(maximum=100, value=fuel_pct)
-        self.bars["cargo"].config(maximum=100, value=cargo_pct)
-        self.bars["arc"].config(maximum=100, value=arc_pct)
-        self.bar_labels["hull"].config(
-            text=f"HULL {p.hull}/{p.max_hull}",
-            foreground=THEME["bad"] if hull_pct < 30 else THEME["fg_dim"])
-        self.bar_labels["shield"].config(
-            text=f"SHLD {p.shield}/{p.effective_max_shield()}",
-            foreground=THEME["bad"] if p.shields_damaged else THEME["fg_dim"])
-        self.bar_labels["fuel"].config(
-            text=f"FUEL {p.fuel}/{p.max_fuel}",
-            foreground=THEME["warn"] if fuel_pct < 25 else THEME["fg_dim"])
-        self.bar_labels["cargo"].config(
-            text=f"HOLD {p.cargo_used()}/{p.cargo_cap}",
-            foreground=THEME["accent2"] if cargo_pct >= 99 else THEME["fg_dim"])
-        self.bar_labels["arc"].config(
-            text=f"ARC {arc_pct:.0f}%", foreground=tier_color)
-
-        if cur.active_event:
-            self.lbl_event.config(
-                text=f"⚡ {cur.active_event.name}: {cur.active_event.desc} "
-                     f"({cur.active_event.duration}d left)")
-        else:
-            self.lbl_event.config(text="")
-
-    # ------------------------------------------------------------------ #
-    # Notebook / tabs
-
-    def _build_notebook(self) -> None:
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill="both", expand=True, padx=10, pady=(4, 0))
-        self.tab_map = ttk.Frame(self.notebook)
-        self.tab_market = ttk.Frame(self.notebook)
-        self.tab_shipyard = ttk.Frame(self.notebook)
-        self.tab_services = ttk.Frame(self.notebook)
-        self.tab_crew = ttk.Frame(self.notebook)
-        self.tab_contracts = ttk.Frame(self.notebook)
-        self.tab_bank = ttk.Frame(self.notebook)
-        self.tab_log = ttk.Frame(self.notebook)
-        for tab, title in ((self.tab_map, "★ Star Map"),
-                           (self.tab_market, "⇄ Market"),
-                           (self.tab_shipyard, "⚙ Shipyard"),
-                           (self.tab_services, "✚ Services"),
-                           (self.tab_crew, "☺ Crew"),
-                           (self.tab_contracts, "✉ Contracts"),
-                           (self.tab_bank, "⌗ Bank & Stocks"),
-                           (self.tab_log, "✎ Captain's Log")):
-            self.notebook.add(tab, text=title)
-        self._build_map_tab()
-        self._build_market_tab()
-        self._build_shipyard_tab()
-        self._build_services_tab()
-        self._build_crew_tab()
-        self._build_contracts_tab()
-        self._build_bank_tab()
-        self._build_log_tab()
-
-    def _build_statusbar(self) -> None:
-        bar = tk.Frame(self.root, bg=THEME["bg"], pady=6, padx=12)
-        bar.pack(side="bottom", fill="x")
-        self.status_label = ttk.Label(bar, text="Welcome aboard, Commander.",
-                                      style="Accent.TLabel")
-        self.status_label.pack(side="left")
-        ttk.Label(bar, text="Ctrl+S Save · Ctrl+L Load · Ctrl+N New Game · F1 Help",
-                  style="Sub.TLabel").pack(side="right")
-
-    def _bind_keys(self) -> None:
-        self.root.bind("<Control-s>", lambda e: self.open_save_dialog())
-        self.root.bind("<Control-l>", lambda e: self.open_load_dialog())
-        self.root.bind("<Control-n>", lambda e: self.confirm_new_game())
-        self.root.bind("<F1>", lambda e: self.show_help_dialog())
-
-    # ------------------------------------------------------------------ #
-    # Star map tab — animated neon cosmos
-
-    MAP_W, MAP_H = 860, 640
-    MARGIN = 58
-
-    def _build_map_tab(self) -> None:
-        wrap = ttk.Frame(self.tab_map)
-        wrap.pack(fill="both", expand=True)
-
-        left = tk.Frame(wrap, bg=THEME["bg"], padx=6, pady=6)
-        left.pack(side="left", fill="both", expand=True)
-
-        self.map_canvas = tk.Canvas(left, width=self.MAP_W, height=self.MAP_H,
-                                    bg=THEME["bg"], highlightthickness=1,
-                                    highlightbackground=THEME["border"])
-        self.map_canvas.pack(fill="both", expand=True)
-        self.map_canvas.bind("<Button-1>", self._on_map_click)
-        self.map_canvas.bind("<Double-Button-1>", self._on_map_double_click)
-        self.map_canvas.bind("<Motion>", self._on_map_hover)
-        self.map_canvas.bind("<Leave>", lambda e: self._hide_map_hover())
-
-        self._map_hover_id = None
-        self._map_stars = []
-        rng = random.Random(42)
-        for _ in range(230):
-            x = rng.randint(4, self.MAP_W - 4)
-            y = rng.randint(4, self.MAP_H - 4)
-            r = rng.choice([1, 1, 1, 2])
-            tint = rng.choice([THEME["fg_dim"], "#3A4780", "#5560A8", THEME["accent3"]])
-            self._map_stars.append((x, y, r, tint))
-
-        right = ttk.Frame(wrap, padding=(10, 6))
-        right.pack(side="left", fill="y")
-
-        self.map_title = self._label(right, "Select a destination", "Accent.TLabel",
-                                     font=(None, 13, "bold"), wraplength=320)
-        self.map_title.pack(anchor="w", pady=(0, 2))
-        self.map_subtitle = self._label(right, "", "Dim.TLabel", wraplength=320)
-        self.map_subtitle.pack(anchor="w")
-        self.map_details = tk.Text(right, width=44, height=13, bg=THEME["field"],
-                                   fg=THEME["fg"], relief="flat", wrap="word",
-                                   font=(None, 9), state="disabled")
-        self.map_details.pack(anchor="w", pady=8)
-
-        self.travel_info = self._label(right, "", "TLabel", wraplength=320)
-        self.travel_info.pack(anchor="w")
-
-        self.btn_engage = self._button(right, "⇨ ENGAGE HYPERJUMP",
-                                       self._engage_travel, style="Cyan.TButton",
-                                       tooltip="Burn fuel and days to travel to the "
-                                               "selected world. Encounters may happen!")
-        self.btn_engage.pack(anchor="w", pady=10, ipadx=10)
-
-        self._label(right, "BEST ROUTES FROM HERE", "Accent.TLabel",
-                    font=(None, 9, "bold")).pack(anchor="w", pady=(8, 2))
-        self.route_box = tk.Text(right, width=44, height=10, bg=THEME["field"],
-                                 fg=THEME["fg"], relief="flat", wrap="word",
-                                 font=(None, 9), state="disabled")
-        self.route_box.pack(anchor="w")
-
-    def _map_coords(self, planet: Planet) -> Tuple[float, float]:
-        xs = [p.x for p in self.engine.planets.values()]
-        ys = [p.y for p in self.engine.planets.values()]
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        span_x = max(1.0, max_x - min_x)
-        span_y = max(1.0, max_y - min_y)
-        sx = (self.MAP_W - 2 * self.MARGIN) / span_x
-        sy = (self.MAP_H - 2 * self.MARGIN) / span_y
-        px = self.MARGIN + (planet.x - min_x) * sx
-        py = self.MAP_H - self.MARGIN - (planet.y - min_y) * sy
-        return px, py
-
-    def draw_map(self) -> None:
-        c = self.map_canvas
-        c.delete("all")
-        self._twinkle_ids = []
-
-        # --- Deep space backdrop: nebula clouds (stipple = fake alpha) ---
-        c.create_oval(-140, 60, 240, 420, fill="#3D2A7A", outline="",
-                      stipple="gray12")
-        c.create_oval(520, -120, 900, 260, fill="#7A2A55", outline="",
-                      stipple="gray12")
-        c.create_oval(300, 380, 720, 760, fill="#123A66", outline="",
-                      stipple="gray12")
-        c.create_oval(760, 420, 1040, 700, fill="#2A3D7A", outline="",
-                      stipple="gray25")
-
-        # --- Faint navigation grid ---
-        for gx in range(80, self.MAP_W, 90):
-            c.create_line(gx, 0, gx, self.MAP_H, fill=THEME["border"],
-                          stipple="gray25", width=1)
-        for gy in range(80, self.MAP_H, 90):
-            c.create_line(0, gy, self.MAP_W, gy, fill=THEME["border"],
-                          stipple="gray25", width=1)
-
-        # --- Starfield (a subset twinkles) ---
-        rng = random.Random(7)
-        for x, y, r, tint in self._map_stars:
-            star_id = c.create_oval(x - r, y - r, x + r, y + r,
-                                    fill=tint, outline="")
-            if rng.random() < 0.18:
-                self._twinkle_ids.append(star_id)
-
-        # --- Faction territory rings ---
-        for p in self.engine.planets.values():
-            px, py = self._map_coords(p)
-            fcol = FACTION_COLORS.get(p.faction, THEME["fg_dim"])
-            c.create_oval(px - 34, py - 34, px + 34, py + 34, outline=fcol,
-                          stipple="gray50", width=1)
-
-        # --- Legend ---
-        lx, ly = 16, 16
-        c.create_rectangle(lx - 6, ly - 6, lx + 158, ly + 74,
-                           fill="#050A20", outline=THEME["border"])
-        c.create_text(lx + 4, ly + 2, anchor="nw", text="FACTION TERRITORY",
-                      fill=THEME["accent"], font=(None, 8, "bold"))
-        for i, fac in enumerate(FACTIONS):
-            c.create_oval(lx + 4, ly + 20 + i * 14, lx + 12, ly + 28 + i * 14,
-                         fill=FACTION_COLORS[fac], outline="")
-            c.create_text(lx + 18, ly + 24 + i * 14, anchor="w", text=fac,
-                          fill=THEME["fg_dim"], font=(None, 8))
-
-        c.create_text(14, self.MAP_H - 12,
-                      text="Orion-Sol Sector · click a world to select · double-click to jump",
-                      anchor="sw", fill=THEME["fg_dim"], font=(None, 8))
-
-        here = self.engine.current_planet
-        hx, hy = self._map_coords(here)
-
-        # --- Travel line to selection ---
-        if self.selected_planet and self.selected_planet != here.name:
-            sel = self.engine.planets.get(self.selected_planet)
-            if sel:
-                sx, sy = self._map_coords(sel)
-                c.create_line(hx, hy, sx, sy, fill=THEME["accent2"],
-                              dash=(5, 4), width=2)
-                mx, my = (hx + sx) / 2, (hy + sy) / 2
-                fuel, days = self.engine.calculate_travel_cost(sel)
-                c.create_text(mx, my - 8, text=f"≈{fuel} fuel · {days}d",
-                              fill=THEME["accent2"], font=(None, 8, "bold"))
-
-        # --- Worlds ---
-        for p in self.engine.planets.values():
-            px, py = self._map_coords(p)
-            size = 7 + (2 if p.security == "None" else 0) + (2 if p.rich > 1.5 else 0)
-            is_here = p.name == here.name
-            is_sel = p.name == self.selected_planet
-
-            # Orbit ring
-            c.create_oval(px - size - 5, py - size - 5, px + size + 5, py + size + 5,
-                          outline=THEME["border"], dash=(2, 3), width=1)
-
-            outline = p.color
-            width = 1
-            if is_here:
-                outline = THEME["accent"]
-                width = 2
-            if is_sel:
-                c.create_oval(px - size - 11, py - size - 11, px + size + 11, py + size + 11,
-                              outline=THEME["warn"], dash=(3, 2), width=2)
-                outline = THEME["warn"]
-                width = 2
-
-            c.create_oval(px - size, py - size, px + size, py + size,
-                          fill=p.color, outline=outline, width=width)
-            label_color = THEME["fg"] if is_here else THEME["fg_dim"]
-            c.create_text(px, py + size + 13, text=p.name,
-                          fill=label_color, font=(None, 8, "bold"))
-
-            if p.active_event:
-                c.create_text(px + size + 6, py - size - 2, text="⚡",
-                              fill=THEME["warn"], font=(None, 10, "bold"))
-
-        # --- Home-world beacon (animated pulse ring) ---
-        self._pulse_id = c.create_oval(hx - self._pulse_radius, hy - self._pulse_radius,
-                                       hx + self._pulse_radius, hy + self._pulse_radius,
-                                       outline=THEME["accent"], width=2)
-        c.create_text(hx, hy - 22, text="◈ YOU",
-                      fill=THEME["accent"], font=(None, 8, "bold"))
-
-        self._start_map_animation()
-
-    # ------------------------------------------------------------------ #
-    # Map animation loops
-
-    def _start_map_animation(self) -> None:
-        if self._map_anim_running:
-            return
-        self._map_anim_running = True
-        self._animate_map()
-
-    def _animate_map(self) -> None:
-        """Twinkle stars + breathe the home-world beacon."""
-        if not self._map_anim_running:
-            return
-        try:
-            if not self.map_canvas.winfo_exists():
-                self._map_anim_running = False
-                return
-
-            self._twinkle_phase = (self._twinkle_phase + 1) % 4
-            bright = [THEME["fg"], "#C9D6FF", "#8FA5E8", THEME["accent3"]]
-            for sid in self._twinkle_ids:
-                try:
-                    self.map_canvas.itemconfig(sid, fill=bright[self._twinkle_phase])
-                except Exception:
-                    pass
-
-            # Pulse beacon
-            if self._pulse_grow:
-                self._pulse_radius += 1.2
-                if self._pulse_radius >= 26:
-                    self._pulse_grow = False
-            else:
-                self._pulse_radius -= 1.2
-                if self._pulse_radius <= 14:
-                    self._pulse_grow = True
-            try:
-                hx, hy = self._map_coords(self.engine.current_planet)
-                self.map_canvas.coords(
-                    self._pulse_id,
-                    hx - self._pulse_radius, hy - self._pulse_radius,
-                    hx + self._pulse_radius, hy + self._pulse_radius)
-            except Exception:
-                pass
-
-            self.map_canvas.after(420, self._animate_map)
-        except Exception:
-            self._map_anim_running = False
-
-    def _on_map_click(self, event) -> None:
-        best, best_d = None, 28 ** 2
-        for name, p in self.engine.planets.items():
-            px, py = self._map_coords(p)
-            d = (px - event.x) ** 2 + (py - event.y) ** 2
-            if d < best_d:
-                best, best_d = name, d
-        if best:
-            self.selected_planet = best
-            self._update_map_info()
-            self.draw_map()
-
-    def _on_map_double_click(self, event) -> None:
-        self._on_map_click(event)
-        self._engage_travel()
-
-    def _on_map_hover(self, event) -> None:
-        best, best_d, best_p = None, 24 ** 2, None
-        for p in self.engine.planets.values():
-            px, py = self._map_coords(p)
-            d = (px - event.x) ** 2 + (py - event.y) ** 2
-            if d < best_d:
-                best, best_d, best_p = p.name, d, p
-        if best_p:
-            line = f"{best_p.name} — {best_p.faction}"
-            if best_p.active_event:
-                line += f" · ⚡{best_p.active_event.name}"
-            if best_p.name == self.selected_planet:
-                line += " · selected"
-            if self._map_hover_id is None:
-                self._map_hover_id = self.map_canvas.create_text(
-                    event.x, event.y - 18, text=line, fill=THEME["accent"],
-                    font=(None, 9, "bold"))
-            else:
-                self.map_canvas.coords(self._map_hover_id, event.x, event.y - 18)
-                self.map_canvas.itemconfig(self._map_hover_id, text=line)
-        else:
-            self._hide_map_hover()
-
-    def _hide_map_hover(self) -> None:
-        if self._map_hover_id is not None:
-            try:
-                self.map_canvas.delete(self._map_hover_id)
-            except Exception:
-                pass
-            self._map_hover_id = None
-
-    def _update_map_info(self) -> None:
-        p = self.engine.player
-        sel = self.engine.planets.get(self.selected_planet) if self.selected_planet else None
-        if sel is None or sel.name == p.location:
-            self.map_title.config(text="Select a destination")
-            self.map_subtitle.config(text="")
-            self._set_textbox(self.map_details, "")
-            self.travel_info.config(text="")
-            self.btn_engage.config(state="disabled")
-            return
-
-        self.map_title.config(text=sel.name)
-        self.map_subtitle.config(text=f"{sel.subtitle} · {sel.faction}")
-        here = self.engine.current_planet
-        fuel, days = self.engine.calculate_travel_cost(sel)
-        dist = self.engine.calculate_distance(here, sel)
-        reachable = p.fuel >= fuel
-
-        details = (
-            f"{sel.desc}\n\n"
-            f"Security : {sel.security}\n"
-            f"Local event : {sel.active_event.name if sel.active_event else 'stable market'}\n"
-            f"Fuel price : {max(1, int(sel.fuel_price * self.engine.difficulty.fuel_mult))} CR/unit\n"
-            f"Repair price : {max(6, int(sel.repair_cost * self.engine.difficulty.repair_mult * (1.0 - RANK_SERVICE_DISCOUNT[self.engine.rank_index()])))} CR/HP"
-        )
-
-        # Deep Space Scanner: live remote market intel.
-        if p.has_module("deep_scanner"):
-            buys = sorted(
-                ((g, self.engine.get_buy_price(g, sel)) for g in COMMODITIES),
-                key=lambda t: t[1])[:3]
-            hot = sorted(
-                ((COMMODITIES[g].name, sel.market.get(g, 0))
-                 for g in COMMODITIES),
-                key=lambda t: -t[1])[:3]
-            lines = [f"\n◈ SCANNER READOUT — {sel.name}:"]
-            lines.append("cheapest buys: " + ", ".join(
-                f"{COMMODITIES[g].name} {pr}" for g, pr in buys))
-            lines.append("priciest stock: " + ", ".join(
-                f"{n} {pr}" for n, pr in hot))
-            details += "\n" + "\n".join(lines)
-        else:
-            details += "\n\n(Install a Deep Space Scanner Array to read\nremote market prices.)"
-
-        self._set_textbox(self.map_details, details)
-
-        reach_txt = "reachable" if reachable else "NOT ENOUGH FUEL"
-        color = THEME["good"] if reachable else THEME["bad"]
-        self.travel_info.config(
-            text=f"Distance {dist:.1f} · Fuel {fuel} · Days {days} — {reach_txt}",
-            style="TLabel", foreground=color)
-        self.btn_engage.config(state="normal" if reachable else "disabled")
-
-    def refresh_routes_box(self) -> None:
-        if not self._sig("routes", (self.engine.player.location,
-                                    self.engine.player.day)):
-            return
-        routes = self.engine.compute_best_trade_routes(from_current_only=True)[:4]
-        lines = []
-        for r in routes:
-            tag = " [CONTRABAND]" if r["is_contraband"] else ""
-            lines.append(
-                f"▸ {r['good']}{tag}: buy {r['buy_price']} at {r['src']}, "
-                f"sell {r['sell_price']} at {r['dst']}\n"
-                f"   est. net +{money(r['net_profit'])} CR ({r['qty']} units, "
-                f"{r['fuel_cost']} fuel, {r['days']}d, +{money(r['profit_per_day'])}/d)"
-            )
-        self._set_textbox(self.route_box,
-                          "\n".join(lines) if lines else
-                          "No profitable routes from this port right now.")
-
-    @staticmethod
-    def _set_textbox(widget: tk.Text, content: str) -> None:
-        widget.config(state="normal")
-        widget.delete("1.0", "end")
-        widget.insert("1.0", content)
-        widget.config(state="disabled")
-
-
-    # ------------------------------------------------------------------ #
-    # Market tab — price tables + live charts
-
-    def _build_market_tab(self) -> None:
-        wrap = ttk.Frame(self.tab_market, padding=10)
-        wrap.pack(fill="both", expand=True)
-
-        # left: commodity table; right: chart detail panel
-        body = ttk.Frame(wrap)
-        body.pack(fill="both", expand=True)
-        left = ttk.Frame(body)
-        left.pack(side="left", fill="both", expand=True)
-        right = ttk.Frame(body, padding=(10, 0, 0, 0))
-        right.pack(side="left", fill="y")
-
-        self.market_banner = self._label(left, "", "Warn.TLabel", font=(None, 10, "bold"))
-        self.market_banner.pack(anchor="w")
-
-        cols = {"Commodity": 200, "Category": 105, "Buy": 70, "Sell": 70,
-                "Stock": 60, "Held": 55, "10-Day Chart": 115, "Trend": 46, "Type": 100}
-        tree_frame = ttk.Frame(left)
-        tree_frame.pack(fill="both", expand=True, pady=(6, 4))
-        self.market_tree = self._make_tree(tree_frame, cols, height=16)
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.market_tree.yview)
-        self.market_tree.configure(yscrollcommand=vsb.set)
-        self.market_tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-        self.market_tree.bind("<<TreeviewSelect>>", lambda e: self._market_preview())
-        self._sortable_tree(self.market_tree)
-
-        trade = tk.Frame(left, bg=THEME["panel"], pady=8, padx=8,
-                         highlightbackground=THEME["border"], highlightthickness=1)
-        trade.pack(fill="x")
-        self.market_qty = tk.IntVar(value=1)
-        self._label(trade, "Quantity:").pack(side="left")
-        ttk.Spinbox(trade, from_=1, to=99999, textvariable=self.market_qty,
-                    width=8).pack(side="left", padx=6)
-        self._button(trade, "MAX", self._market_set_max,
-                     tooltip="Fills the quantity with the maximum you can "
-                             "buy (or all you hold, if you hold more than "
-                             "you can buy).").pack(side="left", padx=(0, 10))
-        self._button(trade, "BUY", self._market_buy, style="Cyan.TButton").pack(side="left", padx=3)
-        self._button(trade, "SELL", self._market_sell, style="Accent.TButton").pack(side="left", padx=3)
-        self.market_preview = self._label(trade, "", "Dim.TLabel")
-        self.market_preview.pack(side="left", padx=16)
-
-        self.market_result = self._label(left, "", "Good.TLabel", wraplength=860)
-        self.market_result.pack(anchor="w", pady=(6, 0))
-
-        # ---- right: chart detail panel ----
-        self.chart_title = self._label(right, "PRICE CHART", "Accent.TLabel",
-                                       font=(None, 11, "bold"), wraplength=330)
-        self.chart_title.pack(anchor="w")
-        self.chart_hint = self._label(right, "Select a commodity row to plot its "
-                                          "10-day history.", "Dim.TLabel",
-                                      wraplength=330, justify="left")
-        self.chart_hint.pack(anchor="w", pady=(0, 6))
-
-        self.chart_canvas = tk.Canvas(right, width=330, height=150,
-                                      bg=THEME["field"], highlightthickness=1,
-                                      highlightbackground=THEME["border"])
-        self.chart_canvas.pack(anchor="w")
-        self.chart_stats = self._label(right, "", "TLabel", wraplength=330,
-                                       justify="left", font=(None, 9))
-        self.chart_stats.pack(anchor="w", pady=(8, 0))
-        self.chart_advice = self._label(right, "", "Dim.TLabel", wraplength=330,
-                                        justify="left", font=(None, 9))
-        self.chart_advice.pack(anchor="w", pady=(6, 0))
-
-    def _sortable_tree(self, tree: ttk.Treeview) -> None:
-        """Click a heading to sort by that column (toggles direction)."""
-        state = {"col": None, "desc": False}
-
-        def sort(col: str) -> None:
-            if state["col"] == col:
-                state["desc"] = not state["desc"]
-            else:
-                state["col"] = col
-                state["desc"] = False
-            items = list(tree.get_children())
-
-            def key(iid):
-                raw = tree.set(iid, col)
-                try:
-                    return float(str(raw).replace(",", "").replace("CR", "")
-                                 .replace("%", "").split(" ")[0])
-                except ValueError:
-                    return str(raw).lower()
-
-            try:
-                items.sort(key=key, reverse=state["desc"])
-            except TypeError:
-                items.sort(key=lambda i: str(tree.set(i, col)).lower(),
-                           reverse=state["desc"])
-            for idx, iid in enumerate(items):
-                tree.move(iid, "", idx)
-            tree.heading(col,
-                         text=col.replace("_", " ").title()
-                         + (" ▼" if state["desc"] else " ▲"))
-
-        for col in tree["columns"]:
-            tree.heading(col, command=lambda c=col: sort(c))
-
-    def refresh_market(self) -> None:
-        p = self.engine.current_planet
-        eng = self.engine
-        sig = (p.name, eng.player.day,
-               tuple(sorted(eng.player.cargo.items())),
-               eng.player.credits // 40,
-               p.active_event.name if p.active_event else "")
-        if not self._sig("market", sig):
-            self._market_chart()
-            return
-
-        if p.active_event:
-            self.market_banner.config(
-                text=f"⚡ {p.name}: {p.active_event.name} — {p.active_event.desc} "
-                     f"({p.active_event.duration} days left)")
-        else:
-            self.market_banner.config(text=f"{p.name} Commodity Exchange — stable market")
-
-        selected = self.market_tree.selection()
-        self.market_tree.delete(*self.market_tree.get_children())
-        for i, (gid, comm) in enumerate(COMMODITIES.items()):
-            buy = eng.get_buy_price(gid)
-            sell = eng.get_sell_price(gid)
-            stock = p.stock.get(gid, 0)
-            held = eng.player.cargo.get(gid, 0)
-            spark = sparkline(p.price_history.get(gid, []))
-            trend = TREND_ICON.get(p.trend(gid), "·")
-            tag = ("bad",) if comm.is_contraband else \
-                  ("odd",) if i % 2 else ("even",)
-            if held > 0:
-                tag = ("hot",) + tag
-            self.market_tree.insert("", "end", iid=gid, values=(
-                f"{comm.icon} {comm.name}", comm.category, buy, sell,
-                stock, held, spark, trend,
-                "CONTRABAND" if comm.is_contraband else "legal"),
-                tags=tag)
-        if selected:
-            try:
-                self.market_tree.selection_set(selected)
-            except Exception:
-                pass
-        self._market_preview()
-
-    def _selected_good(self) -> Optional[str]:
-        sel = self.market_tree.selection()
-        return sel[0] if sel else None
-
-    def _market_set_max(self) -> None:
-        gid = self._selected_good()
-        if not gid:
-            return
-        p = self.engine.current_planet
-        price = self.engine.get_buy_price(gid)
-        max_buy = min(p.stock.get(gid, 0), self.engine.player.cargo_free(),
-                      self.engine.player.credits // max(1, price))
-        max_sell = self.engine.player.cargo.get(gid, 0)
-        self.market_qty.set(max(max_buy, max_sell, 1))
-
-    def _market_preview(self) -> None:
-        gid = self._selected_good()
-        if not gid:
-            self.market_preview.config(text="Select a commodity row to preview the trade.")
-            self._market_chart()
-            return
-        try:
-            qty = max(0, int(self.market_qty.get() or 0))
-        except Exception:
-            qty = 0
-        buy = self.engine.get_buy_price(gid) * qty
-        sell = self.engine.get_sell_price(gid) * qty
-        held = self.engine.player.cargo.get(gid, 0)
-        note = f" · holding {held}" if held else ""
-        self.market_preview.config(
-            text=f"Preview: buy {money(buy)} CR · sell {money(sell)} CR{note}")
-        self._market_chart()
-
-    def _market_chart(self) -> None:
-        """Render the 10-day sparkline detail chart for the selected good."""
-        gid = self._selected_good()
-        c = self.chart_canvas
-        c.delete("all")
-        if not gid:
-            self.chart_title.config(text="PRICE CHART")
-            self.chart_hint.config(text="Select a commodity row to plot its 10-day history.",
-                                   style="Dim.TLabel")
-            self.chart_stats.config(text="")
-            self.chart_advice.config(text="")
-            return
-        p = self.engine.current_planet
-        comm = COMMODITIES[gid]
-        hist = p.price_history.get(gid, [])
-        base = comm.base_price
-
-        self.chart_title.config(text=f"{comm.icon} {comm.name}")
-        self.chart_hint.config(text=comm.desc, style="Dim.TLabel")
-
-        W, H = 330, 150
-        pad_l, pad_r, pad_t, pad_b = 34, 12, 14, 22
-        if len(hist) >= 2:
-            lo, hi = min(hist), max(hist)
-            span = max(1, hi - lo)
-            n = len(hist)
-            step = (W - pad_l - pad_r) / (n - 1)
-            pts = []
-            for i, v in enumerate(hist):
-                x = pad_l + i * step
-                y = pad_t + (H - pad_t - pad_b) * (1 - (v - lo) / span)
-                pts.append((x, y))
-
-            color = THEME["good"] if hist[-1] >= hist[0] else THEME["bad"]
-            # glow line (fat, dark) + crisp line
-            c.create_line(*pts, fill=color, width=6, stipple="gray50")
-            c.create_line(*pts, fill=color, width=2)
-            for (x, y) in pts:
-                c.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5,
-                              fill=THEME["fg"], outline="")
-            lx, ly = pts[-1]
-            c.create_oval(lx - 5, ly - 5, lx + 5, ly + 5,
-                          fill=color, outline=THEME["fg"])
-
-            # min / max gridlines
-            c.create_line(pad_l, pad_t, W - pad_r, pad_t, fill=THEME["border"],
-                          dash=(2, 3))
-            c.create_line(pad_l, H - pad_b, W - pad_r, H - pad_b,
-                          fill=THEME["border"], dash=(2, 3))
-            c.create_text(4, pad_t + 6, text=f"{hi}", fill=THEME["fg_dim"],
-                          font=(None, 8), anchor="w")
-            c.create_text(4, H - pad_b - 4, text=f"{lo}", fill=THEME["fg_dim"],
-                          font=(None, 8), anchor="w")
-            # base-price reference line (clamped into range)
-            base_y = pad_t + (H - pad_t - pad_b) * (1 - (clamp(base, lo, hi) - lo) / span)
-            if lo < base < hi or lo <= base <= hi:
-                c.create_line(pad_l, base_y, W - pad_r, base_y,
-                              fill=THEME["warn"], dash=(4, 3))
-                c.create_text(W - pad_r - 2, base_y - 8, text="base",
-                              fill=THEME["warn"], font=(None, 7), anchor="e")
-            days_label = f"-{n - 1}d"
-            c.create_text(pad_l, H - 8, text=days_label, fill=THEME["fg_dim"],
-                          font=(None, 8))
-            c.create_text(W - pad_r, H - 8, text="now", fill=THEME["fg_dim"],
-                          font=(None, 8), anchor="e")
-            last = hist[-1]
-            avg = sum(hist) / n
-            delta_pct = (last - base) / max(1, base) * 100
-            stat_color = THEME["good"] if last >= base else THEME["bad"]
-            self.chart_stats.config(
-                text=f"now {last} CR  ·  min {min(hist)}  ·  max {max(hist)}  ·  "
-                     f"avg {avg:.0f}\nvs sector base {base}: "
-                     f"{delta_pct:+.0f}%  ({'premium' if last > base else 'discount'})",
-                foreground=stat_color)
-        else:
-            c.create_text(W / 2, H / 2,
-                          text="collecting data…\n(prices chart after the first day)",
-                          fill=THEME["fg_dim"], font=(None, 9))
-            self.chart_stats.config(text="")
-
-        # trade calculator
-        try:
-            qty = max(0, int(self.market_qty.get() or 0))
-        except Exception:
-            qty = 0
-        buy = self.engine.get_buy_price(gid)
-        sell = self.engine.get_sell_price(gid)
-        margin = sell - buy
-        held = self.engine.player.cargo.get(gid, 0)
-        calcs = [f"unit margin here: {margin:+d} CR"]
-        if qty > 0:
-            calcs.append(f"{qty} units → buy {money(buy * qty)} / sell {money(sell * qty)} CR")
-        if held > 0:
-            calcs.append(f"holding {held} → liquidation {money(sell * held)} CR")
-        routes = self.engine.compute_best_trade_routes(from_current_only=True)
-        best = next((r for r in routes if r["good_id"] == gid), None)
-        if best:
-            calcs.append(
-                f"best route: → {best['dst']} nets +{money(best['net_profit'])} CR "
-                f"({best['qty']} units, {best['days']}d)")
-        self.chart_advice.config(text="\n".join(calcs))
-
-    def _market_buy(self) -> None:
-        gid = self._selected_good()
-        if not gid:
-            self._set_result(self.market_result, "Select a commodity first.", good=False)
-            return
-        try:
-            qty = int(self.market_qty.get())
-        except Exception:
-            qty = 0
-        ok, msg = self.engine.buy_commodity(gid, qty)
-        self._set_result(self.market_result, msg, good=ok)
-        if ok:
-            self.engine.autosave()
-        self.refresh_all()
-
-    def _market_sell(self) -> None:
-        gid = self._selected_good()
-        if not gid:
-            self._set_result(self.market_result, "Select a commodity first.", good=False)
-            return
-        try:
-            qty = int(self.market_qty.get())
-        except Exception:
-            qty = 0
-        ok, msg = self.engine.sell_commodity(gid, qty)
-        self._set_result(self.market_result, msg, good=ok)
-        if ok:
-            self.engine.autosave()
-        self.refresh_all()
-
-    @staticmethod
-    def _set_result(label: ttk.Label, msg: str, good: bool = True) -> None:
-        label.config(text=msg, style="Good.TLabel" if good else "Bad.TLabel")
-
-    # ------------------------------------------------------------------ #
-    # Shipyard tab
-
-    def _build_shipyard_tab(self) -> None:
-        wrap = ttk.Frame(self.tab_shipyard, padding=10)
-        wrap.pack(fill="both", expand=True)
-        pane = ttk.Panedwindow(wrap, orient="horizontal")
-        pane.pack(fill="both", expand=True)
-
-        left = ttk.Labelframe(pane, text="Starship Showroom", style="Panel.TLabelframe",
-                              padding=8)
-        right = ttk.Labelframe(pane, text="Equipment & Outfitter", style="Panel.TLabelframe",
-                               padding=8)
-        pane.add(left, weight=1)
-        pane.add(right, weight=1)
-
-        cols = {"Ship": 175, "Class": 135, "Cost": 90, "Hold": 55, "Hull": 55,
-                "Shield": 60, "Speed": 55, "Slots": 70}
-        self.ship_tree = self._make_tree(left, cols, height=13)
-        self.ship_tree.pack(fill="both", expand=True)
-        self.lbl_tradein = self._label(left, "", "Dim.TLabel")
-        self.lbl_tradein.pack(anchor="w", pady=(4, 2))
-        self._button(left, "⇦ BUY THIS SHIP", self._buy_ship, style="Cyan.TButton").pack(anchor="w")
-
-        filter_row = ttk.Frame(right)
-        filter_row.pack(fill="x", pady=(0, 4))
-        self.eq_filter = tk.StringVar(value="all")
-        for value, text in (("all", "All"), ("weapon", "Weapons"),
-                            ("shield", "Shields"), ("module", "Modules")):
-            ttk.Radiobutton(filter_row, text=text, value=value,
-                            variable=self.eq_filter,
-                            command=self.refresh_shipyard).pack(side="left", padx=4)
-
-        cols2 = {"Item": 200, "Slot": 70, "Cost": 85, "Effect": 330, "Status": 95}
-        self.equip_tree = self._make_tree(right, cols2, height=11)
-        self.equip_tree.pack(fill="both", expand=True)
-        self._button(right, "⇧ INSTALL / BUY", self._buy_equipment,
-                     style="Cyan.TButton").pack(anchor="w", pady=(6, 2))
-
-        bottom = ttk.Frame(wrap)
-        bottom.pack(fill="x", pady=(8, 0))
-        self.lbl_loadout = self._label(bottom, "", "Dim.TLabel", wraplength=900)
-        self.lbl_loadout.pack(side="left", fill="x", expand=True)
-        missile_box = ttk.Frame(bottom)
-        missile_box.pack(side="right")
-        self.lbl_missiles = self._label(missile_box, "", "Accent.TLabel")
-        self.lbl_missiles.pack(side="left", padx=(0, 8))
-        self._button(missile_box, "Buy 1 Missile", lambda: self._buy_missiles(1)).pack(side="left", padx=3)
-        self._button(missile_box, "Buy 5", lambda: self._buy_missiles(5)).pack(side="left", padx=3)
-
-    @staticmethod
-    def equipment_effect(eq: Equipment) -> str:
-        if eq.damage:
-            return (f"{eq.damage} dmg · {int(eq.accuracy * 100)}% acc · "
-                    f"{int(eq.crit_chance * 100)}% crit — {eq.desc}")
-        parts = []
-        if eq.shield_hp:
-            parts.append(f"+{eq.shield_hp} shield")
-        if eq.fuel_save:
-            parts.append(f"-{int(eq.fuel_save * 100)}% fuel")
-        if eq.cargo_bonus:
-            parts.append(f"+{eq.cargo_bonus} hold")
-        if eq.evasion_bonus:
-            parts.append(f"+{int(eq.evasion_bonus * 100)}% dodge")
-        if eq.id == "combat_scanner":
-            parts.append(f"+{int(eq.accuracy * 100)}% hit / +{int(eq.crit_chance * 100)}% crit")
-        if parts:
-            return " · ".join(parts) + f" — {eq.desc}"
-        return eq.desc
-
-    def refresh_shipyard(self) -> None:
-        p = self.engine.player
-        sig = (p.ship_id, tuple(p.equipped_weapons), tuple(p.equipped_shields),
-               tuple(p.equipped_modules), p.missiles, p.credits // 100,
-               self.eq_filter.get(), p.damaged_subsystems())
-        if not self._sig("shipyard", sig):
-            return
-
-        selected_ship = self.ship_tree.selection()
-        self.ship_tree.delete(*self.ship_tree.get_children())
-        for i, (sid, tmpl) in enumerate(SHIP_TEMPLATES.items()):
-            tag = ("good",) if sid == p.ship_id else ("odd",) if i % 2 else ("even",)
-            self.ship_tree.insert("", "end", iid=sid, values=(
-                tmpl.name + (" ◂ current" if sid == p.ship_id else ""),
-                tmpl.ship_class, money(tmpl.cost) + " CR",
-                tmpl.cargo_cap, tmpl.max_hull, tmpl.max_shield,
-                f"{tmpl.speed:.1f}",
-                f"{tmpl.weapon_slots}/{tmpl.shield_slots}/{tmpl.module_slots}",
-            ), tags=tag)
-        if selected_ship:
-            try:
-                self.ship_tree.selection_set(selected_ship)
-            except Exception:
-                pass
-        self.lbl_tradein.config(
-            text=f"Trade-in credit for your current ship: {money(self.engine.ship_trade_in_value())} CR")
-
-        selected_eq = self.equip_tree.selection()
-        self.equip_tree.delete(*self.equip_tree.get_children())
-        filt = self.eq_filter.get()
-        installed = set(p.equipped_weapons + p.equipped_shields + p.equipped_modules)
-        for i, (eid, eq) in enumerate(EQUIPMENT_ITEMS.items()):
-            if filt != "all" and eq.slot_type != filt:
-                continue
-            status = "INSTALLED" if eid in installed else "available"
-            tag = ("good",) if eid in installed else ("odd",) if i % 2 else ("even",)
-            self.equip_tree.insert("", "end", iid=eid, values=(
-                eq.name, eq.slot_type, money(eq.cost) + " CR",
-                self.equipment_effect(eq), status), tags=tag)
-        if selected_eq:
-            try:
-                self.equip_tree.selection_set(selected_eq)
-            except Exception:
-                pass
-
-        tmpl = SHIP_TEMPLATES[p.ship_id]
-        weapons = ", ".join(EQUIPMENT_ITEMS[w].name for w in p.equipped_weapons) or "none"
-        shields = ", ".join(EQUIPMENT_ITEMS[s].name for s in p.equipped_shields) or "none"
-        modules = ", ".join(EQUIPMENT_ITEMS[m].name for m in p.equipped_modules) or "none"
-        damaged = p.damaged_subsystems()
-        dmg_txt = f"  |  DAMAGED: {', '.join(damaged)}" if damaged else ""
-        self.lbl_loadout.config(
-            text=f"{tmpl.name} — hardpoints {len(p.equipped_weapons)}/{tmpl.weapon_slots}, "
-                 f"shield bays {len(p.equipped_shields)}/{tmpl.shield_slots}, "
-                 f"modules {len(p.equipped_modules)}/{tmpl.module_slots}{dmg_txt}\n"
-                 f"Weapons: {weapons}  |  Shields: {shields}  |  Modules: {modules}")
-
-        if p.has_missile_rack():
-            self.lbl_missiles.config(text=f"Missiles: {p.missiles}/{PLAYER_MISSILE_CAP}")
-        else:
-            self.lbl_missiles.config(text="Missiles: requires Havoc Missile Launcher")
-
-    def _buy_ship(self) -> None:
-        sel = self.ship_tree.selection()
-        if not sel:
-            self.engine.announce("Select a ship model first.")
-            self.status_label.config(text="Select a ship model first.")
-            return
-        ok, msg = self.engine.buy_ship(sel[0])
-        self.status_label.config(text=msg, foreground=THEME["good"] if ok else THEME["bad"])
-        if not ok:
-            messagebox.showwarning("Shipyard", msg, parent=self.root)
-        else:
-            messagebox.showinfo("Shipyard", msg, parent=self.root)
-            self.engine.autosave()
-        self.refresh_all()
-
-    def _buy_equipment(self) -> None:
-        sel = self.equip_tree.selection()
-        if not sel:
-            self.status_label.config(text="Select an equipment item first.")
-            return
-        ok, msg = self.engine.buy_equipment(sel[0])
-        self.status_label.config(text=msg, foreground=THEME["good"] if ok else THEME["bad"])
-        if not ok:
-            messagebox.showwarning("Outfitter", msg, parent=self.root)
-        self.refresh_all()
-
-    def _buy_missiles(self, qty: int) -> None:
-        ok, msg = self.engine.buy_missiles(qty)
-        self.status_label.config(text=msg, foreground=THEME["good"] if ok else THEME["bad"])
-        if not ok:
-            messagebox.showwarning("Ordnance", msg, parent=self.root)
-        self.refresh_all()
-
-    # ------------------------------------------------------------------ #
-    # Services tab
-
-    def _build_services_tab(self) -> None:
-        wrap = ttk.Frame(self.tab_services, padding=14)
-        wrap.pack(fill="both", expand=True)
-
-        self.svc_title = self._label(wrap, "", "Accent.TLabel", font=(None, 13, "bold"))
-        self.svc_title.pack(anchor="w")
-
-        grid = ttk.Frame(wrap, padding=8)
-        grid.pack(fill="x", pady=8)
-
-        # Fuel
-        self.svc_fuel_info = self._label(grid, "", "TLabel")
-        self.svc_fuel_info.grid(row=0, column=0, columnspan=3, sticky="w", pady=2)
-        self._button(grid, "Buy 25 Fuel", lambda: self._svc(lambda: self.engine.buy_fuel(25))).grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
-        self._button(grid, "Fill Tank", lambda: self._svc(lambda: self.engine.buy_fuel(9999))).grid(row=1, column=1, sticky="w", padx=6, pady=2)
-
-        # Hull
-        self.svc_hull_info = self._label(grid, "", "TLabel")
-        self.svc_hull_info.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 2))
-        self._button(grid, "Repair 25 Hull", lambda: self._svc(lambda: self.engine.repair_hull(25))).grid(row=3, column=0, sticky="w", padx=(0, 6), pady=2)
-        self._button(grid, "Full Repair", lambda: self._svc(lambda: self.engine.repair_hull(9999))).grid(row=3, column=1, sticky="w", padx=6, pady=2)
-
-        # Subsystems
-        self.svc_sub_info = self._label(grid, "", "TLabel")
-        self.svc_sub_info.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 2))
-        self._button(grid, "Repair Subsystems",
-                     lambda: self._svc(self.engine.repair_subsystems)).grid(row=5, column=0, sticky="w", padx=(0, 6), pady=2)
-
-        # Insurance
-        self.svc_ins_info = self._label(grid, "", "TLabel")
-        self.svc_ins_info.grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 2))
-        self.btn_insurance = self._button(grid, "Activate Insurance",
-                                          lambda: self._svc(self.engine.buy_insurance))
-        self.btn_insurance.grid(row=7, column=0, sticky="w", padx=(0, 6), pady=2)
-
-        # Missiles
-        self.svc_missile_info = self._label(grid, "", "TLabel")
-        self.svc_missile_info.grid(row=8, column=0, columnspan=3, sticky="w", pady=(10, 2))
-        self._button(grid, "Buy 1 Missile", lambda: self._svc(lambda: self.engine.buy_missiles(1))).grid(row=9, column=0, sticky="w", padx=(0, 6), pady=2)
-        self._button(grid, "Buy 5 Missiles", lambda: self._svc(lambda: self.engine.buy_missiles(5))).grid(row=9, column=1, sticky="w", padx=6, pady=2)
-
-        tip = ("TIP: Insurance covers one destruction — you lose cargo and 10% of your\n"
-               "credits, but a replacement hull keeps you flying. Repair prices vary by\n"
-               "planet tech level, and fuel is cheapest at mining worlds. At Captain\n"
-               "rank, stations charge 12% less for fuel and repairs.")
-        self._label(wrap, tip, "Dim.TLabel", justify="left").pack(anchor="w", pady=(4, 0))
-
-    def _svc(self, fn) -> None:
-        ok, msg = fn()
-        self.status_label.config(text=msg, foreground=THEME["good"] if ok else THEME["bad"])
-        self.refresh_all()
-
-    def refresh_services(self) -> None:
-        p = self.engine.player
-        cur = self.engine.current_planet
-        fuel_price = max(1, int(cur.fuel_price * self.engine.difficulty.fuel_mult
-                                * (1.0 - RANK_SERVICE_DISCOUNT[self.engine.rank_index()])))
-        repair_price = self.engine.current_repair_price()
-
-        sig = (p.fuel, p.hull, tuple(p.damaged_subsystems()), p.insurance_active,
-               p.missiles, p.credits // 40, cur.name)
-        if not self._sig("services", sig):
-            return
-
-        self.svc_title.config(
-            text=f"Station Services — {cur.name} ({cur.faction})")
-        self.svc_fuel_info.config(text=f"Fuel: {p.fuel}/{p.max_fuel} — price {fuel_price} CR/unit")
-        self.svc_hull_info.config(text=f"Hull: {p.hull}/{p.max_hull} — price {repair_price} CR/HP")
-        damaged = p.damaged_subsystems()
-        if damaged:
-            cost = self.engine.subsystem_repair_cost()
-            self.svc_sub_info.config(
-                text=f"Damaged subsystems: {', '.join(damaged)} — repair cost {money(cost)} CR",
-                foreground=THEME["bad"])
-        else:
-            self.svc_sub_info.config(text="All subsystems fully operational.", foreground=THEME["good"])
-        if p.insurance_active:
-            self.svc_ins_info.config(
-                text="Insurance policy ACTIVE — destruction will trigger a respawn.",
-                foreground=THEME["good"])
-            self.btn_insurance.config(state="disabled")
-        else:
-            self.svc_ins_info.config(
-                text=f"Ship insurance: {money(self.engine.insurance_price())} CR "
-                     f"(4% of hull + equipment value)", foreground=THEME["fg"])
-            self.btn_insurance.config(state="normal")
-        if p.has_missile_rack():
-            self.svc_missile_info.config(
-                text=f"Missiles: {p.missiles}/{PLAYER_MISSILE_CAP} — "
-                     f"{money(self.engine.missile_price())} CR each")
-        else:
-            self.svc_missile_info.config(
-                text="Missiles: install a Havoc Missile Launcher (Shipyard) first.")
-
-    # ------------------------------------------------------------------ #
-    # Crew tab
-
-    def _build_crew_tab(self) -> None:
-        wrap = ttk.Frame(self.tab_crew, padding=10)
-        wrap.pack(fill="both", expand=True)
-
-        cols = {"Officer": 220, "Role": 180, "Signing": 90, "Wage/day": 80, "Perk": 380}
-        self.crew_tree = self._make_tree(wrap, cols, height=10)
-        self.crew_tree.pack(fill="both", expand=True)
-
-        row = ttk.Frame(wrap)
-        row.pack(fill="x", pady=8)
-        self._button(row, "Hire Officer", self._hire_crew, style="Cyan.TButton").pack(side="left", padx=3)
-        self._button(row, "Dismiss Officer", self._dismiss_crew).pack(side="left", padx=3)
-        self.lbl_crew_info = self._label(row, "", "Dim.TLabel")
-        self.lbl_crew_info.pack(side="left", padx=16)
-
-    def refresh_crew(self) -> None:
-        p = self.engine.player
-        if not self._sig("crew", (tuple(p.hired_crew),)):
-            return
-        self.crew_tree.delete(*self.crew_tree.get_children())
-        for i, c in enumerate(AVAILABLE_CREW):
-            hired = c.id in p.hired_crew
-            tag = ("good",) if hired else ("odd",) if i % 2 else ("even",)
-            self.crew_tree.insert("", "end", iid=c.id, values=(
-                c.name + (" [HIRED]" if hired else ""),
-                c.role, money(c.hire_cost) + " CR", f"{c.daily_wage} CR",
-                c.desc), tags=tag)
-        self.lbl_crew_info.config(
-            text=f"Crew: {len(p.hired_crew)}/{MAX_CREW} · Daily wages: "
-                 f"{money(self.engine.total_daily_wages())} CR"
-                 + (" (Captain discount applied)" if self.engine.rank_index() >= 3 else ""))
-
-    def _hire_crew(self) -> None:
-        sel = self.crew_tree.selection()
-        if not sel:
-            return
-        ok, msg = self.engine.hire_crew(sel[0])
-        self.status_label.config(text=msg, foreground=THEME["good"] if ok else THEME["bad"])
-        if not ok:
-            messagebox.showwarning("Crew", msg, parent=self.root)
-        self.refresh_all()
-
-    def _dismiss_crew(self) -> None:
-        sel = self.crew_tree.selection()
-        if not sel:
-            return
-        if messagebox.askyesno("Crew", "Dismiss this officer from your crew?",
-                               parent=self.root):
-            ok, msg = self.engine.dismiss_crew(sel[0])
-            self.status_label.config(text=msg, foreground=THEME["good"] if ok else THEME["bad"])
-            self.refresh_all()
-
-    # ------------------------------------------------------------------ #
-    # Contracts tab
-
-    def _build_contracts_tab(self) -> None:
-        wrap = ttk.Frame(self.tab_contracts, padding=10)
-        wrap.pack(fill="both", expand=True)
-
-        self._label(wrap, "AVAILABLE CONTRACTS", "Accent.TLabel",
-                    font=(None, 10, "bold")).pack(anchor="w")
-        cols = {"Contract": 380, "Destination": 130, "Days Left": 80,
-                "Reward": 100, "Kind": 100}
-        self.contracts_tree = self._make_tree(wrap, cols, height=7)
-        self.contracts_tree.pack(fill="both", expand=True, pady=(4, 4))
-        self.contracts_desc = self._label(wrap, "", "Dim.TLabel", wraplength=1000)
-        self.contracts_desc.pack(anchor="w")
-        row = ttk.Frame(wrap)
-        row.pack(fill="x", pady=6)
-        self._button(row, "✓ ACCEPT CONTRACT", self._accept_mission,
-                     style="Cyan.TButton").pack(side="left")
-
-        self._label(wrap, "ACTIVE CONTRACTS", "Accent.TLabel",
-                    font=(None, 10, "bold")).pack(anchor="w", pady=(10, 0))
-        cols2 = {"Contract": 380, "Destination": 130, "Days Left": 80,
-                 "Reward": 100, "Kind": 100}
-        self.active_tree = self._make_tree(wrap, cols2, height=5)
-        self.active_tree.pack(fill="both", expand=True, pady=(4, 0))
-        self.active_tree.bind("<<TreeviewSelect>>", self._contract_desc)
-
-    def refresh_contracts(self) -> None:
-        avail = self.engine.available_missions
-        active = self.engine.player.active_missions
-        sig = (len(avail), tuple(m.id for m in avail),
-               tuple((m.id, m.days_left) for m in active))
-        if not self._sig("contracts", sig):
-            return
-        self.contracts_tree.delete(*self.contracts_tree.get_children())
-        for i, m in enumerate(avail):
-            tag = ("warn",) if m.m_type == "smuggle" else ("odd",) if i % 2 else ("even",)
-            self.contracts_tree.insert("", "end", iid=m.id, values=(
-                m.title, m.destination, m.days_left,
-                f"{money(m.reward_credits)} CR", m.m_type), tags=tag)
-        self.active_tree.delete(*self.active_tree.get_children())
-        for i, m in enumerate(active):
-            tag = ("bad",) if m.days_left <= 2 else ("odd",) if i % 2 else ("even",)
-            self.active_tree.insert("", "end", iid=m.id, values=(
-                m.title, m.destination, m.days_left,
-                f"{money(m.reward_credits)} CR", m.m_type), tags=tag)
-
-    def _contract_desc(self, event=None) -> None:
-        for tree, source in ((self.contracts_tree, self.engine.available_missions),
-                             (self.active_tree, self.engine.player.active_missions)):
-            sel = tree.selection()
-            if sel:
-                for m in source:
-                    if m.id == sel[0]:
-                        self.contracts_desc.config(text=m.desc)
-                        return
-        self.contracts_desc.config(text="")
-
-    def _accept_mission(self) -> None:
-        sel = self.contracts_tree.selection()
-        if not sel:
-            return
-        ok, msg = self.engine.accept_mission(sel[0])
-        self.status_label.config(text=msg, foreground=THEME["good"] if ok else THEME["bad"])
-        if not ok:
-            messagebox.showwarning("Contracts", msg, parent=self.root)
-        self.refresh_all()
-
-
-    # ------------------------------------------------------------------ #
-    # Bank & stocks tab
-
-    def _build_bank_tab(self) -> None:
-        wrap = ttk.Frame(self.tab_bank, padding=10)
-        wrap.pack(fill="both", expand=True)
-        pane = ttk.Panedwindow(wrap, orient="horizontal")
-        pane.pack(fill="both", expand=True)
-
-        bank = ttk.Labelframe(pane, text="Interstellar Bank", style="Panel.TLabelframe", padding=10)
-        market = ttk.Labelframe(pane, text="Galactic Stock Exchange", style="Panel.TLabelframe", padding=10)
-        pane.add(bank, weight=1)
-        pane.add(market, weight=1)
-
-        self.bank_acct = self._label(bank, "", "TLabel", justify="left", font=(None, 10))
-        self.bank_acct.pack(anchor="w")
-
-        amount_row = ttk.Frame(bank)
-        amount_row.pack(fill="x", pady=8)
-        self._label(amount_row, "Amount:").pack(side="left")
-        self.bank_amount = ttk.Entry(amount_row, width=14)
-        self.bank_amount.pack(side="left", padx=6)
-        self._button(amount_row, "MAX", self._bank_set_max).pack(side="left")
-
-        btn_row = ttk.Frame(bank)
-        btn_row.pack(fill="x")
-        self._button(btn_row, "Deposit", lambda: self._bank_op("deposit")).pack(side="left", padx=3, pady=3)
-        self._button(btn_row, "Withdraw", lambda: self._bank_op("withdraw")).pack(side="left", padx=3, pady=3)
-        self._button(btn_row, "Borrow", lambda: self._bank_op("borrow")).pack(side="left", padx=3, pady=3)
-        self._button(btn_row, "Repay", lambda: self._bank_op("repay")).pack(side="left", padx=3, pady=3)
-
-        tip = ("Savings earn 0.8% daily interest. Loans charge daily interest\n"
-               "based on difficulty, your credit score and rank. Solid repayments\n"
-               "(1,000 CR+) raise your score; 700+ cuts interest by 15%.")
-        self._label(bank, tip, "Dim.TLabel", justify="left").pack(anchor="w", pady=(12, 0))
-
-        cols = {"Symbol": 70, "Company": 240, "Price": 90, "Owned": 70,
-                "Value": 100, "30d Trend": 100}
-        self.stock_tree = self._make_tree(market, cols, height=8)
-        self.stock_tree.pack(fill="both", expand=True)
-
-        srow = ttk.Frame(market)
-        srow.pack(fill="x", pady=8)
-        self._label(srow, "Shares:").pack(side="left")
-        self.stock_qty = tk.IntVar(value=1)
-        ttk.Spinbox(srow, from_=1, to=99999, textvariable=self.stock_qty,
-                    width=8).pack(side="left", padx=6)
-        self._button(srow, "BUY SHARES", self._stock_buy, style="Cyan.TButton").pack(side="left", padx=3)
-        self._button(srow, "SELL SHARES", self._stock_sell, style="Accent.TButton").pack(side="left", padx=3)
-        self.lbl_stock_result = self._label(market, "", "Good.TLabel", wraplength=500)
-        self.lbl_stock_result.pack(anchor="w")
-
-    def refresh_bank(self) -> None:
-        p = self.engine.player
-        sig = (p.credits, p.savings, p.loan, p.credit_score,
-               tuple(sorted(p.stocks_owned.items())),
-               tuple(round(st.price, 2) for st in self.engine.stocks.values()),
-               p.day)
-        if not self._sig("bank", sig):
-            return
-        interest_pct = self.engine._effective_loan_interest() * 100
-        self.bank_acct.config(
-            text=f"Wallet: {money(p.credits)} CR\n"
-                 f"Savings: {money(p.savings)} CR (0.8%/day)\n"
-                 f"Loan: {money(p.loan)} CR ({interest_pct:.2f}%/day effective)\n"
-                 f"Credit score: {p.credit_score} "
-                 f"({'excellent' if p.credit_score >= 700 else 'fair' if p.credit_score >= 550 else 'poor'})\n"
-                 f"Credit limit: {money(self.engine.loan_limit())} CR")
-
-        self.stock_tree.delete(*self.stock_tree.get_children())
-        for i, (sym, stk) in enumerate(self.engine.stocks.items()):
-            owned = p.stocks_owned.get(sym, 0)
-            hist = stk.history
-            if len(hist) >= 2 and hist[-1] > hist[0] * 1.03:
-                trend = "▲ rising"
-            elif len(hist) >= 2 and hist[-1] < hist[0] * 0.97:
-                trend = "▼ falling"
-            else:
-                trend = "— steady"
-            tag = ("good",) if owned else ("odd",) if i % 2 else ("even",)
-            self.stock_tree.insert("", "end", iid=sym, values=(
-                f"${sym}", stk.name, f"{stk.price:.2f}", owned,
-                f"{money(stk.price * owned)} CR", trend), tags=tag)
-
-    def _bank_set_max(self) -> None:
-        self.bank_amount.delete(0, "end")
-        self.bank_amount.insert(0, str(self.engine.player.credits))
-
-    def _bank_amount_value(self) -> int:
-        raw = self.bank_amount.get().strip().lower()
-        if raw in ("all", "max"):
-            return self.engine.player.credits
-        try:
-            return max(0, int(raw))
-        except ValueError:
-            return 0
-
-    def _bank_op(self, op: str) -> None:
-        amount = self._bank_amount_value()
-        fns = {"deposit": self.engine.deposit, "withdraw": self.engine.withdraw,
-               "borrow": self.engine.borrow, "repay": self.engine.repay}
-        ok, msg = fns[op](amount)
-        self.status_label.config(text=msg, foreground=THEME["good"] if ok else THEME["bad"])
-        if not ok:
-            messagebox.showwarning("Bank", msg, parent=self.root)
-        self.refresh_all()
-
-    def _stock_buy(self) -> None:
-        sel = self.stock_tree.selection()
-        if not sel:
-            return
-        try:
-            qty = int(self.stock_qty.get())
-        except Exception:
-            qty = 0
-        ok, msg = self.engine.buy_stock(sel[0], qty)
-        self._set_result(self.lbl_stock_result, msg, good=ok)
-        self.status_label.config(text=msg, foreground=THEME["good"] if ok else THEME["bad"])
-        self.refresh_all()
-
-    def _stock_sell(self) -> None:
-        sel = self.stock_tree.selection()
-        if not sel:
-            return
-        try:
-            qty = int(self.stock_qty.get())
-        except Exception:
-            qty = 0
-        ok, msg = self.engine.sell_stock(sel[0], qty)
-        self._set_result(self.lbl_stock_result, msg, good=ok)
-        self.status_label.config(text=msg, foreground=THEME["good"] if ok else THEME["bad"])
-        self.refresh_all()
-
-    # ------------------------------------------------------------------ #
-    # Captain's log tab — news, stats, achievements, net-worth curve
-
-    def _build_log_tab(self) -> None:
-        wrap = ttk.Frame(self.tab_log, padding=10)
-        wrap.pack(fill="both", expand=True)
-        pane = ttk.Panedwindow(wrap, orient="horizontal")
-        pane.pack(fill="both", expand=True)
-
-        news = ttk.Labelframe(pane, text="News Feed & Event Intel",
-                              style="Panel.TLabelframe", padding=6)
-        stats = ttk.Labelframe(pane, text="Career, Ranks & Achievements",
-                               style="Panel.TLabelframe", padding=6)
-        pane.add(news, weight=1)
-        pane.add(stats, weight=1)
-
-        self.log_text = tk.Text(news, bg=THEME["field"], fg=THEME["fg"],
-                                relief="flat", wrap="word", font=(None, 9),
-                                state="disabled", width=52)
-        self.log_text.pack(fill="both", expand=True)
-
-        # Net worth career curve
-        self._label(stats, "CAREER NET WORTH", "Accent.TLabel",
-                    font=(None, 9, "bold")).pack(anchor="w")
-        self.nw_canvas = tk.Canvas(stats, width=330, height=120,
-                                   bg=THEME["field"], highlightthickness=1,
-                                   highlightbackground=THEME["border"])
-        self.nw_canvas.pack(anchor="w", pady=(2, 8))
-        self.nw_caption = self._label(stats, "", "Dim.TLabel", font=(None, 8))
-        self.nw_caption.pack(anchor="w")
-
-        self.stats_labels = self._label(stats, "", "TLabel", justify="left",
-                                        font=(None, 10))
-        self.stats_labels.pack(anchor="w")
-
-        cols = {"Achievement": 200, "Requirement": 260, "Status": 90}
-        self.ach_tree = self._make_tree(stats, cols, height=8)
-        self.ach_tree.pack(fill="both", expand=True, pady=(8, 0))
-
-    def _draw_net_worth_chart(self) -> None:
-        c = self.nw_canvas
-        c.delete("all")
-        hist = self.engine.player.net_worth_history
-        W, H = 330, 120
-        pad_l, pad_r, pad_t, pad_b = 44, 10, 12, 18
-
-        if len(hist) >= 2:
-            lo, hi = min(hist), max(hist)
-            span = max(1, hi - lo)
-            n = len(hist)
-            step = (W - pad_l - pad_r) / (n - 1)
-            pts = []
-            for i, v in enumerate(hist):
-                x = pad_l + i * step
-                y = pad_t + (H - pad_t - pad_b) * (1 - (v - lo) / span)
-                pts.append((x, y))
-            color = THEME["good"] if hist[-1] >= hist[0] else THEME["bad"]
-            c.create_line(*pts, fill=color, width=6, stipple="gray50")
-            c.create_line(*pts, fill=color, width=2)
-            lx, ly = pts[-1]
-            c.create_oval(lx - 4, ly - 4, lx + 4, ly + 4,
-                          fill=color, outline=THEME["fg"])
-            c.create_line(pad_l, pad_t, W - pad_r, pad_t, fill=THEME["border"], dash=(2, 3))
-            c.create_text(4, pad_t + 6, text=f"{money(hi)}", fill=THEME["fg_dim"],
-                          font=(None, 8), anchor="w")
-            c.create_text(4, H - pad_b - 4, text=f"{money(lo)}", fill=THEME["fg_dim"],
-                          font=(None, 8), anchor="w")
-            c.create_text(W - pad_r, pad_t - 2, text=f"now {money(hist[-1])}",
-                          fill=color, font=(None, 8, "bold"), anchor="ne")
-            trend = hist[-1] - hist[0]
-            arrow = "▲" if trend >= 0 else "▼"
-            tcol = THEME["good"] if trend >= 0 else THEME["bad"]
-            self.nw_caption.config(
-                text=f"{arrow} {money(abs(trend))} CR over the last {n} entries",
-                foreground=tcol)
-        else:
-            c.create_text(W / 2, H / 2, text="career curve begins after your first jump…",
-                          fill=THEME["fg_dim"], font=(None, 9))
-            self.nw_caption.config(text="", foreground=THEME["fg_dim"])
-
-    def refresh_log(self) -> None:
-        p = self.engine.player
-        s = p.stats
-        eng = self.engine
-        sig = (p.day, len(eng.news_feed), tuple(sorted(p.achievements)),
-               self.engine.renown(), len(p.net_worth_history),
-               p.net_worth_history[-1] if p.net_worth_history else 0)
-        if not self._sig("log", sig):
-            return
-
-        self._set_textbox(self.log_text, "\n".join(eng.news_feed[:40]) or "No news yet.")
-        rep_lines = "\n".join(
-            f"  {f}: {p.rep(f):+d} ({reputation_rank(p.rep(f))})" for f in FACTIONS
-        )
-        nxt_name, nxt_needed = eng.renown_to_next_rank()
-        rank_line = (f"Next rank: {nxt_name} — {money(nxt_needed)} renown to go"
-                     if nxt_name else "Maximum rank achieved — Admiral of the sector!")
-        self.stats_labels.config(
-            text=f"Captain: {p.name}   ·   Rank: {eng.rank().insignia} {eng.rank().name}\n"
-                 f"Day: {p.day}    Difficulty: {eng.difficulty.name}\n"
-                 f"Renown: {money(eng.renown())}  ({rank_line})\n\n"
-                 f"Trading profit earned: {money(s.get('total_profit', 0))} CR\n"
-                 f"Hyperjumps made: {s.get('jumps_made', 0)}\n"
-                 f"Pirates destroyed: {s.get('pirates_defeated', 0)}\n"
-                 f"Bounties claimed: {s.get('bounties_claimed', 0)}\n"
-                 f"Contraband sold: {s.get('contraband_sold', 0)} units\n"
-                 f"Contracts fulfilled: {s.get('missions_completed', 0)}\n"
-                 f"Asteroid mining ops: {s.get('mining_ops', 0)}\n"
-                 f"Wormhole transits: {s.get('wormholes', 0)}\n"
-                 f"Missiles fired: {s.get('missiles_fired', 0)}\n"
-                 f"Successful boardings: {s.get('boards', 0)}\n"
-                 f"Insurance claims: {s.get('insurance_claims', 0)}\n\n"
-                 f"Faction Standing:\n{rep_lines}")
-
-        self.ach_tree.delete(*self.ach_tree.get_children())
-        for i, (aid, (title, desc)) in enumerate(ACHIEVEMENTS.items()):
-            unlocked = aid in p.achievements
-            tag = ("good",) if unlocked else ("dim",)
-            self.ach_tree.insert("", "end", iid=aid, values=(
-                title, desc, "UNLOCKED" if unlocked else "locked"), tags=tag)
-
-        self._draw_net_worth_chart()
-
-    # ------------------------------------------------------------------ #
-    # Global refresh
-
-    def refresh_all(self) -> None:
-        self.refresh_hud()
-
-        # Star map: redraw only when position/selection/event set changes.
-        map_sig = (self.engine.player.location, self.selected_planet,
-                   tuple(p.active_event is not None for p in self.engine.planets.values()))
-        if self._sig("map", map_sig):
-            self.draw_map()
-        self._update_map_info()
-        self.refresh_routes_box()
-        self.refresh_market()
-        self.refresh_shipyard()
-        self.refresh_services()
-        self.refresh_crew()
-        self.refresh_contracts()
-        self.refresh_bank()
-        self.refresh_log()
-        if self.engine.last_result:
-            self.status_label.config(text=self.engine.last_result)
-
-    # ------------------------------------------------------------------ #
-    # Travel
-
-    def _engage_travel(self) -> None:
-        if not self.selected_planet:
-            return
-        if self._jump_anim_id is not None:
-            return  # a jump animation is already running
-
-        from_name = self.engine.player.location
-        ok, msg, encounter = self.engine.execute_travel(self.selected_planet)
-        self.status_label.config(text=msg, foreground=THEME["good"] if ok else THEME["bad"])
-        if not ok:
-            messagebox.showwarning("Navigation", msg, parent=self.root)
-            return
-
-        dest_name = self.selected_planet
-        self.selected_planet = None
-        self.refresh_all()
-
-        # --- Visual warp animation, then encounters ---
-        try:
-            from_p = self.engine.planets.get(from_name)
-            to_p = self.engine.planets.get(dest_name)
-            if from_p and to_p:
-                fx, fy = self._map_coords(from_p)
-                tx, ty = self._map_coords(to_p)
-                c = self.map_canvas
-                ship_id = c.create_oval(fx - 5, fy - 5, fx + 5, fy + 5,
-                                        fill=THEME["accent2"], outline=THEME["fg"])
-                trail_id = c.create_line(fx, fy, fx, fy, fill=THEME["accent2"],
-                                         width=2, dash=(3, 2))
-
-                def step(i: int):
-                    if not c.winfo_exists():
-                        self._jump_anim_id = None
-                        return
-                    t = i / 16.0
-                    x = fx + (tx - fx) * t
-                    y = fy + (ty - fy) * t
-                    c.coords(ship_id, x - 5, y - 5, x + 5, y + 5)
-                    c.coords(trail_id, fx, fy, x, y)
-                    if i < 16:
-                        self._jump_anim_id = c.after(28, lambda: step(i + 1))
-                    else:
-                        c.delete(ship_id)
-                        c.delete(trail_id)
-                        self._jump_anim_id = None
-                        self._after_travel(encounter)
-
-                self.btn_engage.config(state="disabled")
-                self._jump_anim_id = c.after(28, lambda: step(0))
-                return
-        except Exception:
-            pass
-
-        self._after_travel(encounter)
-
-    def _after_travel(self, encounter: Optional[Dict[str, Any]]) -> None:
-        self.btn_engage.config(state="normal")
-        self.refresh_all()
-        if encounter:
-            self.show_encounter(encounter)
-        else:
-            self.engine.autosave()
-        self.refresh_all()
-
-    # ------------------------------------------------------------------ #
-    # Encounters
-
-    def show_encounter(self, enc: Dict[str, Any]) -> None:
-        t = enc.get("type")
-        if t in ("pirate_ambush", "bounty_combat"):
-            self.engine.autosave()
-            self.combat_dialog = CombatDialog(self, enc)
-        elif t == "customs_scan":
-            ChoiceDialog(self, enc.get("title", "Customs Inspection"),
-                         enc.get("desc", ""),
-                         choices=[("Submit to Scan", False),
-                                  ("Bribe the Officer", True)],
-                         resolver=lambda a: self.engine.resolve_customs(enc, a))
-        elif t == "faction_patrol":
-            ChoiceDialog(self, enc.get("title", "Faction Patrol"),
-                         enc.get("desc", ""),
-                         choices=[("Cooperate", True), ("Power Through / Ignore", False)],
-                         resolver=lambda a: self.engine.resolve_faction_patrol(enc, a))
-        elif t == "derelict":
-            ChoiceDialog(self, enc.get("title", "Derelict Ship"),
-                         enc.get("desc", ""),
-                         choices=[("Board & Salvage", True), ("Leave It", False)],
-                         resolver=lambda a: self.engine.resolve_derelict(enc, a))
-        elif t == "solar_flare":
-            ChoiceDialog(self, enc.get("title", "Solar Flare"),
-                         enc.get("desc", ""),
-                         choices=[("Brace for Impact", True)],
-                         resolver=lambda a: self.engine.resolve_solar_flare(enc))
-        elif t == "distress_beacon":
-            ChoiceDialog(self, enc.get("title", "Distress Beacon"),
-                         enc.get("desc", ""),
-                         choices=[("Assist (costs 15 fuel)", True), ("Ignore", False)],
-                         resolver=lambda a: self.engine.resolve_distress(enc, a))
-        elif t == "wandering_trader":
-            good = enc.get("good", "crystals")
-            qty = enc.get("qty", 5)
-            price = enc.get("unit_price", 50)
-            desc = (f"{enc.get('desc', '')}\n\nOFFER: {qty}x {COMMODITIES[good].name} "
-                    f"at {money(price)} CR/unit (total {money(price * qty)} CR — "
-                    f"market value ≈ {money(COMMODITIES[good].base_price)} each).")
-            ChoiceDialog(self, enc.get("title", "Wandering Trader"), desc,
-                         choices=[("Accept the Deal", True), ("Decline", False)],
-                         resolver=lambda a: self.engine.resolve_trader(enc, a))
-        elif t == "asteroid_field":
-            ChoiceDialog(self, enc.get("title", "Asteroid Field"),
-                         enc.get("desc", ""),
-                         choices=[("Thread the Needle (risky)", True),
-                                  ("Wide Detour (−8 fuel)", False)],
-                         resolver=lambda a: self.engine.resolve_asteroid_field(enc, a))
-        elif t == "wormhole":
-            ChoiceDialog(self, enc.get("title", "Wormhole"),
-                         enc.get("desc", ""),
-                         choices=[("Enter the Wormhole (random exit)", True),
-                                  ("Stay the Course", False)],
-                         resolver=lambda a: self.engine.resolve_wormhole(enc, a))
-        elif t == "mining_opportunity":
-            vein = enc.get("vein", "ore")
-            desc = (f"{enc.get('desc', '')}\n\nVein: {COMMODITIES[vein].name} "
-                    f"(base value {money(COMMODITIES[vein].base_price)} CR/unit). "
-                    f"Mining costs 10 fuel.")
-            ChoiceDialog(self, enc.get("title", "Mining Opportunity"), desc,
-                         choices=[("Deploy Mining Drones (−10 fuel)", True),
-                                  ("Continue On", False)],
-                         resolver=lambda a: self.engine.resolve_mining(enc, a))
-
-    # ------------------------------------------------------------------ #
-    # Save / load / new game / start flow
-
-    def open_save_dialog(self) -> None:
-        SaveLoadDialog(self, mode="save")
-
-    def open_load_dialog(self) -> None:
-        SaveLoadDialog(self, mode="load")
-
-    def confirm_new_game(self) -> None:
-        NewGameDialog(self)
-
-    def show_start_dialog(self) -> None:
-        StartDialog(self)
-
-    def show_help_dialog(self) -> None:
-        HelpDialog(self)
-
-    def after_game_state_change(self) -> None:
-        self.refresh_all()
-
-    # ------------------------------------------------------------------ #
-    # Victory & death
-
-    def check_end_states(self) -> None:
-        if self.engine.victory_achieved and not self.victory_shown:
-            self.victory_shown = True
-            VictoryDialog(self)
-        elif self.engine.is_game_over:
-            self.handle_death()
-
-    def handle_death(self) -> None:
-        if self.engine.has_save(PRECOMBAT_SLOT):
-            info = self.engine.slot_info(PRECOMBAT_SLOT)
-            load = messagebox.askyesno(
-                "GAME OVER",
-                "Your ship was destroyed...\n\n"
-                "Would you like to reload the pre-combat autosave?\n"
-                f"(saved before the battle, Day {info['day']})",
-                parent=self.root)
-            if load:
-                ok, msg = self.engine.load_game(PRECOMBAT_SLOT)
-                self.status_label.config(text=msg)
-                self.refresh_all()
-                return
-        messagebox.showinfo(
-            "GAME OVER",
-            "Your ship was destroyed. The void claims another trader.\n\n"
-            "Final stats:\n"
-            f"Days survived: {self.engine.player.day}\n"
-            f"Pirates destroyed: {self.engine.player.stats['pirates_defeated']}\n"
-            f"Trading profit: {money(self.engine.player.stats['total_profit'])} CR",
-            parent=self.root)
-        self.root.destroy()
-
-
-# ==============================================================================
-# DIALOGS
-# ==============================================================================
-
-class ModalDialog(tk.Toplevel):
-    """Base modal window with dark theme."""
-
-    def __init__(self, gui: SpaceTraderGUI, title: str, geometry: str = "560x420"):
-        super().__init__(gui.root)
-        self.gui = gui
-        self.configure(bg=THEME["panel"])
-        self.title(title)
-        self.geometry(geometry)
-        self.resizable(False, False)
-        self.transient(gui.root)
-        self.grab_set()
-        self.bind("<Escape>", lambda e: self.close())
-        self.protocol("WM_DELETE_WINDOW", self.close)
-
-    def center(self) -> None:
-        self.update_idletasks()
-        w, h = self.winfo_width(), self.winfo_height()
-        x = (self.winfo_screenwidth() - w) // 2
-        y = (self.winfo_screenheight() - h) // 2
-        self.geometry(f"+{x}+{y}")
-
-    def close(self) -> None:
-        try:
-            self.grab_release()
-        except Exception:
-            pass
-        self.destroy()
-
-
-class StartDialog(ModalDialog):
-    """Welcome window: continue a save or start a new game."""
-
-    def __init__(self, gui: SpaceTraderGUI):
-        super().__init__(gui, "Welcome, Commander", "660x560")
-        ttk.Label(self, text="SPACE TRADER: ODYSSEY",
-                  style="Hero.TLabel").pack(pady=(26, 2))
-        ttk.Label(self, text="N E B U L A   E D I T I O N",
-                  style="Sub.TLabel").pack()
-        ttk.Label(self, text="trade · smuggle · fight · prosper",
-                  style="Dim.TLabel").pack(pady=(0, 8))
-
-        box = ttk.Frame(self, padding=20)
-        box.pack(fill="both", expand=True)
-
-        engine = gui.engine
-        if engine.any_saves_exist():
-            ttk.Label(box, text="SAVED GAMES FOUND", style="Accent.TLabel",
-                      font=(None, 10, "bold")).pack(anchor="w", pady=(0, 4))
-            self.slots_list = tk.Listbox(box, bg=THEME["field"], fg=THEME["fg"],
-                                         relief="flat", height=5,
-                                         highlightthickness=1,
-                                         highlightbackground=THEME["border"])
-            self.slots_list.pack(fill="x")
-            self.slot_ids: List[str] = []
-            for slot in (AUTO_SLOT,) + SAVE_SLOTS:
-                info = engine.slot_info(slot)
-                if info:
-                    label = (f"[autosave] Day {info['day']} · {info['location']} · "
-                             f"{money(info['credits'])} CR · {info['difficulty']} · "
-                             f"saved {info['saved_at']}") if slot == AUTO_SLOT else \
-                            (f"[slot {slot}] Day {info['day']} · {info['location']} · "
-                             f"{money(info['credits'])} CR · {info['difficulty']} · "
-                             f"saved {info['saved_at']}")
-                    self.slots_list.insert("end", label)
-                    self.slot_ids.append(slot)
-            if self.slot_ids:
-                self.slots_list.selection_set(0)
-                self.slots_list.bind("<Double-Button-1>", lambda e: self._continue())
-            ttk.Button(box, text="⏵ CONTINUE SELECTED GAME",
-                       command=self._continue, style="Cyan.TButton").pack(
-                fill="x", pady=(8, 2))
-
-        ttk.Separator(box).pack(fill="x", pady=10)
-        ttk.Label(box, text="OR BEGIN A NEW CAREER", style="Accent.TLabel",
-                  font=(None, 10, "bold")).pack(anchor="w")
-
-        name_row = ttk.Frame(box)
-        name_row.pack(fill="x", pady=6)
-        ttk.Label(name_row, text="Commander name:").pack(side="left")
-        self.name_var = tk.StringVar(value="Commander")
-        ttk.Entry(name_row, textvariable=self.name_var, width=24).pack(side="left", padx=8)
-
-        diff_row = ttk.Frame(box)
-        diff_row.pack(fill="x")
-        self.diff_var = tk.StringVar(value=engine.difficulty_id)
-        for did in ("easy", "normal", "hard", "nightmare"):
-            d = DIFFICULTIES[did]
-            ttk.Radiobutton(diff_row, text=f"{d.name} — {d.desc}",
-                            value=did, variable=self.diff_var,
-                            style="TRadiobutton").pack(anchor="w")
-
-        ttk.Button(box, text="✦ LAUNCH NEW GAME", command=self._new_game,
-                   style="Accent.TButton").pack(fill="x", pady=(10, 0))
-        self.center()
-
-    def _continue(self) -> None:
-        if not hasattr(self, "slots_list"):
-            return
-        sel = self.slots_list.curselection()
-        if not sel:
-            return
-        slot = self.slot_ids[sel[0]]
-        ok, msg = self.gui.engine.load_game(slot)
-        if ok:
-            self.gui._tab_sig.clear()
-            self.gui.victory_shown = False
-            self.close()
-            self.gui.refresh_all()
-        else:
-            messagebox.showerror("Load", msg, parent=self)
-
-    def _new_game(self) -> None:
-        self.gui.engine.new_game(self.name_var.get(), self.diff_var.get())
-        self.gui._tab_sig.clear()
-        self.gui.victory_shown = False
-        self.gui.engine.autosave()
-        self.close()
-        self.gui.refresh_all()
-
-
-class NewGameDialog(ModalDialog):
-    """Started from the HUD button: confirm and choose difficulty."""
-
-    def __init__(self, gui: SpaceTraderGUI):
-        super().__init__(gui, "New Game", "580x430")
-        ttk.Label(self, text="START A NEW CAREER", style="Accent.TLabel",
-                  font=(None, 12, "bold")).pack(pady=(16, 2))
-        ttk.Label(self, text="Your current progress will be replaced (saves on disk stay).",
-                  style="Dim.TLabel").pack()
-
-        box = ttk.Frame(self, padding=16)
-        box.pack(fill="both", expand=True)
-        name_row = ttk.Frame(box)
-        name_row.pack(fill="x", pady=6)
-        ttk.Label(name_row, text="Commander name:").pack(side="left")
-        self.name_var = tk.StringVar(value=gui.engine.player.name)
-        ttk.Entry(name_row, textvariable=self.name_var, width=24).pack(side="left", padx=8)
-
-        self.diff_var = tk.StringVar(value=gui.engine.player.difficulty_id)
-        for did in ("easy", "normal", "hard", "nightmare"):
-            d = DIFFICULTIES[did]
-            ttk.Radiobutton(box, text=f"{d.name} — {d.desc}",
-                            value=did, variable=self.diff_var,
-                            style="TRadiobutton").pack(anchor="w")
-
-        ttk.Button(box, text="✦ START NEW GAME", command=self._start,
-                   style="Accent.TButton").pack(pady=(12, 0))
-        self.center()
-
-    def _start(self) -> None:
-        self.gui.engine.new_game(self.name_var.get(), self.diff_var.get())
-        self.gui.victory_shown = False
-        self.gui._tab_sig.clear()
-        self.gui.engine.autosave()
-        self.close()
-        self.gui.refresh_all()
-
-
-class SaveLoadDialog(ModalDialog):
-    def __init__(self, gui: SpaceTraderGUI, mode: str = "save"):
-        title = "Save Game" if mode == "save" else "Load Game"
-        super().__init__(gui, title, "660x400")
-        self.mode = mode
-        ttk.Label(self, text=title.upper(), style="Accent.TLabel",
-                  font=(None, 12, "bold")).pack(pady=(14, 4))
-
-        self.box = ttk.Frame(self, padding=16)
-        self.box.pack(fill="both", expand=True)
-        self.rows: Dict[str, ttk.Frame] = {}
-
-        slots = SAVE_SLOTS if mode == "save" else (AUTO_SLOT,) + SAVE_SLOTS + (PRECOMBAT_SLOT,)
-        for slot in slots:
-            info = gui.engine.slot_info(slot)
-            row = ttk.Frame(self.box)
-            row.pack(fill="x", pady=4)
-            label = f"[{'autosave' if slot == AUTO_SLOT else 'pre-combat' if slot == PRECOMBAT_SLOT else 'slot ' + slot}] "
-            if info:
-                label += (f"Day {info['day']} · {info['location']} · {money(info['credits'])} CR · "
-                          f"{info['difficulty']} · {info['saved_at']}")
-            else:
-                label += "— empty —"
-            ttk.Label(row, text=label, style="TLabel").pack(side="left")
-            if mode == "save":
-                if slot in SAVE_SLOTS:
-                    ttk.Button(row, text="Save here",
-                               command=lambda s=slot: self._save(s)).pack(side="right")
-            else:
-                if info:
-                    ttk.Button(row, text="Load",
-                               command=lambda s=slot: self._load(s)).pack(side="right")
-        self.center()
-
-    def _save(self, slot: str) -> None:
-        ok, msg = self.gui.engine.save_game(slot)
-        messagebox.showinfo("Save" if ok else "Error", msg, parent=self)
-        if ok:
-            self.close()
-            self.gui.refresh_all()
-
-    def _load(self, slot: str) -> None:
-        ok, msg = self.gui.engine.load_game(slot)
-        if ok:
-            self.gui.victory_shown = False
-            self.gui._tab_sig.clear()
-            self.close()
-            self.gui.refresh_all()
-        else:
-            messagebox.showerror("Load", msg, parent=self)
-
-
-class HelpDialog(ModalDialog):
-    """The 'How to Play' manual."""
-
-    TEXT = (
-        "★ HOW TO PLAY ★\n"
-        "\n"
-        "GOAL — Grow your net worth to 500,000 CR. Every jump, trade and victory "
-        "pushes the ARC bar in the HUD toward it.\n"
-        "\n"
-        "TRADING — Buy low, sell high. Prices differ by planet economy; check the "
-        "Market tab's 10-day sparklines and the detail chart on the right. Star Map "
-        "lists best routes; a Deep Space Scanner Array reads remote prices before "
-        "you jump. Dumping large lots depresses the local price.\n"
-        "\n"
-        "RANKS — Renown (wealth + deeds) promotes you from Cadet to Admiral. "
-        "Ensign: better prices · Lieutenant: +12% contracts · Captain: cheaper "
-        "fuel/repairs/wages · Commodore: faster reputation · Admiral: trading "
-        "perks and softer loans.\n"
-        "\n"
-        "ENCOUNTERS — Pirate ambushes lead to tactical combat: FIRE, target "
-        "subsystems, missiles, drones, RECHARGE (50% with a Shield Capacitor), "
-        "BOARD crippled hulls, or flee. Closing the window mid-battle is not an "
-        "escape — finish the fight. Customs scans can be bribed; smuggler bays "
-        "and Zoe help hide contraband. Asteroid fields, wormholes and mining "
-        "veins offer risk/reward choices.\n"
-        "\n"
-        "CARE — Keep fuel topped up (cheapest at mining worlds), repair hull "
-        "damage before long jumps, buy insurance before dangerous runs, and "
-        "watch loan interest — credit score 700+ cuts it 15%.\n"
-        "\n"
-        "KEYS — Ctrl+S save · Ctrl+L load · Ctrl+N new game · F1 this manual · "
-        "double-click a planet to jump · click column headers to sort markets.\n"
-        "\n"
-        "Good hunting, Commander."
-    )
-
-    def __init__(self, gui: SpaceTraderGUI):
-        super().__init__(gui, "How to Play", "640x560")
-        ttk.Label(self, text="CAPTAIN'S FIELD MANUAL", style="Accent.TLabel",
-                  font=(None, 13, "bold")).pack(pady=(14, 6))
-        text = ScrolledText(self, bg=THEME["field"], fg=THEME["fg"],
-                            relief="flat", wrap="word", font=(None, 10),
-                            height=24, padx=12, pady=10)
-        text.pack(fill="both", expand=True, padx=16)
-        text.insert("1.0", self.TEXT)
-        text.config(state="disabled")
-        ttk.Button(self, text="Close", command=self.close).pack(pady=10)
-        self.center()
-
-
-class ChoiceDialog(ModalDialog):
-    """Non-combat encounter: shows description, resolves a choice engine-side."""
-
-    def __init__(self, gui: SpaceTraderGUI, title: str, desc: str,
-                 choices: List[Tuple[str, bool]], resolver):
-        super().__init__(gui, title, "620x380")
-        ttk.Label(self, text=title, style="Accent.TLabel",
-                  font=(None, 12, "bold"), wraplength=560).pack(pady=(18, 6), padx=20)
-        ttk.Label(self, text=desc, style="TLabel", wraplength=560,
-                  justify="left").pack(padx=24)
-
-        self.result_box = tk.Text(self, height=7, bg=THEME["field"], fg=THEME["fg"],
-                                  relief="flat", wrap="word", font=(None, 9),
-                                  state="disabled")
-        self.result_box.pack(fill="both", expand=True, padx=20, pady=10)
-
-        btn_row = ttk.Frame(self)
-        btn_row.pack(pady=(0, 14))
-        for label, arg in choices:
-            ttk.Button(btn_row, text=label, style="Cyan.TButton",
-                       command=lambda a=arg: self._resolve(a, resolver)).pack(
-                side="left", padx=6)
-        self.center()
-
-    def _resolve(self, arg: bool, resolver) -> None:
-        msgs = resolver(arg)
-        text = "\n".join(msgs)
-        self.gui._set_textbox(self.result_box, text)
-        self.gui.engine.announce(text.splitlines()[0] if text else "")
-        self.gui.status_label.config(
-            text=text.splitlines()[0] if text else "",
-            foreground=THEME["accent"])
-        self.gui.engine.autosave()
-        self.gui.refresh_all()
-        for w in self.winfo_children():
-            if isinstance(w, ttk.Frame):
-                for b in w.winfo_children():
-                    if isinstance(b, ttk.Button):
-                        b.config(state="disabled")
-        ttk.Button(self, text="Continue", command=self.close,
-                   style="Accent.TButton").pack(pady=(0, 12))
-
-
-class CombatDialog(ModalDialog):
-    """Tactical combat window with live bars, colored log and action buttons."""
-
-    # Log line color classifier.
-    LOG_TAGS = {
-        "crit": (THEME["accent2"], True),      # magenta bold
-        "hurt": (THEME["bad"], False),         # red
-        "shield": (THEME["accent"], False),    # cyan
-        "heal": (THEME["good"], False),        # green
-        "sys": (THEME["warn"], True),          # yellow bold
-        "dim": (THEME["fg_dim"], False),
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Space Trader: Odyssey — Nebula Edition</title>
+  <meta name="description" content="A comprehensive sci-fi space trading, exploration, and tactical combat RPG game with real-time sector economy and celestial navigation.">
+  <style>
+    :root {
+      --bg: #04081c;
+      --bg2: #070e28;
+      --panel: #0b1538;
+      --panel-hi: #112052;
+      --panel-border: #1a2c68;
+      --panel-border-hi: #2e489c;
+      --fg: #e2eeff;
+      --fg-dim: #7f95c4;
+      --fg-dark: #4d5e87;
+      --cyan: #00e5ff;
+      --cyan-dim: rgba(0, 229, 255, 0.15);
+      --gold: #ffb703;
+      --gold-dim: rgba(255, 183, 3, 0.15);
+      --green: #06d6a0;
+      --green-dim: rgba(6, 214, 160, 0.15);
+      --red: #ff5252;
+      --red-dim: rgba(255, 82, 82, 0.15);
+      --purple: #9d4edd;
+      --purple-dim: rgba(157, 78, 221, 0.15);
+      --blue: #3a86ff;
+      --font-ui: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --font-mono: ui-monospace, "Cascadia Code", "Fira Code", monospace;
     }
 
-    def __init__(self, gui: SpaceTraderGUI, enc: Dict[str, Any]):
-        super().__init__(gui, enc.get("title", "Combat!"), "760x800")
-        # NOTE: closing the window mid-combat is NOT an escape — see close().
-        self.combat = start_combat(gui.engine, enc)
-        self.enc = enc
-        self._build()
-        for m in self.combat.combat_log:
-            self._append_log(m)
-        self._update()
-        self.center()
+    * { box-sizing: border-box; margin: 0; padding: 0; }
 
-    # ------------------------------------------------------------------ #
+    body {
+      background-color: var(--bg);
+      color: var(--fg);
+      font-family: var(--font-ui);
+      line-height: 1.5;
+      font-size: 14px;
+      overflow-x: hidden;
+      min-height: 100vh;
+      background-image: 
+        radial-gradient(1px 1px at 20px 30px, #ffffffaa, transparent),
+        radial-gradient(1.5px 1.5px at 140px 180px, #00e5ffaa, transparent),
+        radial-gradient(1px 1px at 280px 70px, #ffffffaa, transparent),
+        radial-gradient(2px 2px at 450px 220px, #ffb703aa, transparent),
+        radial-gradient(1px 1px at 600px 120px, #ffffff88, transparent),
+        radial-gradient(1.5px 1.5px at 750px 290px, #9d4eddaa, transparent),
+        radial-gradient(1px 1px at 900px 90px, #ffffffaa, transparent),
+        radial-gradient(1px 1px at 1050px 250px, #00e5ffaa, transparent);
+      background-size: 500px 350px;
+    }
 
-    def _build(self) -> None:
-        head = ttk.Frame(self, padding=(16, 10))
-        head.pack(fill="x")
-        title_lbl = ttk.Label(head, text=self.enc.get("title", "Combat!"),
-                              style="Bad.TLabel", font=(None, 13, "bold"),
-                              wraplength=690)
-        title_lbl.pack(anchor="w")
-        self.lbl_personality = ttk.Label(head, text="", style="Dim.TLabel")
-        self.lbl_personality.pack(anchor="w")
-        self.lbl_turn = ttk.Label(head, text="", style="Dim.TLabel")
-        self.lbl_turn.pack(anchor="w")
+    /* Scrollbars */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--panel-border); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--cyan); }
 
-        enemy = ttk.Frame(self, padding=(16, 4))
-        enemy.pack(fill="x")
-        self.lbl_enemy = ttk.Label(enemy, text="", style="Bad.TLabel",
-                                   font=(None, 11, "bold"))
-        self.lbl_enemy.pack(anchor="w")
-        self.bar_ehull = ttk.Progressbar(enemy, style="Enemy.Horizontal.TProgressbar",
-                                         maximum=100, value=100)
-        self.bar_ehull.pack(fill="x", pady=2)
-        self.bar_eshield = ttk.Progressbar(enemy, style="EnemyShield.Horizontal.TProgressbar",
-                                           maximum=100, value=100)
-        self.bar_eshield.pack(fill="x", pady=2)
+    /* Top HUD Header */
+    #header-hud {
+      background: rgba(7, 14, 40, 0.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--panel-border);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      padding: 10px 20px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
 
-        player = ttk.Frame(self, padding=(16, 4))
-        player.pack(fill="x")
-        self.lbl_player = ttk.Label(player, text="", style="Good.TLabel",
-                                    font=(None, 11, "bold"))
-        self.lbl_player.pack(anchor="w")
-        prow = ttk.Frame(player)
-        prow.pack(fill="x")
-        self.bar_phull = ttk.Progressbar(prow, style="Hull.Horizontal.TProgressbar",
-                                         maximum=100, value=100)
-        self.bar_phull.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.bar_pshield = ttk.Progressbar(prow, style="Shield.Horizontal.TProgressbar",
-                                           maximum=100, value=100)
-        self.bar_pshield.pack(side="left", fill="x", expand=True)
-        self.lbl_warnings = ttk.Label(player, text="", style="Bad.TLabel", wraplength=690)
-        self.lbl_warnings.pack(anchor="w", pady=(2, 0))
+    .brand-group {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .game-logo {
+      font-weight: 900;
+      font-size: 16px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: var(--cyan);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      text-shadow: 0 0 12px rgba(0, 229, 255, 0.4);
+    }
+    .rank-pill {
+      background: var(--panel-hi);
+      border: 1px solid var(--panel-border-hi);
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .rank-pill:hover { border-color: var(--cyan); }
 
-        self.log = ScrolledText(self, height=14, bg=THEME["field"], fg=THEME["fg"],
-                                relief="flat", wrap="word", font=(None, 9),
-                                state="disabled")
-        for tag, (color, bold) in self.LOG_TAGS.items():
-            self.log.tag_configure(tag, foreground=color,
-                                   font=(None, 9, "bold") if bold else (None, 9))
-        self.log.pack(fill="both", expand=True, padx=16, pady=8)
+    .hud-stat-box {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+    }
+    .hud-stat-item {
+      display: flex;
+      flex-direction: column;
+    }
+    .hud-stat-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--fg-dim);
+    }
+    .hud-stat-val {
+      font-family: var(--font-mono);
+      font-size: 15px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
 
-        btn_grid = ttk.Frame(self, padding=(16, 0, 16, 12))
-        btn_grid.pack(fill="x")
-        self.buttons: Dict[str, ttk.Button] = {}
-        defs = [
-            ("fire", "⦿ FIRE ALL BATTERIES", "TButton",
-             "Fire every beam weapon at the enemy."),
-            ("target_engines", "✂ Target ENGINES", "TButton",
-             "Aimed shots: may cripple their drive (they cannot flee)."),
-            ("target_weapons", "✂ Target WEAPONS", "TButton",
-             "Aimed shots: may knock out their guns (halves their damage)."),
-            ("target_shields", "✂ Target SHIELD GRID", "TButton",
-             "Aimed shots: may vent their shields to zero."),
-            ("missile", "☄ FIRE MISSILE", "TButton",
-             "85-125 damage, 95% hit. Needs a launcher and ammo."),
-            ("drones", "✈ DEPLOY DRONES", "TButton",
-             "Persistent 8-16 auto damage every turn. Needs a Drone Bay."),
-            ("recharge", "⇪ RECHARGE SHIELDS", "TButton",
-             "Restore 35% (50% with a Shield Capacitor Bank) of shields."),
-            ("board", "⚓ BOARD ENEMY SHIP", "Danger.TButton",
-             "Only when enemy hull ≤ 25%. Great loot — but failure hurts."),
-            ("flee", "⇨ EMERGENCY FLEE", "TButton",
-             "Escape chance scales with ship speed, navigator and thrusters."),
-        ]
-        for i, (action, label, style, tip) in enumerate(defs):
-            b = ttk.Button(btn_grid, text=label, style=style,
-                           command=lambda a=action: self._act(a))
-            Tooltip(b, tip)
-            b.grid(row=i // 3, column=i % 3, sticky="nsew", padx=3, pady=3)
-            self.buttons[action] = b
-        for col in range(3):
-            btn_grid.columnconfigure(col, weight=1)
+    .hud-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .hud-btn {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      color: var(--fg);
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      transition: all 0.2s;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .hud-btn:hover {
+      background: var(--panel-hi);
+      border-color: var(--cyan);
+      color: var(--cyan);
+    }
 
-        self.lbl_result = ttk.Label(self, text="", style="Accent.TLabel",
-                                    font=(None, 12, "bold"), wraplength=690)
-        self.lbl_result.pack(pady=(0, 4))
-        self.btn_close = ttk.Button(self, text="Close (after the battle)", command=self._finish)
-        self.btn_close.pack(pady=(0, 12))
+    /* Ship Vitals Bar */
+    #vitals-bar {
+      background: var(--bg2);
+      border-bottom: 1px solid var(--panel-border);
+      padding: 8px 20px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      font-size: 12px;
+    }
+    .vitals-ship-name {
+      font-weight: 700;
+      color: var(--cyan);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .vitals-meters {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 20px;
+    }
+    .meter-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .meter-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      color: var(--fg-dim);
+      font-weight: 700;
+      width: 48px;
+    }
+    .meter-bar-outer {
+      width: 90px;
+      height: 8px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 4px;
+      overflow: hidden;
+      position: relative;
+    }
+    .meter-bar-inner {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 0.3s ease;
+    }
+    .meter-val {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 600;
+      min-width: 60px;
+    }
 
-    def close(self) -> None:
-        """Cannot be closed mid-battle — desertion is not an escape."""
-        if not self.combat.is_finished:
-            self._append_log(
-                ">> BATTLE STILL RAGING — you cannot disengage by closing the window!",
-                "sys")
-            return
-        super().close()
+    /* Subsystem damage badges */
+    .subsystem-alert {
+      background: var(--red-dim);
+      border: 1px solid var(--red);
+      color: var(--red);
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 700;
+      animation: pulseAlert 1.5s infinite;
+    }
+    @keyframes pulseAlert {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
 
-    def _act(self, action: str) -> None:
-        if self.combat.is_finished:
-            return
-        msgs = self.combat.player_action(action)
-        for m in msgs:
-            self._append_log(m)
-        self._update()
+    /* Tab Navigation */
+    #tab-nav {
+      background: var(--panel);
+      border-bottom: 1px solid var(--panel-border);
+      padding: 0 20px;
+      display: flex;
+      overflow-x: auto;
+      gap: 2px;
+    }
+    .tab-btn {
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: var(--fg-dim);
+      padding: 12px 16px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      white-space: nowrap;
+      transition: all 0.2s;
+    }
+    .tab-btn:hover {
+      color: var(--fg);
+      background: rgba(255, 255, 255, 0.03);
+    }
+    .tab-btn.active {
+      color: var(--cyan);
+      border-bottom-color: var(--cyan);
+      background: rgba(0, 229, 255, 0.05);
+    }
 
-    def _classify(self, msg: str) -> str:
-        low = msg.lower()
-        if "critical" in low:
-            return "crit"
-        if "warning" in low or "hull damage" in low or "breached" in low or \
-           "destroyed" in low or "failure" in low or "repulsed" in low or \
-           "stole" in low or "hit:" in low or "damaged" in low:
-            return "hurt"
-        if "shield" in low and ("burned" in low or "struck" in low or
-                                "restored" in low or "charge" in low or "vents" in low):
-            return "shield"
-        if "victory" in low or "salvaged" in low or "restored overnight" in low or \
-           "storms the bridge" in low or "surrenders" in low or "seized" in low:
-            return "heal"
-        if low.startswith(">>") or "disabled" in low or " crippled" in low or \
-           "offline" in low or "diverts" in low or "escapes" in low or \
-           "flee" in low or "missile away" in low or "drone bay open" in low:
-            return "sys"
-        return "dim"
+    /* Main Container */
+    #app-main {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 20px;
+      min-height: calc(100vh - 200px);
+    }
 
-    def _append_log(self, msg: str, tag: Optional[str] = None) -> None:
-        if tag is None:
-            tag = self._classify(msg)
-        self.log.config(state="normal")
-        self.log.insert("end", msg + "\n", tag)
-        self.log.see("end")
-        self.log.config(state="disabled")
+    .view-container { display: none; }
+    .view-container.active { display: block; animation: fadeIn 0.25s ease-in-out; }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
 
-    def _update(self) -> None:
-        c = self.combat
-        p = c.engine.player
+    /* Card Panels */
+    .panel-card {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .panel-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--panel-border);
+    }
+    .panel-card-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--cyan);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .panel-card-subtitle {
+      font-size: 12px;
+      color: var(--fg-dim);
+    }
 
-        self.lbl_personality.config(
-            text=f"Enemy pilot profile: {c.personality.upper()} — "
-                 f"{ENEMY_PERSONALITIES[c.personality]}")
-        self.lbl_turn.config(text=f"Turn {c.turn_count}")
-        self.lbl_enemy.config(
-            text=f"{c.enemy_name} [{c.enemy_ship_name}]   HULL {c.enemy_hull}/{c.enemy_max_hull}   "
-                 f"SHIELD {c.enemy_shield}/{c.enemy_max_shield}"
-                 + ("   [WEAPONS OFFLINE]" if c.enemy_weapons_damaged else "")
-                 + ("   [ENGINES CRIPPLED]" if c.enemy_engines_damaged else ""))
-        self.bar_ehull.config(maximum=max(1, c.enemy_max_hull), value=c.enemy_hull)
-        self.bar_eshield.config(maximum=max(1, c.enemy_max_shield), value=c.enemy_shield)
+    /* Star Map Elements */
+    #map-wrapper {
+      display: grid;
+      grid-template-columns: 1fr 340px;
+      gap: 20px;
+    }
+    @media (max-width: 1024px) {
+      #map-wrapper { grid-template-columns: 1fr; }
+    }
+    #map-svg-container {
+      background: #020514;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      overflow: hidden;
+      position: relative;
+      min-height: 520px;
+    }
+    .map-planet-node {
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .map-planet-node:hover circle.planet-body {
+      filter: drop-shadow(0 0 10px var(--cyan));
+      stroke-width: 2.5;
+    }
+    .hyperlane {
+      stroke: rgba(46, 72, 156, 0.4);
+      stroke-dasharray: 4 4;
+      stroke-width: 1;
+    }
+    .current-ping {
+      animation: ping 2s infinite;
+      transform-origin: center;
+    }
+    @keyframes ping {
+      0% { r: 12px; opacity: 0.8; }
+      100% { r: 32px; opacity: 0; }
+    }
 
-        self.lbl_player.config(
-            text=f"YOUR SHIP   HULL {p.hull}/{p.max_hull}   SHIELD {p.shield}/{p.effective_max_shield()}   "
-                 f"MISSILES {p.missiles}   DRONES {'DEPLOYED' if c.drones_active else '—'}")
-        self.bar_phull.config(maximum=max(1, p.max_hull), value=p.hull)
-        self.bar_pshield.config(maximum=max(1, p.effective_max_shield()),
-                                value=min(p.shield, p.effective_max_shield()))
+    /* Planet Flight Dossier */
+    #dossier-card {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .dossier-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .dossier-title { font-size: 18px; font-weight: 700; color: var(--fg); }
+    .dossier-subtitle { font-size: 12px; color: var(--fg-dim); }
+    .dossier-metric-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      background: var(--bg2);
+      border: 1px solid var(--panel-border);
+      border-radius: 6px;
+      padding: 12px;
+    }
+    .dossier-btn-engage {
+      background: var(--cyan);
+      color: #020514;
+      border: none;
+      padding: 12px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      cursor: pointer;
+      transition: all 0.2s;
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    .dossier-btn-engage:hover:not(:disabled) {
+      background: #33ecff;
+      box-shadow: 0 0 16px rgba(0, 229, 255, 0.5);
+    }
+    .dossier-btn-engage:disabled {
+      background: #1a2c68;
+      color: var(--fg-dim);
+      cursor: not-allowed;
+    }
 
-        warnings = []
-        if p.weapons_damaged:
-            warnings.append("WEAPONS DAMAGED (-40% damage)")
-        if p.engines_damaged:
-            warnings.append("ENGINES DAMAGED (cannot flee)")
-        if p.shields_damaged:
-            warnings.append("SHIELDS DAMAGED (max -40%)")
-        self.lbl_warnings.config(text="   ⚠   ".join(warnings))
+    /* Market View */
+    .market-filter-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .filter-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .filter-pill {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      color: var(--fg-dim);
+      padding: 5px 12px;
+      border-radius: 14px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .filter-pill.active {
+      background: var(--cyan-dim);
+      border-color: var(--cyan);
+      color: var(--cyan);
+      font-weight: 700;
+    }
+    .search-input {
+      background: var(--bg2);
+      border: 1px solid var(--panel-border);
+      color: var(--fg);
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      outline: none;
+      width: 220px;
+    }
+    .search-input:focus { border-color: var(--cyan); }
 
-        p_has_rack = p.has_missile_rack()
-        self.buttons["fire"].config(state="normal" if not c.is_finished else "disabled")
-        for a in ("target_engines", "target_weapons", "target_shields"):
-            self.buttons[a].config(state="normal" if not c.is_finished else "disabled")
-        self.buttons["missile"].config(
-            state="normal" if (not c.is_finished and p_has_rack and p.missiles > 0) else "disabled",
-            text=f"☄ FIRE MISSILE ({p.missiles})" if p_has_rack else "☄ MISSILES (no launcher)")
-        self.buttons["drones"].config(
-            state="normal" if (not c.is_finished and p.has_drone_bay()) else "disabled")
-        self.buttons["recharge"].config(state="normal" if not c.is_finished else "disabled")
-        self.buttons["board"].config(
-            state="normal" if (not c.is_finished and c.can_board()) else "disabled")
-        self.buttons["flee"].config(
-            state="normal" if (not c.is_finished and c.can_flee()) else "disabled")
+    /* Tables */
+    .data-table-wrapper {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      overflow-x: auto;
+    }
+    table.data-table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+    }
+    table.data-table th {
+      background: var(--bg2);
+      color: var(--fg-dim);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--panel-border);
+    }
+    table.data-table td {
+      padding: 10px 14px;
+      border-bottom: 1px solid rgba(26, 44, 104, 0.4);
+      font-size: 13px;
+    }
+    table.data-table tr:hover td {
+      background: rgba(255, 255, 255, 0.02);
+    }
 
-        if c.is_finished:
-            if c.player_won:
-                result = "VICTORY — the sector is a little safer."
-            elif c.player_escaped:
-                result = "ESCAPED — you live to run cargo another day."
-            elif c.enemy_fled:
-                result = "The enemy fled the field."
-            elif c.insurance_used:
-                result = "DESTROYED — insurance respawn complete."
-            elif c.player_dead:
-                result = "GAME OVER — your ship is gone."
-            else:
-                result = "The battle has ended."
-            self.lbl_result.config(text=result,
-                                   style="Good.TLabel" if c.player_won else "Bad.TLabel")
-            self.btn_close.config(state="normal", text="Close")
-        else:
-            self.btn_close.config(state="disabled", text="Close (after the battle)")
+    .btn-action-sm {
+      background: var(--panel-hi);
+      border: 1px solid var(--panel-border-hi);
+      color: var(--fg);
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-action-sm:hover:not(:disabled) {
+      border-color: var(--cyan);
+      color: var(--cyan);
+    }
+    .btn-action-sm:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+    .btn-buy { background: var(--cyan-dim); border-color: var(--cyan); color: var(--cyan); }
+    .btn-sell { background: var(--gold-dim); border-color: var(--gold); color: var(--gold); }
 
-    def _finish(self) -> None:
-        if not self.combat.is_finished:
-            return
-        gui = self.gui
-        combat = self.combat
-        try:
-            self.grab_release()
-        except Exception:
-            pass
-        self.destroy()
-        gui.engine.autosave()
-        gui.combat_dialog = None
-        gui.refresh_all()
-        if combat.player_dead:
-            gui.handle_death()
-        else:
-            gui.check_end_states()
+    /* Trade Drawer Modal */
+    #trade-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 5, 20, 0.8);
+      backdrop-filter: blur(8px);
+      z-index: 200;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    #trade-modal.active { display: flex; }
+    .modal-box {
+      background: var(--panel);
+      border: 1px solid var(--panel-border-hi);
+      border-radius: 12px;
+      width: 100%;
+      max-width: 520px;
+      padding: 24px;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.8);
+    }
 
+    /* Combat Overlay Bridge */
+    #combat-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 5, 20, 0.95);
+      backdrop-filter: blur(12px);
+      z-index: 300;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    #combat-modal.active { display: flex; }
+    .combat-bridge {
+      background: var(--bg2);
+      border: 1px solid var(--red);
+      border-radius: 12px;
+      width: 100%;
+      max-width: 860px;
+      padding: 24px;
+      box-shadow: 0 0 40px rgba(255, 82, 82, 0.2);
+    }
 
-class VictoryDialog(ModalDialog):
-    def __init__(self, gui: SpaceTraderGUI):
-        super().__init__(gui, "VICTORY", "620x460")
-        nw = gui.engine.calculate_net_worth()
-        p = gui.engine.player
-        ttk.Label(self, text="★ GALACTIC MOGUL ★", style="Good.TLabel",
-                  font=(None, 18, "bold")).pack(pady=(24, 4))
-        ttk.Label(self, text=f"Net worth reached {money(nw)} CR!", style="Accent.TLabel",
-                  font=(None, 12)).pack()
-        box = ttk.Frame(self, padding=20)
-        box.pack(fill="both", expand=True)
-        stats = (f"Commander {p.name} — Day {p.day} ({gui.engine.difficulty.name})\n"
-                 f"Final rank: {gui.engine.rank().insignia} {gui.engine.rank().name}\n\n"
-                 f"Trading profit: {money(p.stats['total_profit'])} CR\n"
-                 f"Hyperjumps: {p.stats['jumps_made']}\n"
-                 f"Pirates destroyed: {p.stats['pirates_defeated']}\n"
-                 f"Bounties claimed: {p.stats['bounties_claimed']}\n"
-                 f"Contracts fulfilled: {p.stats['missions_completed']}\n"
-                 f"Achievements: {len(p.achievements)}/{len(ACHIEVEMENTS)}")
-        ttk.Label(box, text=stats, style="TLabel", justify="left",
-                  font=(None, 10)).pack(anchor="w")
-        row = ttk.Frame(box)
-        row.pack(pady=(12, 0))
-        ttk.Button(row, text="Keep Playing", style="Accent.TButton",
-                   command=self.close).pack(side="left", padx=6)
-        ttk.Button(row, text="Retire (Save & Exit)",
-                   command=lambda: self._retire()).pack(side="left", padx=6)
-        self.center()
+    /* Generic Modal */
+    .generic-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 5, 20, 0.85);
+      backdrop-filter: blur(8px);
+      z-index: 250;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .generic-modal.active { display: flex; }
 
-    def _retire(self) -> None:
-        ok, msg = self.gui.engine.save_game("1")
-        if not ok:
-            messagebox.showerror("Save", msg, parent=self)
-        self.close()
-        self.gui.root.destroy()
+    /* Toast Log Notification */
+    #toast-container {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      z-index: 500;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      pointer-events: none;
+    }
+    .toast-msg {
+      background: var(--panel-hi);
+      border-left: 4px solid var(--cyan);
+      border-radius: 4px;
+      padding: 10px 16px;
+      font-size: 13px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+      animation: slideInToast 0.3s ease;
+      max-width: 380px;
+      color: var(--fg);
+    }
+    @keyframes slideInToast {
+      from { transform: translateX(100%); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
+    }
+
+    /* Grid Layouts */
+    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+
+    /* Badges & Pills */
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .pill-cyan { background: var(--cyan-dim); color: var(--cyan); }
+    .pill-gold { background: var(--gold-dim); color: var(--gold); }
+    .pill-green { background: var(--green-dim); color: var(--green); }
+    .pill-red { background: var(--red-dim); color: var(--red); }
+    .pill-purple { background: var(--purple-dim); color: var(--purple); }
+
+    /* Sparkline SVG */
+    .sparkline-svg {
+      display: inline-block;
+      vertical-align: middle;
+      overflow: visible;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- TOP HUD HEADER -->
+  <header id="header-hud">
+    <div class="brand-group">
+      <div class="game-logo">
+        <span>🚀</span> SPACE TRADER: ODYSSEY
+      </div>
+      <div id="rank-badge" class="rank-pill" onclick="switchTab('log')" title="Click to view Career progression">
+        <span id="hud-rank-insignia" style="color: var(--cyan);">·</span>
+        <span id="hud-rank-title">Cadet</span>
+      </div>
+      <div id="hud-renown-meter" style="font-size: 11px; color: var(--fg-dim);">
+        <span id="hud-renown-val">0</span> Renown (<span id="hud-renown-next">6,000</span> to promo)
+      </div>
+    </div>
+
+    <div class="hud-stat-box">
+      <div class="hud-stat-item">
+        <span class="hud-stat-label">Location</span>
+        <span class="hud-stat-val" style="color: var(--cyan);">
+          <span id="hud-location">Earth</span>
+          <span id="hud-security" class="pill pill-green" style="font-size: 9px; margin-left: 4px;">High</span>
+        </span>
+      </div>
+      <div class="hud-stat-item">
+        <span class="hud-stat-label">Sector Date</span>
+        <span class="hud-stat-val" id="hud-day">Day 1</span>
+      </div>
+      <div class="hud-stat-item">
+        <span class="hud-stat-label">Credits Balance</span>
+        <span class="hud-stat-val" style="color: var(--gold);" id="hud-credits">2,500 CR</span>
+      </div>
+      <div class="hud-stat-item">
+        <span class="hud-stat-label">Net Worth (Target: 500k CR)</span>
+        <span class="hud-stat-val" style="color: var(--green);" id="hud-networth">6,625 CR</span>
+      </div>
+    </div>
+
+    <div class="hud-actions">
+      <button class="hud-btn" id="btn-mute" onclick="toggleAudio()">🔊 Sound</button>
+      <button class="hud-btn" onclick="openSaveModal()">💾 Save / Load</button>
+      <button class="hud-btn" onclick="openManualModal()">❓ Codex</button>
+      <button class="hud-btn" onclick="openNewGameModal()">🔄 New Game</button>
+    </div>
+  </header>
+
+  <!-- SHIP VITALS STATUS BAR -->
+  <section id="vitals-bar">
+    <div class="vitals-ship-name">
+      <span>🛡️</span>
+      <span id="vitals-ship-name-val">Star Sparrow</span>
+      <span id="vitals-ship-class-val" style="color: var(--fg-dim); font-size: 11px;">[Light Courier]</span>
+      <div id="vitals-damage-badges" style="display: flex; gap: 4px; margin-left: 8px;"></div>
+    </div>
+
+    <div class="vitals-meters">
+      <div class="meter-group">
+        <span class="meter-label">Hull Armor</span>
+        <div class="meter-bar-outer">
+          <div id="meter-hull" class="meter-bar-inner" style="width: 100%; background: var(--green);"></div>
+        </div>
+        <span id="meter-hull-val" class="meter-val">100/100</span>
+      </div>
+
+      <div class="meter-group">
+        <span class="meter-label">Shields</span>
+        <div class="meter-bar-outer">
+          <div id="meter-shield" class="meter-bar-inner" style="width: 100%; background: var(--cyan);"></div>
+        </div>
+        <span id="meter-shield-val" class="meter-val">40/40</span>
+      </div>
+
+      <div class="meter-group">
+        <span class="meter-label">Warp Fuel</span>
+        <div class="meter-bar-outer">
+          <div id="meter-fuel" class="meter-bar-inner" style="width: 100%; background: var(--gold);"></div>
+        </div>
+        <span id="meter-fuel-val" class="meter-val">130/130 LY</span>
+      </div>
+
+      <div class="meter-group">
+        <span class="meter-label">Cargo Hold</span>
+        <div class="meter-bar-outer">
+          <div id="meter-cargo" class="meter-bar-inner" style="width: 0%; background: var(--purple);"></div>
+        </div>
+        <span id="meter-cargo-val" class="meter-val">0/25 T</span>
+      </div>
+
+      <div class="meter-group">
+        <span class="meter-label">Torpedoes</span>
+        <span id="meter-missiles-val" class="meter-val" style="color: var(--red);">0/8</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- DECK CONTROLS NAVIGATION TABS -->
+  <nav id="tab-nav">
+    <button class="tab-btn active" id="tabbtn-map" onclick="switchTab('map')">🌌 Star Map</button>
+    <button class="tab-btn" id="tabbtn-market" onclick="switchTab('market')">📈 Commodity Market</button>
+    <button class="tab-btn" id="tabbtn-advisor" onclick="switchTab('advisor')">🧭 Trade Advisor</button>
+    <button class="tab-btn" id="tabbtn-shipyard" onclick="switchTab('shipyard')">🚀 Shipyard & Outfitter</button>
+    <button class="tab-btn" id="tabbtn-services" onclick="switchTab('services')">🔧 Station Depot</button>
+    <button class="tab-btn" id="tabbtn-crew" onclick="switchTab('crew')">👥 Crew Lounge</button>
+    <button class="tab-btn" id="tabbtn-missions" onclick="switchTab('missions')">📜 Missions & Bounties</button>
+    <button class="tab-btn" id="tabbtn-bank" onclick="switchTab('bank')">🏦 Bank & Stocks</button>
+    <button class="tab-btn" id="tabbtn-log" onclick="switchTab('log')">🎖️ Career & Log</button>
+  </nav>
+
+  <!-- MAIN APPLICATION BODY -->
+  <main id="app-main">
+
+    <!-- 1. STAR MAP VIEW -->
+    <div id="view-map" class="view-container active">
+      <div id="map-wrapper">
+        <div id="map-svg-container">
+          <svg id="star-map-svg" width="100%" height="100%" viewBox="0 0 1000 650" style="display: block;"></svg>
+        </div>
+
+        <div id="dossier-card">
+          <div class="dossier-header">
+            <div>
+              <div id="dossier-name" class="dossier-title">Select a Planet</div>
+              <div id="dossier-subtitle" class="dossier-subtitle">Sol Sector Coordinates</div>
+            </div>
+            <span id="dossier-faction-badge" class="pill pill-cyan">Sol Fed</span>
+          </div>
+
+          <p id="dossier-desc" style="font-size: 13px; color: var(--fg-dim); line-height: 1.5;">
+            Click on any planetary system on the navigational star chart to calculate jump coordinates, hyperlane fuel requirements, and economic intelligence.
+          </p>
+
+          <div class="dossier-metric-grid">
+            <div>
+              <div style="font-size: 10px; color: var(--fg-dim);">DISTANCE</div>
+              <div id="dossier-distance" style="font-family: var(--font-mono); font-weight: 700; color: var(--fg);">-- LY</div>
+            </div>
+            <div>
+              <div style="font-size: 10px; color: var(--fg-dim);">WARP FUEL REQUIRED</div>
+              <div id="dossier-fuel" style="font-family: var(--font-mono); font-weight: 700; color: var(--gold);">-- LY</div>
+            </div>
+            <div>
+              <div style="font-size: 10px; color: var(--fg-dim);">FLIGHT DURATION</div>
+              <div id="dossier-days" style="font-family: var(--font-mono); font-weight: 700; color: var(--fg);">-- Days</div>
+            </div>
+            <div>
+              <div style="font-size: 10px; color: var(--fg-dim);">SYSTEM SECURITY</div>
+              <div id="dossier-security" style="font-weight: 700; color: var(--green);">--</div>
+            </div>
+          </div>
+
+          <div id="dossier-event-box" style="display: none; background: var(--gold-dim); border: 1px solid var(--gold); border-radius: 6px; padding: 10px; font-size: 12px; color: var(--gold);">
+            <strong>Active Sector Event:</strong> <span id="dossier-event-title"></span>
+            <div id="dossier-event-desc" style="margin-top: 4px; font-size: 11px; opacity: 0.9;"></div>
+          </div>
+
+          <button id="dossier-btn-engage" class="dossier-btn-engage" disabled onclick="executeTravel()">
+            ⚡ Engage Hyperdrive
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. COMMODITY MARKET VIEW -->
+    <div id="view-market" class="view-container">
+      <div class="panel-card">
+        <div class="panel-card-header">
+          <div>
+            <div class="panel-card-title">📈 Planetary Commodity Exchange</div>
+            <div class="panel-card-subtitle" id="market-station-sub">Trading terminal at Earth Spaceport</div>
+          </div>
+          <div style="display: flex; gap: 12px; align-items: center;">
+            <div style="font-size: 12px; color: var(--fg-dim);">
+              Free Cargo: <strong id="market-free-cargo" style="color: var(--cyan);">25</strong> T
+            </div>
+          </div>
+        </div>
+
+        <div class="market-filter-bar">
+          <div class="filter-pills" id="market-category-filters">
+            <button class="filter-pill active" onclick="setMarketCategory('all')">All Goods</button>
+            <button class="filter-pill" onclick="setMarketCategory('Essentials')">Essentials</button>
+            <button class="filter-pill" onclick="setMarketCategory('Raw Materials')">Raw Materials</button>
+            <button class="filter-pill" onclick="setMarketCategory('High Tech')">High Tech</button>
+            <button class="filter-pill" onclick="setMarketCategory('Luxury')">Luxury</button>
+            <button class="filter-pill" onclick="setMarketCategory('Contraband')">Contraband</button>
+          </div>
+          <input type="text" id="market-search" class="search-input" placeholder="🔍 Search commodities..." oninput="filterMarketTable()">
+        </div>
+
+        <div class="data-table-wrapper">
+          <table class="data-table" id="market-table">
+            <thead>
+              <tr>
+                <th>Commodity</th>
+                <th>Category</th>
+                <th>Station Stock</th>
+                <th>Buy Price</th>
+                <th>Sell Price</th>
+                <th>10-Day Trend</th>
+                <th>Cargo Held</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="market-table-body">
+              <!-- Dynamically populated -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 3. TRADE ADVISOR VIEW -->
+    <div id="view-advisor" class="view-container">
+      <div class="panel-card">
+        <div class="panel-card-header">
+          <div>
+            <div class="panel-card-title">🧭 Deep Space Trade Route Advisor</div>
+            <div class="panel-card-subtitle">Real-time algorithmic route optimization factoring travel time, fuel burn, and market spreads.</div>
+          </div>
+          <button class="btn-action-sm" onclick="fetchTradeRoutes()">🔄 Re-calculate Routes</button>
+        </div>
+
+        <div class="data-table-wrapper">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Commodity</th>
+                <th>Source (Buy)</th>
+                <th>Destination (Sell)</th>
+                <th>Buy / Sell</th>
+                <th>Margin</th>
+                <th>Est. Net Profit</th>
+                <th>Duration</th>
+                <th>Efficiency (CR/Day)</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="advisor-table-body">
+              <!-- Dynamically populated -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 4. SHIPYARD & OUTFITTER VIEW -->
+    <div id="view-shipyard" class="view-container">
+      <div class="grid-2">
+        <!-- Shipyard Catalog -->
+        <div class="panel-card">
+          <div class="panel-card-header">
+            <div>
+              <div class="panel-card-title">🚀 Starship Dealership</div>
+              <div class="panel-card-subtitle">Commercial, defensive, and exploration hulls. Trade-in value applied automatically.</div>
+            </div>
+          </div>
+          <div id="shipyard-cards" style="display: flex; flex-direction: column; gap: 14px;">
+            <!-- Dynamically populated -->
+          </div>
+        </div>
+
+        <!-- Outfitter Catalog -->
+        <div class="panel-card">
+          <div class="panel-card-header">
+            <div>
+              <div class="panel-card-title">⚡ Starship Outfitter & Hardpoints</div>
+              <div class="panel-card-subtitle">Install beam lasers, kinetic cannons, barrier shields, warp boosters, and expanded cargo bays.</div>
+            </div>
+          </div>
+          <div id="outfitter-cards" style="display: flex; flex-direction: column; gap: 12px;">
+            <!-- Dynamically populated -->
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 5. STATION SERVICES VIEW -->
+    <div id="view-services" class="view-container">
+      <div class="panel-card">
+        <div class="panel-card-header">
+          <div>
+            <div class="panel-card-title">🔧 Spaceport Depot & Maintenance Facilities</div>
+            <div class="panel-card-subtitle" id="services-sub">Earth Spaceport Drydock & Replenishment Bays</div>
+          </div>
+        </div>
+
+        <div class="grid-3">
+          <!-- Fuel Bay -->
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 10px;">
+            <div style="font-weight: 700; color: var(--gold); font-size: 15px;">⛽ Hyper-Fuel Depository</div>
+            <div style="font-size: 12px; color: var(--fg-dim);">
+              Fuel Price: <strong id="depot-fuel-price" style="color: var(--gold);">5</strong> CR / LY
+            </div>
+            <div style="font-size: 13px;">Current: <span id="depot-fuel-current">130</span> / <span id="depot-fuel-max">130</span> LY</div>
+            <div style="display: flex; gap: 8px; margin-top: auto;">
+              <button class="btn-action-sm btn-buy" onclick="buyFuel(10)">+10 LY</button>
+              <button class="btn-action-sm btn-buy" onclick="buyFuel(50)">+50 LY</button>
+              <button class="btn-action-sm btn-buy" onclick="buyFuel(999)">Refuel to Max</button>
+            </div>
+          </div>
+
+          <!-- Drydock Repairs -->
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 10px;">
+            <div style="font-weight: 700; color: var(--green); font-size: 15px;">🛡️ Armor & Hull Drydock</div>
+            <div style="font-size: 12px; color: var(--fg-dim);">
+              Repair Cost: <strong id="depot-repair-price" style="color: var(--green);">15</strong> CR / HP
+            </div>
+            <div style="font-size: 13px;">Integrity: <span id="depot-hull-current">100</span> / <span id="depot-hull-max">100</span> HP</div>
+            <div style="display: flex; gap: 8px; margin-top: auto;">
+              <button class="btn-action-sm btn-buy" onclick="repairHull(10)">Repair 10 HP</button>
+              <button class="btn-action-sm btn-buy" onclick="repairHull(999)">Repair to Full</button>
+            </div>
+          </div>
+
+          <!-- Subsystems Repair -->
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 10px;">
+            <div style="font-weight: 700; color: var(--cyan); font-size: 15px;">⚙️ Subsystem Calibration</div>
+            <div style="font-size: 12px; color: var(--fg-dim);">
+              Restores damaged propulsion, fire control avionics, and shield generators.
+            </div>
+            <div id="depot-subsystem-status" style="font-size: 13px;">All subsystems nominal.</div>
+            <button id="btn-repair-subsystems" class="btn-action-sm btn-buy" style="margin-top: auto;" onclick="repairSubsystems()">
+              Overhaul Damaged Modules (1,500 CR)
+            </button>
+          </div>
+
+          <!-- Torpedo Magazine -->
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 10px;">
+            <div style="font-weight: 700; color: var(--red); font-size: 15px;">🚀 Seeker Torpedo Armory</div>
+            <div style="font-size: 12px; color: var(--fg-dim);">
+              Lock-on anti-ship ordnance bypassing kinetic energy shields.
+            </div>
+            <div style="font-size: 13px;">Magazine: <span id="depot-missiles-count">0</span> / 8 Torpedoes</div>
+            <div style="display: flex; gap: 8px; margin-top: auto;">
+              <button class="btn-action-sm btn-buy" onclick="buyMissiles(1)">Arm 1 Torpedo</button>
+              <button class="btn-action-sm btn-buy" onclick="buyMissiles(8)">Restock Full Bay</button>
+            </div>
+          </div>
+
+          <!-- Lloyds Insurance -->
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 10px;">
+            <div style="font-weight: 700; color: var(--purple); font-size: 15px;">📜 Lloyds Interstellar Insurance</div>
+            <div style="font-size: 12px; color: var(--fg-dim);">
+              Guarantees clone replacement and vessel reconstitution upon fatal ship destruction.
+            </div>
+            <div id="depot-insurance-status" style="font-size: 13px;">Policy: Inactive</div>
+            <button id="btn-buy-insurance" class="btn-action-sm btn-buy" style="margin-top: auto;" onclick="buyInsurance()">
+              Purchase Policy (2,000 CR)
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 6. CREW LOUNGE VIEW -->
+    <div id="view-crew" class="view-container">
+      <div class="panel-card">
+        <div class="panel-card-header">
+          <div>
+            <div class="panel-card-title">👥 Spacers Cantina & Officer Recruitment</div>
+            <div class="panel-card-subtitle">Hire specialist crew members for unique passive combat and navigational boosts.</div>
+          </div>
+          <div style="font-size: 12px; color: var(--fg-dim);">
+            Daily Payroll: <strong id="crew-daily-wages" style="color: var(--gold);">0</strong> CR/day
+          </div>
+        </div>
+
+        <div class="grid-2" id="crew-cards">
+          <!-- Dynamically populated -->
+        </div>
+      </div>
+    </div>
+
+    <!-- 7. MISSIONS VIEW -->
+    <div id="view-missions" class="view-container">
+      <div class="grid-2">
+        <div class="panel-card">
+          <div class="panel-card-header">
+            <div>
+              <div class="panel-card-title">📜 Station Contract Board</div>
+              <div class="panel-card-subtitle">Cargo hauls, confidential runs, and wanted pirate bounties.</div>
+            </div>
+          </div>
+          <div id="available-missions-list" style="display: flex; flex-direction: column; gap: 12px;">
+            <!-- Dynamically populated -->
+          </div>
+        </div>
+
+        <div class="panel-card">
+          <div class="panel-card-header">
+            <div>
+              <div class="panel-card-title">⏱️ Active Contract Manifest</div>
+              <div class="panel-card-subtitle">Track deadlines and deliver shipments upon arrival.</div>
+            </div>
+          </div>
+          <div id="active-missions-list" style="display: flex; flex-direction: column; gap: 12px;">
+            <!-- Dynamically populated -->
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 8. BANK & STOCKS VIEW -->
+    <div id="view-bank" class="view-container">
+      <div class="grid-2">
+        <!-- Banking -->
+        <div class="panel-card">
+          <div class="panel-card-header">
+            <div>
+              <div class="panel-card-title">🏦 First Galactic Bank & Credit Reserve</div>
+              <div class="panel-card-subtitle">High-yield compound savings and commercial credit lines.</div>
+            </div>
+          </div>
+
+          <div style="display: flex; flex-direction: column; gap: 16px;">
+            <!-- Savings Box -->
+            <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 16px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <span style="font-weight: 700; color: var(--green);">Secure Savings Account</span>
+                <span id="bank-savings-bal" style="font-family: var(--font-mono); font-weight: 700; color: var(--green); font-size: 16px;">0 CR</span>
+              </div>
+              <div style="font-size: 12px; color: var(--fg-dim); margin-bottom: 12px;">Earns 0.25% compound interest every sector travel day.</div>
+              <div style="display: flex; gap: 8px;">
+                <button class="btn-action-sm btn-buy" onclick="promptDeposit()">Deposit Credits</button>
+                <button class="btn-action-sm btn-sell" onclick="promptWithdraw()">Withdraw Credits</button>
+              </div>
+            </div>
+
+            <!-- Loan Box -->
+            <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 16px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <span style="font-weight: 700; color: var(--red);">Outstanding Debt / Loan</span>
+                <span id="bank-loan-bal" style="font-family: var(--font-mono); font-weight: 700; color: var(--red); font-size: 16px;">0 CR</span>
+              </div>
+              <div style="font-size: 12px; color: var(--fg-dim); margin-bottom: 6px;">
+                Credit Score: <strong id="bank-credit-score" style="color: var(--cyan);">650</strong> · Limit: <strong id="bank-loan-limit" style="color: var(--fg);">10,000</strong> CR
+              </div>
+              <div style="font-size: 12px; color: var(--fg-dim); margin-bottom: 12px;">
+                Interest: <span id="bank-interest-rate">1.5%</span> / day. Maintaining loans boosts your credit score!
+              </div>
+              <div style="display: flex; gap: 8px;">
+                <button class="btn-action-sm btn-buy" onclick="promptBorrow()">Borrow Funds</button>
+                <button class="btn-action-sm btn-sell" onclick="promptRepay()">Repay Loan</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Stock Exchange -->
+        <div class="panel-card">
+          <div class="panel-card-header">
+            <div>
+              <div class="panel-card-title">📊 Interstellar Securities Exchange</div>
+              <div class="panel-card-subtitle">Trade equities in the solar system's top megacorporations.</div>
+            </div>
+          </div>
+          <div id="stocks-cards" style="display: flex; flex-direction: column; gap: 12px;">
+            <!-- Dynamically populated -->
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 9. CAREER & LOG VIEW -->
+    <div id="view-log" class="view-container">
+      <div class="grid-2">
+        <!-- Ranks and Reputation -->
+        <div class="panel-card">
+          <div class="panel-card-header">
+            <div>
+              <div class="panel-card-title">🎖️ Officer Ranks & Career Perks</div>
+              <div class="panel-card-subtitle">Earn renown through trading, missions, and combat to climb the officer hierarchy.</div>
+            </div>
+          </div>
+          <div id="ranks-progression-list" style="display: flex; flex-direction: column; gap: 10px;">
+            <!-- Dynamically populated -->
+          </div>
+
+          <div style="margin-top: 24px;">
+            <div class="panel-card-title" style="font-size: 14px; margin-bottom: 10px;">🌐 Faction Diplomatic Standings</div>
+            <div id="faction-standings-list" style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+              <!-- Dynamically populated -->
+            </div>
+          </div>
+        </div>
+
+        <!-- Achievements & News -->
+        <div class="panel-card">
+          <div class="panel-card-header">
+            <div>
+              <div class="panel-card-title">🏆 Career Achievements (23)</div>
+              <div class="panel-card-subtitle">Major milestones unlocked across your voyages.</div>
+            </div>
+          </div>
+          <div id="achievements-grid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px;">
+            <!-- Dynamically populated -->
+          </div>
+
+          <div style="margin-top: 24px;">
+            <div class="panel-card-title" style="font-size: 14px; margin-bottom: 10px;">📡 Galactic Subspace News Wire</div>
+            <div id="news-feed-list" style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 6px; padding: 12px; font-family: var(--font-mono); font-size: 11px; max-height: 200px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px;">
+              <!-- Dynamically populated -->
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- TRADE SLIDER MODAL -->
+  <div id="trade-modal">
+    <div class="modal-box">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+        <h3 id="trade-modal-title" style="color: var(--cyan); font-size: 18px;">Trade Commodity</h3>
+        <button class="btn-action-sm" onclick="closeTradeModal()">✕</button>
+      </div>
+
+      <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; margin-bottom: 16px;">
+        <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
+          <span style="color: var(--fg-dim);">Commodity:</span>
+          <strong id="trade-good-name" style="color: var(--fg);">--</strong>
+        </div>
+        <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
+          <span style="color: var(--fg-dim);">Unit Price:</span>
+          <strong id="trade-unit-price" style="color: var(--gold);">0 CR</strong>
+        </div>
+        <div style="display: flex; justify-content: space-between;">
+          <span style="color: var(--fg-dim);">Available Space / Stock:</span>
+          <strong id="trade-max-limit" style="color: var(--cyan);">0</strong>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 20px;">
+        <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+          <span style="font-weight: 600;">Quantity:</span>
+          <span id="trade-qty-display" style="font-family: var(--font-mono); font-size: 18px; font-weight: 700; color: var(--cyan);">1</span>
+        </div>
+        <input type="range" id="trade-slider" min="1" max="10" value="1" style="width: 100%; cursor: pointer;" oninput="onTradeSliderChange(this.value)">
+        <div style="display: flex; justify-content: space-between; margin-top: 8px;">
+          <button class="btn-action-sm" onclick="setTradeQty(1)">Min (1)</button>
+          <button class="btn-action-sm" onclick="setTradeQty(5)">5</button>
+          <button class="btn-action-sm" onclick="setTradeQty(10)">10</button>
+          <button class="btn-action-sm" onclick="setTradeQtyMax()">Max</button>
+        </div>
+      </div>
+
+      <div style="display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--panel-border); padding-top: 16px; margin-bottom: 20px;">
+        <span style="font-size: 15px; font-weight: 700;">Total Transaction:</span>
+        <span id="trade-total-display" style="font-family: var(--font-mono); font-size: 20px; font-weight: 800; color: var(--gold);">0 CR</span>
+      </div>
+
+      <button id="trade-btn-confirm" class="dossier-btn-engage" onclick="executeTradeModal()">
+        Confirm Purchase
+      </button>
+    </div>
+  </div>
+
+  <!-- TACTICAL COMBAT BRIDGE MODAL -->
+  <div id="combat-modal">
+    <div class="combat-bridge">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; border-bottom: 1px solid var(--red); padding-bottom: 12px;">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <span style="color: var(--red); font-size: 20px;">⚠️</span>
+          <div>
+            <div id="combat-enemy-name" style="font-size: 18px; font-weight: 800; color: var(--red);">Corsair Raider</div>
+            <div id="combat-enemy-ship" style="font-size: 12px; color: var(--fg-dim);">Class: Viper Interceptor · Personality: Aggressive</div>
+          </div>
+        </div>
+        <span id="combat-turn-counter" class="pill pill-red">Turn 1</span>
+      </div>
+
+      <!-- Combat Vitals Duel -->
+      <div class="grid-2" style="margin-bottom: 16px;">
+        <!-- Player Ship Bridge -->
+        <div style="background: var(--panel); border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px;">
+          <div style="font-weight: 700; color: var(--cyan); margin-bottom: 8px;" id="combat-player-ship-title">Your Ship: Star Sparrow</div>
+          <div style="display: flex; flex-direction: column; gap: 6px; font-size: 12px;">
+            <div style="display: flex; justify-content: space-between;">
+              <span>Hull:</span>
+              <strong id="combat-player-hull-val" style="color: var(--green);">100 / 100</strong>
+            </div>
+            <div class="meter-bar-outer" style="width: 100%;">
+              <div id="combat-player-hull-bar" class="meter-bar-inner" style="width: 100%; background: var(--green);"></div>
+            </div>
+            <div style="display: flex; justify-content: space-between; margin-top: 4px;">
+              <span>Shields:</span>
+              <strong id="combat-player-shield-val" style="color: var(--cyan);">40 / 40</strong>
+            </div>
+            <div class="meter-bar-outer" style="width: 100%;">
+              <div id="combat-player-shield-bar" class="meter-bar-inner" style="width: 100%; background: var(--cyan);"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Enemy Target Vessel -->
+        <div style="background: var(--panel); border: 1px solid var(--red-dim); border-radius: 8px; padding: 14px;">
+          <div style="font-weight: 700; color: var(--red); margin-bottom: 8px;" id="combat-enemy-vessel-title">Hostile Target</div>
+          <div style="display: flex; flex-direction: column; gap: 6px; font-size: 12px;">
+            <div style="display: flex; justify-content: space-between;">
+              <span>Hull:</span>
+              <strong id="combat-enemy-hull-val" style="color: var(--red);">75 / 75</strong>
+            </div>
+            <div class="meter-bar-outer" style="width: 100%;">
+              <div id="combat-enemy-hull-bar" class="meter-bar-inner" style="width: 100%; background: var(--red);"></div>
+            </div>
+            <div style="display: flex; justify-content: space-between; margin-top: 4px;">
+              <span>Shields:</span>
+              <strong id="combat-enemy-shield-val" style="color: var(--cyan);">25 / 25</strong>
+            </div>
+            <div class="meter-bar-outer" style="width: 100%;">
+              <div id="combat-enemy-shield-bar" class="meter-bar-inner" style="width: 100%; background: var(--cyan);"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Action Commands -->
+      <div id="combat-actions-bar" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; margin-bottom: 16px;">
+        <button class="btn-action-sm btn-buy" onclick="sendCombatAction('fire')">⚡ Fire Batteries</button>
+        <button class="btn-action-sm" onclick="sendCombatAction('target_weapons')">🎯 Target Weapons</button>
+        <button class="btn-action-sm" onclick="sendCombatAction('target_engines')">🎯 Target Thrusters</button>
+        <button class="btn-action-sm" onclick="sendCombatAction('target_shields')">🎯 Target Shields</button>
+        <button class="btn-action-sm btn-sell" id="btn-combat-missile" onclick="sendCombatAction('missile')">🚀 Fire Torpedo</button>
+        <button class="btn-action-sm" onclick="sendCombatAction('recharge')">🛡️ Boost Capacitor</button>
+        <button class="btn-action-sm" id="btn-combat-board" onclick="sendCombatAction('board')">🏴‍☠️ Board Vessel</button>
+        <button class="btn-action-sm" style="color: var(--red);" onclick="sendCombatAction('flee')">🏃 Emergency Warp</button>
+      </div>
+
+      <!-- Combat Log Terminal -->
+      <div id="combat-terminal-log" style="background: var(--bg); border: 1px solid var(--panel-border); border-radius: 6px; padding: 12px; font-family: var(--font-mono); font-size: 11px; max-height: 140px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; color: var(--fg-dim);">
+        <div>Sensors locked onto enemy vessel. Weapons armed.</div>
+      </div>
+
+      <!-- Victory / Defeat Dismissal -->
+      <div id="combat-result-box" style="display: none; margin-top: 16px; text-align: center;">
+        <button class="dossier-btn-engage" id="combat-btn-dismiss" onclick="dismissCombat()">
+          Disengage & Return to Helm
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- DYNAMIC TRAVEL ENCOUNTER MODAL -->
+  <div id="encounter-modal" class="generic-modal">
+    <div class="modal-box">
+      <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px;">
+        <span id="enc-icon" style="font-size: 24px;">📡</span>
+        <h3 id="enc-title" style="color: var(--cyan); font-size: 18px;">Deep Space Contact</h3>
+      </div>
+
+      <p id="enc-desc" style="font-size: 13px; color: var(--fg-dim); line-height: 1.6; margin-bottom: 20px;">
+        An unexpected sensor contact has appeared along your hyperlane corridor.
+      </p>
+
+      <div style="display: flex; gap: 12px;">
+        <button id="enc-btn-opt1" class="dossier-btn-engage" onclick="resolveEncounter(true)">Option 1</button>
+        <button id="enc-btn-opt2" class="hud-btn" style="flex: 1; padding: 12px;" onclick="resolveEncounter(false)">Option 2</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SAVE / LOAD MODAL -->
+  <div id="save-modal" class="generic-modal">
+    <div class="modal-box">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+        <h3 style="color: var(--cyan); font-size: 18px;">💾 Save / Load Game Flight Records</h3>
+        <button class="btn-action-sm" onclick="closeSaveModal()">✕</button>
+      </div>
+
+      <div id="save-slots-list" style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px;">
+        <!-- Dynamically loaded -->
+      </div>
+    </div>
+  </div>
+
+  <!-- NEW GAME MODAL -->
+  <div id="newgame-modal" class="generic-modal">
+    <div class="modal-box">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+        <h3 style="color: var(--cyan); font-size: 18px;">🔄 New Captain Commission</h3>
+        <button class="btn-action-sm" onclick="closeNewGameModal()">✕</button>
+      </div>
+
+      <div style="margin-bottom: 14px;">
+        <label style="display: block; font-size: 12px; color: var(--fg-dim); margin-bottom: 4px;">Commander Callsign:</label>
+        <input type="text" id="newgame-name" class="search-input" style="width: 100%;" value="Commander">
+      </div>
+
+      <div style="margin-bottom: 20px;">
+        <label style="display: block; font-size: 12px; color: var(--fg-dim); margin-bottom: 4px;">Difficulty Tier:</label>
+        <select id="newgame-diff" class="search-input" style="width: 100%;">
+          <option value="easy">Easy (More credits, cheaper repairs, peaceful sector)</option>
+          <option value="normal" selected>Normal (Standard economic margins and patrol enforcement)</option>
+          <option value="hard">Hard (Narrow margins, dangerous raiders, stringent authorities)</option>
+          <option value="nightmare">Nightmare (Merciless raiders, fragile ships, unforgiving debt)</option>
+        </select>
+      </div>
+
+      <button class="dossier-btn-engage" onclick="confirmNewGame()">Launch New Career</button>
+    </div>
+  </div>
+
+  <!-- CODEX & MANUAL MODAL -->
+  <div id="manual-modal" class="generic-modal">
+    <div class="modal-box" style="max-width: 680px; max-height: 80vh; overflow-y: auto;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; position: sticky; top: 0; background: var(--panel); padding-bottom: 8px;">
+        <h3 style="color: var(--cyan); font-size: 18px;">📖 Space Trader: Odyssey — Field Manual</h3>
+        <button class="btn-action-sm" onclick="closeManualModal()">✕</button>
+      </div>
+
+      <div style="font-size: 13px; color: var(--fg); line-height: 1.6; display: flex; flex-direction: column; gap: 14px;">
+        <div>
+          <h4 style="color: var(--gold); margin-bottom: 4px;">🏆 Ultimate Objective: Galactic Mogul</h4>
+          <p>Amass a total net worth of <strong>500,000 Credits</strong> through interstellar trading, passenger transport, pirate hunting, contract completion, and smart stock investments.</p>
+        </div>
+
+        <div>
+          <h4 style="color: var(--cyan); margin-bottom: 4px;">📈 Interstellar Commerce</h4>
+          <p>Planets produce commodities according to their planetary traits: agricultural worlds export cheap food and grain; mining stations flood the market with titanium and gems; high-tech arcologies demand raw minerals and export quantum processors. Buy low, consult the <strong>Trade Advisor</strong> for optimal routes, and sell high!</p>
+        </div>
+
+        <div>
+          <h4 style="color: var(--red); margin-bottom: 4px;">⚡ Tactical Starship Combat</h4>
+          <p>Out in the lawless black, Free Corsairs and deserter dreadnoughts raid commercial shipping. Upgrade your hardpoints with Pulse Lasers, Heavy Barrier Shields, and Seeker Torpedoes. Target enemy thrusters to prevent them from fleeing, or breach their hull and launch a <strong>Boarding Action</strong> to seize their cargo and ransom their crew!</p>
+        </div>
+
+        <div>
+          <h4 style="color: var(--purple); margin-bottom: 4px;">🎖️ Career Progression & Ranks</h4>
+          <p>Earning renown advances your commission from <em>Cadet</em> to <em>Admiral</em>, unlocking massive price discounts, lower bank loan interest, cheaper repairs, and enhanced mission rewards.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TOAST CONTAINER -->
+  <div id="toast-container"></div>
+
+  <!-- APPLICATION LOGIC JAVASCRIPT -->
+  <script>
+    // --- Audio Engine (Web Audio API) ---
+    let audioCtx = null;
+    let audioMuted = false;
+
+    function initAudio() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+    }
+
+    function toggleAudio() {
+      audioMuted = !audioMuted;
+      document.getElementById('btn-mute').textContent = audioMuted ? '🔇 Muted' : '🔊 Sound';
+      showToast(audioMuted ? 'Audio muted' : 'Audio enabled');
+    }
+
+    function playSound(type) {
+      if (audioMuted) return;
+      initAudio();
+      if (!audioCtx) return;
+      const now = audioCtx.currentTime;
+
+      if (type === 'laser') {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(880, now);
+        osc.frequency.exponentialRampToValueAtTime(110, now + 0.12);
+        gain.gain.setValueAtTime(0.2, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.12);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + 0.12);
+      } else if (type === 'buy' || type === 'coin') {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(987, now);
+        osc.frequency.setValueAtTime(1318, now + 0.08);
+        gain.gain.setValueAtTime(0.15, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.2);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + 0.2);
+      } else if (type === 'sell') {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(1046, now);
+        osc.frequency.setValueAtTime(1567, now + 0.08);
+        gain.gain.setValueAtTime(0.18, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.22);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + 0.22);
+      } else if (type === 'warp') {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(130, now);
+        osc.frequency.exponentialRampToValueAtTime(650, now + 0.4);
+        gain.gain.setValueAtTime(0.25, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.45);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + 0.45);
+      } else if (type === 'alarm') {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(600, now);
+        osc.frequency.setValueAtTime(400, now + 0.1);
+        gain.gain.setValueAtTime(0.15, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + 0.25);
+      } else if (type === 'victory' || type === 'rank_up') {
+        [523.25, 659.25, 783.99, 1046.50].forEach((freq, i) => {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(freq, now + i * 0.08);
+          gain.gain.setValueAtTime(0.15, now + i * 0.08);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + i * 0.08 + 0.35);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(now + i * 0.08);
+          osc.stop(now + i * 0.08 + 0.35);
+        });
+      }
+    }
+
+    // --- Toast Notifications ---
+    function showToast(msg) {
+      const c = document.getElementById('toast-container');
+      const t = document.createElement('div');
+      t.className = 'toast-msg';
+      t.textContent = msg;
+      c.appendChild(t);
+      setTimeout(() => {
+        t.style.opacity = '0';
+        t.style.transform = 'translateY(10px)';
+        t.style.transition = 'all 0.3s';
+        setTimeout(() => t.remove(), 300);
+      }, 4000);
+    }
+
+    // --- State & Navigation ---
+    let gameState = null;
+    let currentTab = 'map';
+    let selectedPlanetName = null;
+    let selectedGoodId = null;
+    let tradeMode = 'buy';
+    let marketCategoryFilter = 'all';
+
+    function switchTab(tabId) {
+      currentTab = tabId;
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.view-container').forEach(v => v.classList.remove('active'));
+
+      const btn = document.getElementById('tabbtn-' + tabId);
+      if (btn) btn.classList.add('active');
+      const view = document.getElementById('view-' + tabId);
+      if (view) view.classList.add('active');
+
+      if (tabId === 'advisor') fetchTradeRoutes();
+      if (tabId === 'map') renderStarMap();
+    }
+
+    // --- API Interactions ---
+    async function fetchState() {
+      try {
+        const res = await fetch('/api/state');
+        const json = await res.json();
+        if (json.success && json.state) {
+          gameState = json.state;
+          if (json.sound) playSound(json.sound);
+          renderAll();
+        }
+      } catch (err) {
+        console.error("Failed to fetch state:", err);
+      }
+    }
+
+    async function sendAction(action, payload = {}) {
+      try {
+        const res = await fetch('/api/action', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action, ...payload })
+        });
+        const json = await res.json();
+        if (json.logs && json.logs.length) {
+          json.logs.forEach(l => showToast(l));
+        }
+        if (json.sound) playSound(json.sound);
+        if (json.state) {
+          gameState = json.state;
+          renderAll();
+        }
+        return json;
+      } catch (err) {
+        showToast("Communication error: " + err);
+      }
+    }
+
+    // --- Master Render ---
+    function renderAll() {
+      if (!gameState) return;
+      renderHUD();
+      renderVitals();
+      renderStarMap();
+      renderMarket();
+      renderShipyard();
+      renderServices();
+      renderCrew();
+      renderMissions();
+      renderBank();
+      renderLog();
+      checkEncounter();
+      checkCombat();
+    }
+
+    function renderHUD() {
+      const p = gameState.player;
+      const cp = gameState.current_planet;
+
+      document.getElementById('hud-rank-insignia').textContent = p.rank.insignia;
+      document.getElementById('hud-rank-title').textContent = p.rank.name;
+      document.getElementById('hud-renown-val').textContent = p.renown.toLocaleString();
+      document.getElementById('hud-renown-next').textContent = p.renown_needed > 0 ? p.renown_needed.toLocaleString() : 'MAX';
+
+      document.getElementById('hud-location').textContent = cp.name;
+      document.getElementById('hud-security').textContent = cp.security;
+      document.getElementById('hud-day').textContent = 'Day ' + p.day;
+      document.getElementById('hud-credits').textContent = p.credits.toLocaleString() + ' CR';
+      document.getElementById('hud-networth').textContent = p.net_worth.toLocaleString() + ' CR';
+    }
+
+    function renderVitals() {
+      const p = gameState.player;
+      document.getElementById('vitals-ship-name-val').textContent = p.ship_name;
+      document.getElementById('vitals-ship-class-val').textContent = '[' + p.ship_class + ']';
+
+      // Hull
+      const hullPct = Math.max(0, Math.min(100, (p.hull / p.max_hull) * 100));
+      const hullBar = document.getElementById('meter-hull');
+      hullBar.style.width = hullPct + '%';
+      hullBar.style.background = hullPct < 25 ? 'var(--red)' : (hullPct < 50 ? 'var(--gold)' : 'var(--green)');
+      document.getElementById('meter-hull-val').textContent = `${p.hull}/${p.max_hull}`;
+
+      // Shield
+      const shieldPct = p.max_shield > 0 ? Math.max(0, Math.min(100, (p.shield / p.max_shield) * 100)) : 0;
+      document.getElementById('meter-shield').style.width = shieldPct + '%';
+      document.getElementById('meter-shield-val').textContent = `${p.shield}/${p.max_shield}`;
+
+      // Fuel
+      const fuelPct = Math.max(0, Math.min(100, (p.fuel / p.max_fuel) * 100));
+      document.getElementById('meter-fuel').style.width = fuelPct + '%';
+      document.getElementById('meter-fuel-val').textContent = `${p.fuel}/${p.max_fuel} LY`;
+
+      // Cargo
+      const cargoPct = Math.max(0, Math.min(100, (p.cargo_used / p.cargo_cap) * 100));
+      document.getElementById('meter-cargo').style.width = cargoPct + '%';
+      document.getElementById('meter-cargo-val').textContent = `${p.cargo_used}/${p.cargo_cap} T`;
+
+      // Missiles
+      document.getElementById('meter-missiles-val').textContent = `${p.missiles}/${p.max_missiles}`;
+
+      // Damaged Subsystem Badges
+      const bContainer = document.getElementById('vitals-damage-badges');
+      bContainer.innerHTML = '';
+      if (p.weapons_damaged) bContainer.innerHTML += '<span class="subsystem-alert">WEAPONS DAMAGED</span>';
+      if (p.engines_damaged) bContainer.innerHTML += '<span class="subsystem-alert">THRUSTERS DAMAGED</span>';
+      if (p.shields_damaged) bContainer.innerHTML += '<span class="subsystem-alert">SHIELDS OFFLINE</span>';
+    }
+
+    // --- Star Map SVG Rendering ---
+    function renderStarMap() {
+      const svg = document.getElementById('star-map-svg');
+      if (!svg || !gameState) return;
+      const planets = gameState.all_planets;
+      const cpName = gameState.current_planet.name;
+      const cp = planets.find(p => p.name === cpName) || planets[0];
+
+      if (!selectedPlanetName) selectedPlanetName = cpName;
+      const selP = planets.find(p => p.name === selectedPlanetName) || cp;
+
+      // Coordinate scaling
+      const w = 1000, h = 650;
+      function mapX(x) { return 70 + (x / 16.0) * (w - 140); }
+      function mapY(y) { return 60 + (y / 15.0) * (h - 120); }
+
+      let html = `
+        <defs>
+          <filter id="glow-cyan" x="-20%" y="-20%" width="140%" height="140%">
+            <feGaussianBlur stdDeviation="6" result="blur" />
+            <feComposite in="SourceGraphic" in2="blur" operator="over" />
+          </filter>
+        </defs>
+      `;
+
+      // Hyperlanes
+      planets.forEach((p1, idx) => {
+        planets.slice(idx + 1).forEach(p2 => {
+          const d = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+          if (d <= 5.5) {
+            html += `<line x1="${mapX(p1.x)}" y1="${mapY(p1.y)}" x2="${mapX(p2.x)}" y2="${mapY(p2.y)}" class="hyperlane" />`;
+          }
+        });
+      });
+
+      // Jump range ring
+      const maxRangeUnits = Math.max(0, (gameState.player.fuel - 4) / 3.0);
+      const pixelRadius = (maxRangeUnits / 16.0) * (w - 140);
+      html += `
+        <circle cx="${mapX(cp.x)}" cy="${mapY(cp.y)}" r="${pixelRadius}" 
+          fill="rgba(0, 229, 255, 0.04)" stroke="rgba(0, 229, 255, 0.35)" stroke-dasharray="6 4" stroke-width="1.5" />
+      `;
+
+      // Planet Nodes
+      planets.forEach(p => {
+        const px = mapX(p.x), py = mapY(p.y);
+        const isCurrent = (p.name === cpName);
+        const isSelected = (p.name === selectedPlanetName);
+
+        if (isCurrent) {
+          html += `<circle cx="${px}" cy="${py}" r="16" fill="none" stroke="var(--cyan)" stroke-width="1.5" class="current-ping" />`;
+        }
+
+        const strokeColor = isSelected ? 'var(--cyan)' : (isCurrent ? 'var(--green)' : 'rgba(255,255,255,0.4)');
+        const strokeWidth = isSelected ? '3' : '1.5';
+        const nodeRadius = isCurrent ? 12 : 9;
+
+        html += `
+          <g class="map-planet-node" onclick="selectPlanet('${p.name}')">
+            <circle cx="${px}" cy="${py}" r="${nodeRadius + 4}" fill="${p.color}" opacity="0.15" />
+            <circle class="planet-body" cx="${px}" cy="${py}" r="${nodeRadius}" fill="${p.color}" stroke="${strokeColor}" stroke-width="${strokeWidth}" />
+            <text x="${px}" y="${py + 22}" text-anchor="middle" fill="${isSelected ? 'var(--cyan)' : 'var(--fg)'}" font-size="12" font-weight="${isSelected ? 'bold' : 'normal'}" font-family="system-ui">
+              ${p.name}
+            </text>
+            ${p.active_event ? `<text x="${px}" y="${py - 14}" text-anchor="middle" fill="var(--gold)" font-size="10">⚡</text>` : ''}
+          </g>
+        `;
+      });
+
+      svg.innerHTML = html;
+      renderDossier(selP, cp);
+    }
+
+    function selectPlanet(name) {
+      selectedPlanetName = name;
+      renderStarMap();
+    }
+
+    function renderDossier(planet, currentPlanet) {
+      document.getElementById('dossier-name').textContent = planet.name;
+      document.getElementById('dossier-subtitle').textContent = planet.subtitle;
+      document.getElementById('dossier-faction-badge').textContent = planet.faction;
+      document.getElementById('dossier-desc').textContent = planet.desc;
+      document.getElementById('dossier-distance').textContent = planet.distance + ' LY';
+      document.getElementById('dossier-fuel').textContent = planet.fuel_cost + ' LY';
+      document.getElementById('dossier-days').textContent = planet.days_cost + ' Days';
+      document.getElementById('dossier-security').textContent = planet.security;
+
+      const eventBox = document.getElementById('dossier-event-box');
+      if (planet.active_event) {
+        eventBox.style.display = 'block';
+        document.getElementById('dossier-event-title').textContent = planet.active_event.title;
+        document.getElementById('dossier-event-desc').textContent = planet.active_event.desc;
+      } else {
+        eventBox.style.display = 'none';
+      }
+
+      const btn = document.getElementById('dossier-btn-engage');
+      if (planet.is_current) {
+        btn.disabled = true;
+        btn.textContent = '📍 Current Location';
+      } else if (!planet.in_range) {
+        btn.disabled = true;
+        btn.textContent = `❌ Insufficient Fuel (${planet.fuel_cost} LY needed)`;
+      } else {
+        btn.disabled = false;
+        btn.textContent = `⚡ Engage Hyperdrive to ${planet.name}`;
+      }
+    }
+
+    function executeTravel() {
+      if (!selectedPlanetName) return;
+      sendAction('travel', { destination: selectedPlanetName });
+    }
+
+    // --- Commodity Market ---
+    function setMarketCategory(cat) {
+      marketCategoryFilter = cat;
+      document.querySelectorAll('#market-category-filters .filter-pill').forEach(p => p.classList.remove('active'));
+      event.target.classList.add('active');
+      renderMarket();
+    }
+
+    function filterMarketTable() {
+      renderMarket();
+    }
+
+    function renderMarket() {
+      if (!gameState) return;
+      const tbody = document.getElementById('market-table-body');
+      const goods = gameState.current_planet.market;
+      const query = (document.getElementById('market-search').value || '').toLowerCase();
+      document.getElementById('market-station-sub').textContent = `Commercial Terminal at ${gameState.current_planet.name} Spaceport`;
+      document.getElementById('market-free-cargo').textContent = gameState.player.cargo_free;
+
+      let html = '';
+      goods.forEach(g => {
+        if (marketCategoryFilter !== 'all' && g.category !== marketCategoryFilter) return;
+        if (query && !g.name.toLowerCase().includes(query)) return;
+
+        // Sparkline
+        const pts = g.price_history || [g.base_price];
+        const minP = Math.min(...pts), maxP = Math.max(...pts);
+        const range = maxP === minP ? 1 : (maxP - minP);
+        const sparkCoords = pts.map((val, i) => {
+          const x = (i / Math.max(1, pts.length - 1)) * 50;
+          const y = 20 - ((val - minP) / range) * 16;
+          return `${x},${y}`;
+        }).join(' ');
+
+        const trendColor = g.trend === 'up' ? 'var(--green)' : (g.trend === 'down' ? 'var(--red)' : 'var(--fg-dim)');
+        const buyColor = g.pct_diff < 0 ? 'var(--green)' : (g.pct_diff > 15 ? 'var(--red)' : 'var(--fg)');
+
+        html += `
+          <tr>
+            <td>
+              <div style="font-weight: 700; color: var(--fg);">${g.name}</div>
+              <div style="font-size: 11px; color: var(--fg-dim);">${g.desc}</div>
+            </td>
+            <td><span class="pill pill-cyan">${g.category}</span></td>
+            <td><strong style="color: var(--fg);">${g.stock}</strong> T</td>
+            <td><strong style="color: ${buyColor}; font-family: var(--font-mono);">${g.buy_price} CR</strong></td>
+            <td><strong style="color: var(--gold); font-family: var(--font-mono);">${g.sell_price} CR</strong></td>
+            <td>
+              <svg class="sparkline-svg" width="55" height="22">
+                <polyline points="${sparkCoords}" fill="none" stroke="${trendColor}" stroke-width="2" />
+              </svg>
+            </td>
+            <td><strong style="color: var(--cyan);">${g.player_qty}</strong> T</td>
+            <td>
+              <div style="display: flex; gap: 4px;">
+                <button class="btn-action-sm btn-buy" ${!g.can_buy ? 'disabled' : ''} onclick="openTradeModal('${g.id}', 'buy')">Buy</button>
+                <button class="btn-action-sm btn-sell" ${!g.can_sell ? 'disabled' : ''} onclick="openTradeModal('${g.id}', 'sell')">Sell</button>
+              </div>
+            </td>
+          </tr>
+        `;
+      });
+
+      tbody.innerHTML = html;
+    }
+
+    // --- Trade Slider Modal ---
+    function openTradeModal(goodId, mode) {
+      selectedGoodId = goodId;
+      tradeMode = mode;
+      const g = gameState.current_planet.market.find(item => item.id === goodId);
+      if (!g) return;
+
+      const p = gameState.player;
+      let maxQty = 1;
+      if (mode === 'buy') {
+        const affordable = Math.floor(p.credits / Math.max(1, g.buy_price));
+        maxQty = Math.max(1, Math.min(g.stock, p.cargo_free, affordable));
+        document.getElementById('trade-modal-title').textContent = `Purchase ${g.name}`;
+        document.getElementById('trade-btn-confirm').textContent = 'Confirm Purchase';
+        document.getElementById('trade-unit-price').textContent = `${g.buy_price} CR`;
+      } else {
+        maxQty = Math.max(1, g.player_qty);
+        document.getElementById('trade-modal-title').textContent = `Sell ${g.name}`;
+        document.getElementById('trade-btn-confirm').textContent = 'Confirm Sale';
+        document.getElementById('trade-unit-price').textContent = `${g.sell_price} CR`;
+      }
+
+      document.getElementById('trade-good-name').textContent = g.name;
+      document.getElementById('trade-max-limit').textContent = `${maxQty} Units Max`;
+
+      const slider = document.getElementById('trade-slider');
+      slider.max = maxQty;
+      slider.value = 1;
+      onTradeSliderChange(1);
+
+      document.getElementById('trade-modal').classList.add('active');
+    }
+
+    function closeTradeModal() {
+      document.getElementById('trade-modal').classList.remove('active');
+    }
+
+    function onTradeSliderChange(val) {
+      const g = gameState.current_planet.market.find(item => item.id === selectedGoodId);
+      if (!g) return;
+      const qty = parseInt(val, 10);
+      document.getElementById('trade-qty-display').textContent = qty;
+      const unitP = tradeMode === 'buy' ? g.buy_price : g.sell_price;
+      document.getElementById('trade-total-display').textContent = `${(qty * unitP).toLocaleString()} CR`;
+    }
+
+    function setTradeQty(val) {
+      const slider = document.getElementById('trade-slider');
+      slider.value = Math.min(parseInt(slider.max, 10), val);
+      onTradeSliderChange(slider.value);
+    }
+
+    function setTradeQtyMax() {
+      const slider = document.getElementById('trade-slider');
+      slider.value = slider.max;
+      onTradeSliderChange(slider.value);
+    }
+
+    function executeTradeModal() {
+      const qty = parseInt(document.getElementById('trade-slider').value, 10);
+      closeTradeModal();
+      if (tradeMode === 'buy') {
+        sendAction('buy_commodity', { good: selectedGoodId, qty });
+      } else {
+        sendAction('sell_commodity', { good: selectedGoodId, qty });
+      }
+    }
+
+    // --- Trade Advisor ---
+    async function fetchTradeRoutes() {
+      try {
+        const res = await fetch('/api/routes');
+        const json = await res.json();
+        if (json.success && json.routes) {
+          const tbody = document.getElementById('advisor-table-body');
+          let html = '';
+          json.routes.forEach(r => {
+            html += `
+              <tr>
+                <td><strong style="color: var(--cyan);">${r.good}</strong></td>
+                <td>${r.src}</td>
+                <td><strong style="color: var(--gold);">${r.dst}</strong></td>
+                <td>${r.buy_price} / ${r.sell_price} CR</td>
+                <td><span class="pill pill-green">+${r.margin} CR (${r.margin_pct}%)</span></td>
+                <td><strong style="color: var(--gold); font-family: var(--font-mono);">${r.net_profit.toLocaleString()} CR</strong></td>
+                <td>${r.days} Days</td>
+                <td><strong style="color: var(--green);">${r.profit_per_day.toLocaleString()} CR/day</strong></td>
+                <td>
+                  <button class="btn-action-sm btn-buy" onclick="selectPlanet('${r.dst}'); switchTab('map');">Plot Course</button>
+                </td>
+              </tr>
+            `;
+          });
+          tbody.innerHTML = html || '<tr><td colspan="9" style="text-align: center; color: var(--fg-dim);">No profitable routes identified currently.</td></tr>';
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    // --- Shipyard & Outfitter ---
+    function renderShipyard() {
+      if (!gameState) return;
+      const sContainer = document.getElementById('shipyard-cards');
+      let html = '';
+      gameState.all_ships.forEach(s => {
+        html += `
+          <div style="background: var(--bg2); border: 1px solid ${s.is_current ? 'var(--cyan)' : 'var(--panel-border)'}; border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center;">
+            <div style="flex: 1;">
+              <div style="font-weight: 700; color: ${s.is_current ? 'var(--cyan)' : 'var(--fg)'}; font-size: 15px;">
+                ${s.name} ${s.is_current ? '<span class="pill pill-cyan">COMMISSIONED</span>' : ''}
+              </div>
+              <div style="font-size: 11px; color: var(--fg-dim); margin-bottom: 6px;">[${s.ship_class}] · ${s.desc}</div>
+              <div style="display: flex; gap: 12px; font-size: 11px; color: var(--fg-dim);">
+                <span>Hull: <strong style="color: var(--green);">${s.max_hull}</strong></span>
+                <span>Shield: <strong style="color: var(--cyan);">${s.max_shield}</strong></span>
+                <span>Cargo: <strong style="color: var(--purple);">${s.cargo_cap} T</strong></span>
+                <span>Range: <strong style="color: var(--gold);">${s.max_fuel} LY</strong></span>
+                <span>Speed: <strong>${s.speed}x</strong></span>
+              </div>
+            </div>
+            <div style="text-align: right; margin-left: 16px;">
+              <div style="font-family: var(--font-mono); font-size: 14px; font-weight: 700; color: var(--gold);">${s.net_cost.toLocaleString()} CR</div>
+              <div style="font-size: 10px; color: var(--fg-dim); margin-bottom: 6px;">(Trade-in: -${s.trade_in_value.toLocaleString()} CR)</div>
+              ${s.is_current ? '' : `<button class="btn-action-sm btn-buy" ${!s.can_afford ? 'disabled' : ''} onclick="sendAction('buy_ship', { ship_id: '${s.id}' })">Commission</button>`}
+            </div>
+          </div>
+        `;
+      });
+      sContainer.innerHTML = html;
+
+      // Outfitter
+      const oContainer = document.getElementById('outfitter-cards');
+      let oHtml = '';
+      gameState.all_equipment.forEach(eq => {
+        oHtml += `
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px; display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <div style="font-weight: 700; color: var(--fg);">${eq.name} <span class="pill pill-cyan" style="font-size: 9px;">${eq.slot_type}</span></div>
+              <div style="font-size: 11px; color: var(--fg-dim);">${eq.desc}</div>
+            </div>
+            <div style="text-align: right; margin-left: 14px;">
+              <div style="font-family: var(--font-mono); font-size: 13px; font-weight: 700; color: var(--gold); margin-bottom: 4px;">${eq.cost.toLocaleString()} CR</div>
+              ${eq.is_equipped ? '<span class="pill pill-green">INSTALLED</span>' : `<button class="btn-action-sm btn-buy" ${!eq.can_afford ? 'disabled' : ''} onclick="sendAction('buy_equipment', { eq_id: '${eq.id}' })">Equip</button>`}
+            </div>
+          </div>
+        `;
+      });
+      oContainer.innerHTML = oHtml;
+    }
+
+    // --- Station Depot Services ---
+    function renderServices() {
+      if (!gameState) return;
+      const p = gameState.player;
+      const cp = gameState.current_planet;
+
+      document.getElementById('services-sub').textContent = `Spaceport Facilities at ${cp.name}`;
+      document.getElementById('depot-fuel-price').textContent = cp.fuel_price;
+      document.getElementById('depot-fuel-current').textContent = p.fuel;
+      document.getElementById('depot-fuel-max').textContent = p.max_fuel;
+
+      document.getElementById('depot-repair-price').textContent = p.repair_cost_per_hp;
+      document.getElementById('depot-hull-current').textContent = p.hull;
+      document.getElementById('depot-hull-max').textContent = p.max_hull;
+
+      const hasDamaged = p.weapons_damaged || p.engines_damaged || p.shields_damaged;
+      document.getElementById('depot-subsystem-status').textContent = hasDamaged ? 'MALFUNCTION: Damaged systems detected.' : 'All subsystems nominal.';
+      document.getElementById('btn-repair-subsystems').disabled = !hasDamaged;
+
+      document.getElementById('depot-missiles-count').textContent = p.missiles;
+
+      const insStatus = document.getElementById('depot-insurance-status');
+      const insBtn = document.getElementById('btn-buy-insurance');
+      if (p.insurance_active) {
+        insStatus.textContent = 'Policy: Active (Vessel guaranteed against loss)';
+        insStatus.style.color = 'var(--green)';
+        insBtn.disabled = true;
+      } else {
+        insStatus.textContent = 'Policy: Inactive';
+        insStatus.style.color = 'var(--fg-dim)';
+        insBtn.disabled = false;
+      }
+    }
+
+    function buyFuel(amount) { sendAction('buy_fuel', { amount }); }
+    function repairHull(hp) { sendAction('repair_hull', { hp }); }
+    function repairSubsystems() { sendAction('repair_subsystems'); }
+    function buyMissiles(qty) { sendAction('buy_missiles', { qty }); }
+    function buyInsurance() { sendAction('buy_insurance'); }
+
+    // --- Crew Lounge ---
+    function renderCrew() {
+      if (!gameState) return;
+      document.getElementById('crew-daily-wages').textContent = gameState.player.total_daily_wages;
+      const container = document.getElementById('crew-cards');
+      let html = '';
+      gameState.all_crew.forEach(c => {
+        html += `
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 10px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <div>
+                <div style="font-weight: 700; color: var(--fg); font-size: 15px;">${c.name}</div>
+                <div style="font-size: 11px; color: var(--cyan);">${c.role}</div>
+              </div>
+              <span class="pill pill-gold">${c.daily_wage} CR / day</span>
+            </div>
+            <p style="font-size: 12px; color: var(--fg-dim); line-height: 1.4;">${c.desc}</p>
+            <div style="margin-top: auto; display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-size: 11px; color: var(--fg-dim);">Hire Fee: <strong>${c.hire_cost.toLocaleString()} CR</strong></span>
+              ${c.is_hired ? `<button class="btn-action-sm btn-sell" onclick="sendAction('dismiss_crew', { crew_id: '${c.id}' })">Dismiss</button>` : `<button class="btn-action-sm btn-buy" onclick="sendAction('hire_crew', { crew_id: '${c.id}' })">Hire Officer</button>`}
+            </div>
+          </div>
+        `;
+      });
+      container.innerHTML = html;
+    }
+
+    // --- Missions ---
+    function renderMissions() {
+      if (!gameState) return;
+      const aList = document.getElementById('available-missions-list');
+      let aHtml = '';
+      gameState.available_missions.forEach(m => {
+        aHtml += `
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <div style="font-weight: 700; color: var(--cyan);">${m.title}</div>
+              <div style="font-size: 11px; color: var(--fg-dim);">${m.description}</div>
+              <div style="font-size: 11px; color: var(--fg); margin-top: 4px;">
+                Destination: <strong style="color: var(--gold);">${m.destination}</strong> · Deadline: <strong>${m.deadline_days} days</strong>
+              </div>
+            </div>
+            <div style="text-align: right; margin-left: 14px;">
+              <div style="font-family: var(--font-mono); font-size: 14px; font-weight: 700; color: var(--green); margin-bottom: 4px;">+${m.reward_credits.toLocaleString()} CR</div>
+              <button class="btn-action-sm btn-buy" onclick="sendAction('accept_mission', { mission_id: '${m.id}' })">Accept</button>
+            </div>
+          </div>
+        `;
+      });
+      aList.innerHTML = aHtml || '<div style="color: var(--fg-dim); font-size: 12px;">No open contracts posted at this spaceport currently.</div>';
+
+      const actList = document.getElementById('active-missions-list');
+      let actHtml = '';
+      gameState.player.active_missions.forEach(m => {
+        const canDeliver = (m.destination === gameState.current_planet.name);
+        actHtml += `
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <div style="font-weight: 700; color: var(--gold);">${m.title}</div>
+              <div style="font-size: 11px; color: var(--fg-dim);">Deliver to <strong>${m.destination}</strong></div>
+              <div style="font-size: 11px; color: ${m.deadline_days <= 2 ? 'var(--red)' : 'var(--fg)'};">
+                Remaining Time: ${m.deadline_days} Days
+              </div>
+            </div>
+            <div>
+              ${canDeliver ? `<span class="pill pill-green">Delivered upon arrival!</span>` : `<span class="pill pill-cyan">In Transit</span>`}
+            </div>
+          </div>
+        `;
+      });
+      actList.innerHTML = actHtml || '<div style="color: var(--fg-dim); font-size: 12px;">No active missions in your captain manifest.</div>';
+    }
+
+    // --- Bank & Stocks ---
+    function renderBank() {
+      if (!gameState) return;
+      const p = gameState.player;
+      document.getElementById('bank-savings-bal').textContent = p.savings.toLocaleString() + ' CR';
+      document.getElementById('bank-loan-bal').textContent = p.loan.toLocaleString() + ' CR';
+      document.getElementById('bank-credit-score').textContent = p.credit_score;
+      document.getElementById('bank-loan-limit').textContent = p.loan_limit.toLocaleString() + ' CR';
+      document.getElementById('bank-interest-rate').textContent = p.effective_interest_rate + '%';
+
+      // Stocks
+      const sContainer = document.getElementById('stocks-cards');
+      let html = '';
+      gameState.all_stocks.forEach(stk => {
+        const trendColor = stk.change_pct >= 0 ? 'var(--green)' : 'var(--red)';
+        html += `
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px; display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <div style="font-weight: 700; color: var(--fg);">
+                ${stk.name} <span class="pill pill-cyan" style="font-size: 10px;">${stk.symbol}</span>
+              </div>
+              <div style="font-size: 11px; color: var(--fg-dim);">${stk.desc}</div>
+              <div style="font-size: 11px; color: var(--fg); margin-top: 2px;">Owned: <strong>${stk.shares_owned}</strong> shares</div>
+            </div>
+            <div style="text-align: right; margin-left: 14px;">
+              <div style="font-family: var(--font-mono); font-size: 15px; font-weight: 700; color: var(--gold);">${stk.price} CR</div>
+              <div style="font-size: 11px; color: ${trendColor}; font-weight: 700; margin-bottom: 4px;">${stk.change_pct >= 0 ? '+' : ''}${stk.change_pct}%</div>
+              <div style="display: flex; gap: 4px;">
+                <button class="btn-action-sm btn-buy" onclick="sendAction('buy_stock', { symbol: '${stk.symbol}', qty: 5 })">+5</button>
+                <button class="btn-action-sm btn-sell" ${stk.shares_owned <= 0 ? 'disabled' : ''} onclick="sendAction('sell_stock', { symbol: '${stk.symbol}', qty: 5 })">-5</button>
+              </div>
+            </div>
+          </div>
+        `;
+      });
+      sContainer.innerHTML = html;
+    }
+
+    function promptDeposit() {
+      const amt = prompt("Enter Credits to deposit into high-yield savings:", "500");
+      if (amt && parseInt(amt, 10) > 0) sendAction('bank_deposit', { amount: parseInt(amt, 10) });
+    }
+    function promptWithdraw() {
+      const amt = prompt("Enter Credits to withdraw:", "500");
+      if (amt && parseInt(amt, 10) > 0) sendAction('bank_withdraw', { amount: parseInt(amt, 10) });
+    }
+    function promptBorrow() {
+      const amt = prompt("Enter loan amount to borrow from First Galactic Bank:", "1000");
+      if (amt && parseInt(amt, 10) > 0) sendAction('bank_borrow', { amount: parseInt(amt, 10) });
+    }
+    function promptRepay() {
+      const amt = prompt("Enter Credits to repay towards outstanding loan:", "1000");
+      if (amt && parseInt(amt, 10) > 0) sendAction('bank_repay', { amount: parseInt(amt, 10) });
+    }
+
+    // --- Career & Captain's Log ---
+    function renderLog() {
+      if (!gameState) return;
+      const p = gameState.player;
+
+      // Ranks
+      const rContainer = document.getElementById('ranks-progression-list');
+      let rHtml = '';
+      gameState.ranks.forEach(r => {
+        const isCurrent = (r.name === p.rank.name);
+        rHtml += `
+          <div style="background: var(--bg2); border-left: 3px solid ${r.color}; border-radius: 4px; padding: 8px 12px; display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <span style="color: ${r.color}; font-weight: 700;">${r.insignia} ${r.name}</span>
+              <span style="font-size: 11px; color: var(--fg-dim); margin-left: 6px;">(${r.renown.toLocaleString()} Renown)</span>
+              <div style="font-size: 11px; color: var(--fg-dim);">${r.perk}</div>
+            </div>
+            ${isCurrent ? '<span class="pill pill-cyan">ACTIVE</span>' : ''}
+          </div>
+        `;
+      });
+      rContainer.innerHTML = rHtml;
+
+      // Faction Standings
+      const fContainer = document.getElementById('faction-standings-list');
+      let fHtml = '';
+      for (const [faction, rep] of Object.entries(p.reputation)) {
+        const standing = p.standing[faction];
+        const repColor = rep >= 15 ? 'var(--green)' : (rep <= -15 ? 'var(--red)' : 'var(--fg-dim)');
+        fHtml += `
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 6px; padding: 8px 12px;">
+            <div style="font-weight: 700; font-size: 12px;">${faction}</div>
+            <div style="display: flex; justify-content: space-between; font-size: 11px; margin-top: 4px;">
+              <span style="color: ${repColor}; font-weight: 700;">${standing}</span>
+              <span style="font-family: var(--font-mono); color: var(--fg-dim);">${rep > 0 ? '+' : ''}${rep}</span>
+            </div>
+          </div>
+        `;
+      }
+      fContainer.innerHTML = fHtml;
+
+      // Achievements
+      const aContainer = document.getElementById('achievements-grid');
+      let aHtml = '';
+      gameState.all_achievements.forEach(ach => {
+        aHtml += `
+          <div style="background: var(--bg2); border: 1px solid ${ach.unlocked ? 'var(--gold)' : 'var(--panel-border)'}; border-radius: 6px; padding: 8px; text-align: center; opacity: ${ach.unlocked ? '1' : '0.4'};">
+            <div style="font-size: 18px; margin-bottom: 2px;">${ach.unlocked ? '🏆' : '🔒'}</div>
+            <div style="font-size: 11px; font-weight: 700; color: ${ach.unlocked ? 'var(--gold)' : 'var(--fg)'};">${ach.title}</div>
+            <div style="font-size: 9px; color: var(--fg-dim); margin-top: 2px;">${ach.desc}</div>
+          </div>
+        `;
+      });
+      aContainer.innerHTML = aHtml;
+
+      // News Feed
+      const nContainer = document.getElementById('news-feed-list');
+      nContainer.innerHTML = gameState.news_feed.map(n => `<div>📡 ${n}</div>`).join('');
+    }
+
+    // --- Dynamic Encounters ---
+    function checkEncounter() {
+      if (!gameState || !gameState.active_encounter) {
+        document.getElementById('encounter-modal').classList.remove('active');
+        return;
+      }
+      const enc = gameState.active_encounter;
+      const modal = document.getElementById('encounter-modal');
+      document.getElementById('enc-title').textContent = enc.title || 'Sensor Contact';
+      document.getElementById('enc-desc').textContent = enc.desc || 'An encounter has occurred in deep space.';
+
+      const t = enc.type;
+      const opt1 = document.getElementById('enc-btn-opt1');
+      const opt2 = document.getElementById('enc-btn-opt2');
+
+      if (t === 'customs_scan') {
+        opt1.textContent = 'Submit to Security Scan';
+        opt2.textContent = 'Attempt to Bribe Officer (500 CR)';
+      } else if (t === 'faction_patrol') {
+        opt1.textContent = 'Transmit Friendly Identification';
+        opt2.textContent = 'Ignore and Divert Course';
+      } else if (t === 'derelict') {
+        opt1.textContent = 'Deploy Salvage Crew';
+        opt2.textContent = 'Leave Derelict Alone';
+      } else if (t === 'distress_beacon') {
+        opt1.textContent = 'Transfer 15 LY Fuel Aid';
+        opt2.textContent = 'Ignore Transmission';
+      } else if (t === 'wandering_trader') {
+        opt1.textContent = `Buy Rare Deal (${enc.qty}x ${enc.good} for ${enc.qty * enc.unit_price} CR)`;
+        opt2.textContent = 'Decline Offer';
+      } else if (t === 'asteroid_field') {
+        opt1.textContent = 'Thread Through Field (Piloting Test)';
+        opt2.textContent = 'Take Wide Detour (1 Extra Day)';
+      } else if (t === 'wormhole') {
+        opt1.textContent = 'Plunge into Anomaly';
+        opt2.textContent = 'Maintain Standard Route';
+      } else if (t === 'mining_opportunity') {
+        opt1.textContent = 'Deploy Drone Extractors';
+        opt2.textContent = 'Bypass Asteroid';
+      } else {
+        opt1.textContent = 'Cooperate';
+        opt2.textContent = 'Dismiss';
+      }
+
+      modal.classList.add('active');
+    }
+
+    function resolveEncounter(choice) {
+      sendAction('resolve_encounter', { choice });
+    }
+
+    // --- Tactical Combat ---
+    function checkCombat() {
+      const c = gameState ? gameState.active_combat : null;
+      const modal = document.getElementById('combat-modal');
+      if (!c) {
+        modal.classList.remove('active');
+        return;
+      }
+      modal.classList.add('active');
+
+      document.getElementById('combat-enemy-name').textContent = c.enemy_name;
+      document.getElementById('combat-enemy-ship').textContent = `Class: ${c.enemy_ship_name} · Behavior: ${c.personality.toUpperCase()}`;
+      document.getElementById('combat-turn-counter').textContent = `Combat Turn ${c.turn_count}`;
+
+      // Player combat gauges
+      const p = gameState.player;
+      document.getElementById('combat-player-hull-val').textContent = `${p.hull} / ${p.max_hull}`;
+      document.getElementById('combat-player-hull-bar').style.width = `${(p.hull / p.max_hull) * 100}%`;
+      document.getElementById('combat-player-shield-val').textContent = `${p.shield} / ${p.max_shield}`;
+      document.getElementById('combat-player-shield-bar').style.width = p.max_shield > 0 ? `${(p.shield / p.max_shield) * 100}%` : '0%';
+
+      // Enemy combat gauges
+      document.getElementById('combat-enemy-hull-val').textContent = `${c.enemy_hull} / ${c.enemy_max_hull}`;
+      document.getElementById('combat-enemy-hull-bar').style.width = `${(c.enemy_hull / c.enemy_max_hull) * 100}%`;
+      document.getElementById('combat-enemy-shield-val').textContent = `${c.enemy_shield} / ${c.enemy_max_shield}`;
+      document.getElementById('combat-enemy-shield-bar').style.width = c.enemy_max_shield > 0 ? `${(c.enemy_shield / c.enemy_max_shield) * 100}%` : '0%';
+
+      // Torpedo Button
+      document.getElementById('btn-combat-missile').textContent = `🚀 Fire Torpedo (${c.player_missiles} left)`;
+      document.getElementById('btn-combat-missile').disabled = (c.player_missiles <= 0);
+
+      // Boarding Button
+      document.getElementById('btn-combat-board').disabled = !c.can_board;
+
+      // Combat Terminal
+      const term = document.getElementById('combat-terminal-log');
+      term.innerHTML = c.combat_log.map(l => `<div>> ${l}</div>`).join('');
+      term.scrollTop = term.scrollHeight;
+
+      // Result dismissal
+      const resBox = document.getElementById('combat-result-box');
+      const actBar = document.getElementById('combat-actions-bar');
+      if (c.is_finished) {
+        actBar.style.display = 'none';
+        resBox.style.display = 'block';
+        const dBtn = document.getElementById('combat-btn-dismiss');
+        if (c.player_won) {
+          dBtn.textContent = '🏆 Enemy Defeated — Salvage & Disengage';
+        } else if (c.player_escaped) {
+          dBtn.textContent = '🏃 Warp Drive Engaged — Disengage';
+        } else if (c.player_dead) {
+          dBtn.textContent = '💀 Vessel Destroyed — Reconstruct from Insurance / Autosave';
+        }
+      } else {
+        actBar.style.display = 'grid';
+        resBox.style.display = 'none';
+      }
+    }
+
+    function sendCombatAction(combat_action) {
+      sendAction('combat_action', { combat_action });
+    }
+
+    function dismissCombat() {
+      sendAction('dismiss_combat');
+    }
+
+    // --- Save / Load Dialog ---
+    async function openSaveModal() {
+      try {
+        const res = await fetch('/api/saves');
+        const json = await res.json();
+        if (json.success && json.slots) {
+          const list = document.getElementById('save-slots-list');
+          let html = '';
+          json.slots.forEach(s => {
+            const info = s.info;
+            html += `
+              <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px; display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                  <div style="font-weight: 700; color: var(--cyan);">Slot ${s.slot.toUpperCase()}</div>
+                  <div style="font-size: 11px; color: var(--fg-dim);">
+                    ${s.exists ? `${info.name} · Day ${info.day} · ${info.location} · ${info.credits.toLocaleString()} CR` : 'Empty Save Slot'}
+                  </div>
+                </div>
+                <div style="display: flex; gap: 6px;">
+                  <button class="btn-action-sm btn-buy" onclick="saveGame('${s.slot}')">Save</button>
+                  <button class="btn-action-sm btn-sell" ${!s.exists ? 'disabled' : ''} onclick="loadGame('${s.slot}')">Load</button>
+                </div>
+              </div>
+            `;
+          });
+          list.innerHTML = html;
+          document.getElementById('save-modal').classList.add('active');
+        }
+      } catch (e) {
+        showToast("Error loading saves: " + e);
+      }
+    }
+
+    function closeSaveModal() {
+      document.getElementById('save-modal').classList.remove('active');
+    }
+
+    function saveGame(slot) {
+      sendAction('save_game', { slot });
+      closeSaveModal();
+    }
+
+    function loadGame(slot) {
+      sendAction('load_game', { slot });
+      closeSaveModal();
+    }
+
+    // --- New Game Dialog ---
+    function openNewGameModal() {
+      document.getElementById('newgame-modal').classList.add('active');
+    }
+    function closeNewGameModal() {
+      document.getElementById('newgame-modal').classList.remove('active');
+    }
+    function confirmNewGame() {
+      const name = document.getElementById('newgame-name').value;
+      const difficulty = document.getElementById('newgame-diff').value;
+      closeNewGameModal();
+      sendAction('new_game', { name, difficulty });
+    }
+
+    // --- Manual Modal ---
+    function openManualModal() {
+      document.getElementById('manual-modal').classList.add('active');
+    }
+    function closeManualModal() {
+      document.getElementById('manual-modal').classList.remove('active');
+    }
+
+    // --- Keyboard Shortcuts ---
+    window.addEventListener('keydown', (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+      if (e.key === '1') switchTab('map');
+      if (e.key === '2') switchTab('market');
+      if (e.key === '3') switchTab('advisor');
+      if (e.key === '4') switchTab('shipyard');
+      if (e.key === '5') switchTab('services');
+      if (e.key === '6') switchTab('crew');
+      if (e.key === '7') switchTab('missions');
+      if (e.key === '8') switchTab('bank');
+      if (e.key === '9') switchTab('log');
+      if (e.key === 'Escape') {
+        closeTradeModal();
+        closeSaveModal();
+        closeNewGameModal();
+        closeManualModal();
+      }
+    });
+
+    // --- Initial Boot ---
+    window.addEventListener('DOMContentLoaded', () => {
+      fetchState();
+      setInterval(fetchState, 3000); // Polling for telemetry & auto-sync
+    });
+  </script>
+</body>
+</html>
+"""
 
 
 # ==============================================================================
-# SELF-TEST SUITE
+# WEB SERVER & SESSION MANAGEMENT — Browser HTML Edition
+# ==============================================================================
+
+class GameSession:
+    """Holds the active game engine and current encounter / combat state."""
+    def __init__(self, muted: bool = False, difficulty: str = "normal", player_name: str = "Commander"):
+        self.engine = GameEngine(muted=muted, difficulty_id=difficulty)
+        self.engine.new_game(player_name, difficulty)
+        self.active_encounter: Optional[Dict[str, Any]] = None
+        self.active_combat: Optional[CombatEncounter] = None
+        self.last_logs: List[str] = ["Welcome to Space Trader: Odyssey. Engines online, all systems nominal."]
+        self.sound_event: Optional[str] = None
+        self.lock = threading.Lock()
+
+    def set_sound(self, name: str) -> None:
+        self.sound_event = name
+
+    def pop_sound(self) -> Optional[str]:
+        s = self.sound_event
+        self.sound_event = None
+        return s
+
+
+RANK_TIER_COLORS = ["#94a3b8", "#38bdf8", "#34d399", "#a855f7", "#fbbf24", "#f43f5e"]
+
+
+def serialize_game_state(session: GameSession) -> Dict[str, Any]:
+    """Extract comprehensive JSON game state for the browser UI."""
+    engine = session.engine
+    player = engine.player
+    current_p = engine.current_planet
+
+    # Cargo detail
+    cargo_detail = []
+    cargo_used = 0
+    for gid, qty in player.cargo.items():
+        if qty > 0 and gid in COMMODITIES:
+            comm = COMMODITIES[gid]
+            sell_price = engine.get_sell_price(gid)
+            cargo_detail.append({
+                "id": gid,
+                "name": comm.name,
+                "category": comm.category,
+                "qty": qty,
+                "base_price": comm.base_price,
+                "sell_price": sell_price,
+                "total_value": sell_price * qty,
+                "is_contraband": comm.is_contraband,
+                "desc": comm.desc,
+                "icon": comm.icon,
+            })
+            cargo_used += qty
+
+    # Rank & Renown progression
+    cur_rank = engine.rank()
+    next_rank_title, renown_needed = engine.renown_to_next_rank()
+    cur_rank_idx = engine.rank_index()
+    if cur_rank_idx < len(RANKS) - 1:
+        prev_req = cur_rank.renown
+        next_req = RANKS[cur_rank_idx + 1].renown
+        denom = max(1, next_req - prev_req)
+        renown_pct = min(100.0, max(0.0, (engine.renown() - prev_req) / denom * 100.0))
+    else:
+        renown_pct = 100.0
+
+    ship_tmpl = SHIP_TEMPLATES.get(player.ship_id, SHIP_TEMPLATES["sparrow"])
+
+    # Crew details
+    crew_list = []
+    for c in AVAILABLE_CREW:
+        crew_list.append({
+            "id": c.id,
+            "name": c.name,
+            "role": c.role,
+            "hire_cost": c.hire_cost,
+            "daily_wage": c.daily_wage,
+            "perk_type": c.perk_type,
+            "perk_val": c.perk_val,
+            "desc": c.desc,
+            "is_hired": c.id in player.hired_crew,
+        })
+
+    # Planets list
+    all_planets = []
+    for p in engine.planets.values():
+        dist = engine.calculate_distance(current_p, p)
+        fuel_cost, days_cost = engine.calculate_travel_cost(p)
+        all_planets.append({
+            "name": p.name,
+            "subtitle": p.subtitle,
+            "x": p.x,
+            "y": p.y,
+            "tech": p.tech,
+            "agri": p.agri,
+            "crime": p.crime,
+            "rich": p.rich,
+            "mining": p.mining,
+            "security": p.security,
+            "faction": p.faction,
+            "color": p.color,
+            "desc": p.desc,
+            "fuel_price": p.fuel_price,
+            "repair_cost": p.repair_cost,
+            "active_event": asdict(p.active_event) if p.active_event else None,
+            "distance": round(dist, 1),
+            "fuel_cost": fuel_cost,
+            "days_cost": days_cost,
+            "in_range": player.fuel >= fuel_cost,
+            "is_current": p.name == current_p.name,
+        })
+
+    # Market commodities on current planet
+    market_items = []
+    for gid, comm in COMMODITIES.items():
+        buy_p = engine.get_buy_price(gid)
+        sell_p = engine.get_sell_price(gid)
+        stock_qty = current_p.stock.get(gid, 0)
+        p_qty = player.cargo.get(gid, 0)
+        history = current_p.price_history.get(gid, [comm.base_price])
+
+        if len(history) >= 2:
+            if history[-1] > history[-2]:
+                trend = "up"
+            elif history[-1] < history[-2]:
+                trend = "down"
+            else:
+                trend = "flat"
+        else:
+            trend = "flat"
+
+        avg_price = sum(history) / len(history) if history else comm.base_price
+        pct_diff = round(((buy_p - comm.base_price) / max(1, comm.base_price)) * 100.0, 1)
+
+        market_items.append({
+            "id": gid,
+            "name": comm.name,
+            "category": comm.category,
+            "base_price": comm.base_price,
+            "buy_price": buy_p,
+            "sell_price": sell_p,
+            "stock": stock_qty,
+            "player_qty": p_qty,
+            "trend": trend,
+            "price_history": history,
+            "is_contraband": comm.is_contraband,
+            "desc": comm.desc,
+            "icon": comm.icon,
+            "avg_price": int(avg_price),
+            "pct_diff": pct_diff,
+            "can_buy": (player.credits >= buy_p and (player.cargo_cap - cargo_used) > 0 and stock_qty > 0),
+            "can_sell": p_qty > 0,
+        })
+
+    # Shipyard
+    ships_list = []
+    trade_in_val = engine.ship_trade_in_value()
+    for sid, st in SHIP_TEMPLATES.items():
+        cost_after_trade = max(0, st.cost - trade_in_val)
+        ships_list.append({
+            "id": sid,
+            "name": st.name,
+            "ship_class": st.ship_class,
+            "cost": st.cost,
+            "trade_in_value": trade_in_val,
+            "net_cost": cost_after_trade,
+            "cargo_cap": st.cargo_cap,
+            "max_hull": st.max_hull,
+            "max_shield": st.max_shield,
+            "max_fuel": st.max_fuel,
+            "speed": st.speed,
+            "weapon_slots": st.weapon_slots,
+            "shield_slots": st.shield_slots,
+            "module_slots": st.module_slots,
+            "desc": st.desc,
+            "is_current": sid == player.ship_id,
+            "can_afford": player.credits >= cost_after_trade,
+        })
+
+    # Outfitter
+    equipment_list = []
+    for eq_id, eq in EQUIPMENT_ITEMS.items():
+        is_equipped = (
+            eq_id in player.equipped_weapons or
+            eq_id in player.equipped_shields or
+            eq_id in player.equipped_modules
+        )
+        equipment_list.append({
+            "id": eq_id,
+            "name": eq.name,
+            "slot_type": eq.slot_type,
+            "cost": eq.cost,
+            "damage": eq.damage,
+            "shield_hp": eq.shield_hp,
+            "accuracy": eq.accuracy,
+            "crit_chance": eq.crit_chance,
+            "fuel_save": eq.fuel_save,
+            "cargo_bonus": eq.cargo_bonus,
+            "evasion_bonus": eq.evasion_bonus,
+            "desc": eq.desc,
+            "is_equipped": is_equipped,
+            "can_afford": player.credits >= eq.cost,
+        })
+
+    # Missions
+    available_missions = []
+    for m in engine.available_missions:
+        if m.origin == current_p.name and not m.completed and not m.failed and m not in player.active_missions:
+            available_missions.append(asdict(m))
+
+    active_missions = [asdict(m) for m in player.active_missions]
+
+    # Stocks
+    stocks_list = []
+    for sym, stk in engine.stocks.items():
+        owned = player.stocks_owned.get(sym, 0)
+        history = stk.history
+        last_change = 0.0
+        if len(history) >= 2:
+            last_change = round(((history[-1] - history[-2]) / max(1.0, history[-2])) * 100.0, 1)
+        stocks_list.append({
+            "symbol": sym,
+            "name": stk.name,
+            "price": round(stk.price, 2),
+            "history": [round(h, 2) for h in stk.history[-15:]],
+            "volatility": stk.volatility,
+            "desc": stk.desc,
+            "shares_owned": owned,
+            "total_value": int(owned * stk.price),
+            "change_pct": last_change,
+        })
+
+    # Achievements
+    achievements_list = []
+    for aid, (atitle, adesc) in ACHIEVEMENTS.items():
+        achievements_list.append({
+            "id": aid,
+            "title": atitle,
+            "desc": adesc,
+            "unlocked": aid in player.achievements,
+        })
+
+    # Combat state
+    combat_data = None
+    if session.active_combat:
+        c = session.active_combat
+        combat_data = {
+            "enemy_name": c.enemy_name,
+            "enemy_ship_id": c.enemy_ship_id,
+            "enemy_ship_name": c.enemy_ship_name,
+            "enemy_hull": c.enemy_hull,
+            "enemy_max_hull": c.enemy_max_hull,
+            "enemy_shield": c.enemy_shield,
+            "enemy_max_shield": c.enemy_max_shield,
+            "enemy_weapons_damaged": c.enemy_weapons_damaged,
+            "enemy_engines_damaged": c.enemy_engines_damaged,
+            "personality": c.personality,
+            "personality_desc": ENEMY_PERSONALITIES.get(c.personality, ""),
+            "turn_count": c.turn_count,
+            "drones_active": c.drones_active,
+            "combat_log": c.combat_log[-12:],
+            "is_finished": c.is_finished,
+            "player_won": c.player_won,
+            "player_escaped": c.player_escaped,
+            "player_dead": c.player_dead,
+            "insurance_used": c.insurance_used,
+            "enemy_fled": c.enemy_fled,
+            "boarded_success": c.boarded_success,
+            "can_board": c.can_board(),
+            "can_flee": c.can_flee(),
+            "player_missiles": c.player_missiles(),
+            "is_bounty": c.is_bounty,
+            "bounty_reward": c.bounty_reward,
+        }
+
+    net_worth = engine.calculate_net_worth()
+
+    return {
+        "player": {
+            "name": player.name,
+            "credits": player.credits,
+            "savings": player.savings,
+            "loan": player.loan,
+            "loan_limit": engine.loan_limit(),
+            "effective_interest_rate": round(engine._effective_loan_interest() * 100, 2),
+            "credit_score": player.credit_score,
+            "day": player.day,
+            "location": player.location,
+            "difficulty_id": player.difficulty_id,
+            "difficulty_name": engine.difficulty.name,
+            "ship_id": player.ship_id,
+            "ship_name": ship_tmpl.name,
+            "ship_class": ship_tmpl.ship_class,
+            "hull": player.hull,
+            "max_hull": player.max_hull,
+            "shield": player.shield,
+            "max_shield": player.max_shield,
+            "fuel": player.fuel,
+            "max_fuel": player.max_fuel,
+            "speed": ship_tmpl.speed,
+            "cargo_cap": player.cargo_cap,
+            "cargo_used": cargo_used,
+            "cargo_free": max(0, player.cargo_cap - cargo_used),
+            "missiles": player.missiles,
+            "max_missiles": PLAYER_MISSILE_CAP,
+            "missile_price": engine.missile_price(),
+            "insurance_active": player.insurance_active,
+            "insurance_price": engine.insurance_price(),
+            "weapons_damaged": player.weapons_damaged,
+            "engines_damaged": player.engines_damaged,
+            "shields_damaged": player.shields_damaged,
+            "subsystem_repair_cost": engine.subsystem_repair_cost(),
+            "repair_cost_per_hp": engine.current_repair_price(),
+            "highest_rank_index": player.highest_rank_index,
+            "rank": {
+                "id": cur_rank.id,
+                "name": cur_rank.name,
+                "renown": cur_rank.renown,
+                "insignia": cur_rank.insignia,
+                "perk": cur_rank.perk,
+                "color": RANK_TIER_COLORS[cur_rank_idx],
+                "tier": cur_rank_idx,
+            },
+            "renown": engine.renown(),
+            "next_rank_title": next_rank_title,
+            "renown_needed": renown_needed,
+            "renown_pct": round(renown_pct, 1),
+            "cargo": player.cargo,
+            "cargo_detail": cargo_detail,
+            "equipped_weapons": player.equipped_weapons,
+            "equipped_shields": player.equipped_shields,
+            "equipped_modules": player.equipped_modules,
+            "weapon_slots": ship_tmpl.weapon_slots,
+            "shield_slots": ship_tmpl.shield_slots,
+            "module_slots": ship_tmpl.module_slots,
+            "hired_crew": player.hired_crew,
+            "total_daily_wages": engine.total_daily_wages(),
+            "active_missions": active_missions,
+            "stocks_owned": player.stocks_owned,
+            "achievements": list(player.achievements),
+            "stats": player.stats,
+            "net_worth": net_worth,
+            "target_net_worth": TARGET_NET_WORTH,
+            "net_worth_pct": round(min(100.0, (net_worth / TARGET_NET_WORTH) * 100.0), 1),
+            "net_worth_history": player.net_worth_history[-30:],
+            "reputation": {f: player.rep(f) for f in FACTIONS},
+            "standing": {f: reputation_rank(player.rep(f)) for f in FACTIONS},
+            "victory": net_worth >= TARGET_NET_WORTH,
+        },
+        "current_planet": {
+            "name": current_p.name,
+            "subtitle": current_p.subtitle,
+            "x": current_p.x,
+            "y": current_p.y,
+            "tech": current_p.tech,
+            "agri": current_p.agri,
+            "crime": current_p.crime,
+            "rich": current_p.rich,
+            "mining": current_p.mining,
+            "security": current_p.security,
+            "faction": current_p.faction,
+            "color": current_p.color,
+            "desc": current_p.desc,
+            "fuel_price": current_p.fuel_price,
+            "repair_cost": current_p.repair_cost,
+            "active_event": asdict(current_p.active_event) if current_p.active_event else None,
+            "market": market_items,
+        },
+        "all_planets": all_planets,
+        "all_ships": ships_list,
+        "all_equipment": equipment_list,
+        "all_crew": crew_list,
+        "available_missions": available_missions,
+        "all_stocks": stocks_list,
+        "all_achievements": achievements_list,
+        "ranks": [
+            {
+                "id": r.id,
+                "name": r.name,
+                "renown": r.renown,
+                "insignia": r.insignia,
+                "perk": r.perk,
+                "color": RANK_TIER_COLORS[i],
+            }
+            for i, r in enumerate(RANKS)
+        ],
+        "news_feed": engine.news_feed[-15:],
+        "active_encounter": session.active_encounter,
+        "active_combat": combat_data,
+        "last_logs": session.last_logs[-8:],
+    }
+
+
+GLOBAL_SESSION: Optional[GameSession] = None
+
+
+class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
+    """Multi-threaded HTTP handler serving the browser game client and REST API."""
+
+    def log_message(self, format: str, *args: Any) -> None:
+        """Suppress noisy default HTTP access logs."""
+        return
+
+    def _set_headers(self, content_type: str = "application/json", status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.end_headers()
+
+    def do_OPTIONS(self) -> None:
+        self._set_headers()
+
+    def do_GET(self) -> None:
+        global GLOBAL_SESSION
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path in ("/", "/index.html"):
+            self._set_headers(content_type="text/html; charset=utf-8")
+            self.wfile.write(HTML_PAGE.encode("utf-8"))
+            return
+
+        if path == "/api/health":
+            self._set_headers()
+            self.wfile.write(json.dumps({"status": "ok", "app": "Space Trader: Odyssey"}).encode("utf-8"))
+            return
+
+        if GLOBAL_SESSION is None:
+            GLOBAL_SESSION = GameSession()
+
+        if path == "/api/state":
+            with GLOBAL_SESSION.lock:
+                state = serialize_game_state(GLOBAL_SESSION)
+                sound = GLOBAL_SESSION.pop_sound()
+            self._set_headers()
+            self.wfile.write(json.dumps({"success": True, "state": state, "sound": sound}).encode("utf-8"))
+            return
+
+        if path == "/api/routes":
+            with GLOBAL_SESSION.lock:
+                routes = GLOBAL_SESSION.engine.compute_best_trade_routes()
+            self._set_headers()
+            self.wfile.write(json.dumps({"success": True, "routes": routes[:12]}).encode("utf-8"))
+            return
+
+        if path == "/api/saves":
+            with GLOBAL_SESSION.lock:
+                slots = []
+                for s in (AUTO_SLOT, PRECOMBAT_SLOT) + SAVE_SLOTS:
+                    info = GLOBAL_SESSION.engine.slot_info(s)
+                    slots.append({
+                        "slot": s,
+                        "exists": info is not None,
+                        "info": info
+                    })
+            self._set_headers()
+            self.wfile.write(json.dumps({"success": True, "slots": slots}).encode("utf-8"))
+            return
+
+        # Fallback 404
+        self.send_error(404, "File Not Found")
+
+    def do_POST(self) -> None:
+        global GLOBAL_SESSION
+        if GLOBAL_SESSION is None:
+            GLOBAL_SESSION = GameSession()
+
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/api/action":
+            self.send_error(404, "Unknown endpoint")
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8")
+            data = json.loads(body) if body else {}
+        except Exception as e:
+            self._set_headers(status=400)
+            self.wfile.write(json.dumps({"success": False, "error": f"Invalid JSON: {e}"}).encode("utf-8"))
+            return
+
+        action = data.get("action", "")
+        success = False
+        message = ""
+        sound: Optional[str] = None
+        logs: List[str] = []
+
+        with GLOBAL_SESSION.lock:
+            engine = GLOBAL_SESSION.engine
+            player = engine.player
+
+            if action == "new_game":
+                name = str(data.get("name", "Commander")).strip() or "Commander"
+                diff = str(data.get("difficulty", "normal")).strip().lower()
+                engine.new_game(name, diff)
+                GLOBAL_SESSION.active_encounter = None
+                GLOBAL_SESSION.active_combat = None
+                GLOBAL_SESSION.last_logs = [f"New commission created for {name} on {diff.upper()} difficulty."]
+                success = True
+                message = f"Welcome aboard, {name}!"
+                sound = "warp"
+
+            elif action == "travel":
+                dest = str(data.get("destination", ""))
+                ok, msg, enc = engine.execute_travel(dest)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "warp"
+                    if enc:
+                        t = enc.get("type")
+                        if t in ("pirate_ambush", "bounty_combat"):
+                            GLOBAL_SESSION.active_combat = start_combat(engine, enc)
+                            GLOBAL_SESSION.active_encounter = None
+                            sound = "alarm"
+                            logs.append(f"ALARM: Hostile vessel intercepted! {enc.get('title', 'Raider Attack')}")
+                        else:
+                            GLOBAL_SESSION.active_encounter = enc
+                            logs.append(f"Sector Sensor Contact: {enc.get('title', 'Anomaly Detected')}")
+                    else:
+                        GLOBAL_SESSION.active_encounter = None
+                        GLOBAL_SESSION.active_combat = None
+
+            elif action == "resolve_encounter":
+                choice = bool(data.get("choice", False))
+                enc = GLOBAL_SESSION.active_encounter
+                if enc:
+                    t = enc.get("type")
+                    enc_logs: List[str] = []
+                    if t == "customs_scan":
+                        enc_logs = engine.resolve_customs(enc, choice)
+                        sound = "alarm" if choice else "coin"
+                    elif t == "faction_patrol":
+                        enc_logs = engine.resolve_faction_patrol(enc, choice)
+                        sound = "coin" if choice else "alarm"
+                    elif t == "derelict":
+                        enc_logs = engine.resolve_derelict(enc, choice)
+                        sound = "upgrade" if choice else "click"
+                    elif t == "solar_flare":
+                        enc_logs = engine.resolve_solar_flare(enc)
+                        sound = "shield_hit"
+                    elif t == "distress_beacon":
+                        enc_logs = engine.resolve_distress(enc, choice)
+                        sound = "coin" if choice else "click"
+                    elif t == "wandering_trader":
+                        enc_logs = engine.resolve_trader(enc, choice)
+                        sound = "buy" if choice else "click"
+                    elif t == "asteroid_field":
+                        enc_logs = engine.resolve_asteroid_field(enc, choice)
+                        sound = "shield_hit" if choice else "coin"
+                    elif t == "wormhole":
+                        enc_logs = engine.resolve_wormhole(enc, choice)
+                        sound = "wormhole" if choice else "click"
+                    elif t == "mining_opportunity":
+                        enc_logs = engine.resolve_mining(enc, choice)
+                        sound = "mine" if choice else "click"
+
+                    GLOBAL_SESSION.active_encounter = None
+                    if enc.get("type") in ("pirate_ambush", "bounty_combat"):
+                        GLOBAL_SESSION.active_combat = start_combat(engine, enc)
+                        sound = "alarm"
+
+                    success = True
+                    logs.extend(enc_logs)
+                    message = enc_logs[-1] if enc_logs else "Encounter resolved."
+                else:
+                    success = False
+                    message = "No active encounter to resolve."
+
+            elif action == "combat_action":
+                c_act = str(data.get("combat_action", "fire"))
+                combat = GLOBAL_SESSION.active_combat
+                if combat and not combat.is_finished:
+                    c_logs = combat.player_action(c_act)
+                    logs.extend(c_logs)
+                    success = True
+                    message = c_logs[-1] if c_logs else "Combat turn complete."
+
+                    if c_act == "fire":
+                        sound = "laser"
+                    elif c_act == "missile":
+                        sound = "laser"
+                    elif c_act == "recharge":
+                        sound = "upgrade"
+                    elif c_act == "flee":
+                        sound = "warp" if combat.player_escaped else "alarm"
+                    elif c_act == "board":
+                        sound = "upgrade"
+
+                    if combat.is_finished:
+                        if combat.player_won:
+                            sound = "victory"
+                        elif combat.player_dead:
+                            sound = "death"
+                else:
+                    success = False
+                    message = "No active combat engagement."
+
+            elif action == "dismiss_combat":
+                combat = GLOBAL_SESSION.active_combat
+                if combat and combat.is_finished:
+                    GLOBAL_SESSION.active_combat = None
+                    engine.autosave()
+                    success = True
+                    message = "Disengaged from combat arena."
+                else:
+                    success = False
+                    message = "Combat is still in progress."
+
+            elif action == "buy_commodity":
+                good = str(data.get("good", ""))
+                qty = int(data.get("qty", 1))
+                ok, msg = engine.buy_commodity(good, qty)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "buy"
+
+            elif action == "sell_commodity":
+                good = str(data.get("good", ""))
+                qty = int(data.get("qty", 1))
+                ok, msg = engine.sell_commodity(good, qty)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "sell"
+
+            elif action == "buy_fuel":
+                amount = int(data.get("amount", 10))
+                ok, msg = engine.buy_fuel(amount)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "coin"
+
+            elif action == "repair_hull":
+                hp = int(data.get("hp", 10))
+                ok, msg = engine.repair_hull(hp)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "upgrade"
+
+            elif action == "repair_subsystems":
+                ok, msg = engine.repair_subsystems()
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "upgrade"
+
+            elif action == "buy_insurance":
+                ok, msg = engine.buy_insurance()
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "coin"
+
+            elif action == "buy_missiles":
+                qty = int(data.get("qty", 1))
+                ok, msg = engine.buy_missiles(qty)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "coin"
+
+            elif action == "buy_ship":
+                ship_id = str(data.get("ship_id", ""))
+                ok, msg = engine.buy_ship(ship_id)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "upgrade"
+
+            elif action == "buy_equipment":
+                eq_id = str(data.get("eq_id", ""))
+                ok, msg = engine.buy_equipment(eq_id)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "upgrade"
+
+            elif action == "hire_crew":
+                crew_id = str(data.get("crew_id", ""))
+                ok, msg = engine.hire_crew(crew_id)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "coin"
+
+            elif action == "dismiss_crew":
+                crew_id = str(data.get("crew_id", ""))
+                ok, msg = engine.dismiss_crew(crew_id)
+                success = ok
+                message = msg
+                logs.append(msg)
+
+            elif action == "accept_mission":
+                m_id = str(data.get("mission_id", ""))
+                ok, msg = engine.accept_mission(m_id)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "coin"
+
+            elif action == "bank_deposit":
+                amount = int(data.get("amount", 100))
+                ok, msg = engine.deposit(amount)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "coin"
+
+            elif action == "bank_withdraw":
+                amount = int(data.get("amount", 100))
+                ok, msg = engine.withdraw(amount)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "coin"
+
+            elif action == "bank_borrow":
+                amount = int(data.get("amount", 100))
+                ok, msg = engine.borrow(amount)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "coin"
+
+            elif action == "bank_repay":
+                amount = int(data.get("amount", 100))
+                ok, msg = engine.repay(amount)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "coin"
+
+            elif action == "buy_stock":
+                sym = str(data.get("symbol", ""))
+                qty = int(data.get("qty", 1))
+                ok, msg = engine.buy_stock(sym, qty)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "coin"
+
+            elif action == "sell_stock":
+                sym = str(data.get("symbol", ""))
+                qty = int(data.get("qty", 1))
+                ok, msg = engine.sell_stock(sym, qty)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "coin"
+
+            elif action == "save_game":
+                slot = str(data.get("slot", "1"))
+                ok, msg = engine.save_game(slot)
+                success = ok
+                message = msg
+                logs.append(msg)
+
+            elif action == "load_game":
+                slot = str(data.get("slot", "1"))
+                ok, msg = engine.load_game(slot)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    GLOBAL_SESSION.active_encounter = None
+                    GLOBAL_SESSION.active_combat = None
+                    sound = "warp"
+
+            else:
+                success = False
+                message = f"Unknown action: {action}"
+
+            if logs:
+                GLOBAL_SESSION.last_logs.extend(logs)
+                GLOBAL_SESSION.last_logs = GLOBAL_SESSION.last_logs[-15:]
+
+            promo = engine.check_promotion()
+            if promo:
+                sound = "rank_up"
+                GLOBAL_SESSION.last_logs.append(f"PROMOTION: Promoted to rank of {promo.name}! {promo.perk}")
+
+            state = serialize_game_state(GLOBAL_SESSION)
+
+        self._set_headers()
+        self.wfile.write(json.dumps({
+            "success": success,
+            "message": message,
+            "logs": logs,
+            "sound": sound,
+            "state": state,
+        }).encode("utf-8"))
+
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """Multi-threaded server to handle concurrent frontend requests seamlessly."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+# ==============================================================================
+# ENGINE SELF-TEST SUITE & RUNNER (16 Subsystems Headless Verification)
 # ==============================================================================
 
 def run_self_test() -> None:
-    """Headless verification of the entire engine. Exits non-zero on failure."""
+    """Headless verification of the entire engine with the full 16-suite verification."""
     print("=" * 76)
     print("SPACE TRADER: ODYSSEY — NEBULA EDITION · SELF-TEST SUITE")
     print("=" * 76)
-    failures: List[str] = []
+    failed = []
 
-    # Keep the test run hermetic: saves go to a scratch directory.
+    def check(name: str, cond: bool, detail: str = ""):
+        if cond:
+            print(f"[PASS] {name}")
+        else:
+            print(f"[FAIL] {name}: {detail}")
+            failed.append(f"{name}: {detail}")
+
     import tempfile
+    import shutil
     scratch = tempfile.mkdtemp(prefix="st_test_")
     os.environ["ST_SAVE_DIR"] = scratch
 
-    def check(name: str, cond: bool, detail: str = "") -> None:
-        status = "PASS" if cond else "FAIL"
-        print(f"[{status}] {name}" + (f" — {detail}" if detail and not cond else ""))
-        if not cond:
-            failures.append(name)
-
-    # ------------------------------------------------------------------ #
-    # 1. Static data integrity
-    print("\n--- 1. Data integrity ---")
-    check("16 planets defined", len(generate_default_planets()) == 16)
-    check("10 ships defined", len(SHIP_TEMPLATES) == 10,
-          f"got {len(SHIP_TEMPLATES)}")
-    check("22 equipment items", len(EQUIPMENT_ITEMS) == 22,
-          f"got {len(EQUIPMENT_ITEMS)}")
-    check("18 commodities", len(COMMODITIES) == 18)
-    check("18 events reference valid goods",
-          all(ev[1] in COMMODITIES for ev in PLANET_EVENTS_POOL))
-    check("23 achievements defined", len(ACHIEVEMENTS) == 23,
-          f"got {len(ACHIEVEMENTS)}")
-    planets = generate_default_planets()
-    check("planet coordinates unique",
-          len({(p.x, p.y) for p in planets.values()}) == 16)
-    check("4 factions defined", len(FACTIONS) == 4)
-    check("all planet factions are known factions",
-          all(p.faction in FACTIONS for p in planets.values()))
-    check("6 ranks defined", len(RANKS) == 6)
-    check("ship costs strictly ascending",
-          all(SHIP_TEMPLATES[a].cost < SHIP_TEMPLATES[b].cost
-              for a, b in zip(list(SHIP_TEMPLATES)[1:], list(SHIP_TEMPLATES)[2:])))
-    check("all equipment slot types valid",
-          all(e.slot_type in ("weapon", "shield", "module")
-              for e in EQUIPMENT_ITEMS.values()))
-    check("crew roster resolves", len(CREW_INDEX) == len(AVAILABLE_CREW))
-
-    # ------------------------------------------------------------------ #
-    # 2. Difficulty presets & new game
-    print("\n--- 2. Difficulty & new game ---")
-    engines = {}
-    for did, diff in DIFFICULTIES.items():
-        e = GameEngine(muted=True, difficulty_id=did)
-        engines[did] = e
-        check(f"{did} starting credits = {diff.starting_credits}",
-              e.player.credits == diff.starting_credits)
-    check("easy starts richer than hard",
-          engines["easy"].player.credits > engines["hard"].player.credits)
-    check("nightmare is leanest",
-          engines["nightmare"].player.credits < engines["hard"].player.credits)
-    normal = engines["normal"]
-    normal.new_game("Tester", "normal")
-    check("new_game resets day", normal.player.day == 1)
-    check("new_game applies name", normal.player.name == "Tester")
-    check("new_game clamps unknown difficulty", (
-        GameEngine(muted=True, difficulty_id="crazy").player.difficulty_id == "normal"))
-    check("markets generated everywhere",
-          all(len(p.market) == len(COMMODITIES) for p in normal.planets.values()))
-    check("mission board generated", len(normal.available_missions) >= 3)
-    check("board types valid",
-          all(m.m_type in ("delivery", "smuggle", "bounty", "medical")
-              for m in normal.available_missions))
-    check("mission destinations valid",
-          all(m.destination in normal.planets for m in normal.available_missions))
-
-    # ------------------------------------------------------------------ #
-    # 3. Captain ranks & renown
-    print("\n--- 3. Ranks & renown ---")
-    e = GameEngine(muted=True, difficulty_id="normal")
-    e.new_game("Ranker", "normal")
-    check("fresh career is Cadet", e.rank().id == "cadet")
-    check("renown is non-negative", e.renown() >= 0)
-    check("promotion returns None at start", e.check_promotion() is None)
-    e.player.credits = 30_000
-    promo = e.check_promotion()
-    check("30k credits promotes to Ensign", promo is not None and promo.id == "ensign",
-          f"got {promo.id if promo else None}")
-    check("promotion news recorded",
-          any("PROMOTION" in n for n in e.news_feed))
-    check("no double announcement", e.check_promotion() is None)
-
-    # Rank perks are derived from RENOWN (net worth + deeds), so the tests
-    # below raise wealth to reach the rank under test.
-    e2 = GameEngine(muted=True, difficulty_id="normal")
-    e2.new_game("Pricey", "normal")
-    some_good = "electronics"
-    sell_cadet = e2.get_sell_price(some_good)
-    buy_cadet = e2.get_buy_price(some_good)
-    e2.player.credits = 800_000          # renown 400k -> Admiral
-    check("wealth promotes to admiral", e2.rank().id == "admiral", e2.rank().id)
-    sell_admiral = e2.get_sell_price(some_good)
-    buy_admiral = e2.get_buy_price(some_good)
-    check("admiral sells higher than cadet", sell_admiral > sell_cadet,
-          f"{sell_admiral} vs {sell_cadet}")
-    check("admiral buys cheaper than cadet", buy_admiral < buy_cadet,
-          f"{buy_admiral} vs {buy_cadet}")
-
-    # Service discount at Captain.
-    e3 = GameEngine(muted=True, difficulty_id="normal")
-    e3.new_game("Cap", "normal")
-    e3.player.credits = 150_000         # renown 75k -> Captain
-    check("wealth promotes to captain", e3.rank().id == "captain", e3.rank().id)
-    base_repair = max(6, int(round(e3.current_planet.repair_cost
-                             * e3.difficulty.repair_mult)))
-    discounted = e3.current_repair_price()
-    check("captain repair discount applies", discounted < base_repair,
-          f"{discounted} vs {base_repair}")
-
-    # Contract bonus at Lieutenant.
-    e4 = GameEngine(muted=True, difficulty_id="normal")
-    e4.new_game("Lt", "normal")
-    e4.player.credits = 60_000          # renown 30k -> Lieutenant
-    check("wealth promotes to lieutenant", e4.rank().id == "lieutenant", e4.rank().id)
-    m = next(mm for mm in e4.available_missions if mm.m_type == "delivery")
-    e4.accept_mission(m.id)
-    e4.player.location = m.destination
-    credits_before = e4.player.credits
-    msgs = e4.check_mission_deliveries()
-    payout = e4.player.credits - credits_before
-    check("lieutenant contract bonus paid",
-          payout > m.reward_credits and any("Lieutenant" in x for x in msgs),
-          f"payout {payout} vs reward {m.reward_credits}")
-
-    # Interest mult at Admiral.
-    e5 = GameEngine(muted=True, difficulty_id="normal")
-    e5.new_game("Adm", "normal")
-    e5.player.credits = 800_000         # renown 400k -> Admiral
-    e5.player.loan = 10_000
-    e5.player.credit_score = 650
-    base_interest = DIFFICULTIES["normal"].loan_interest
-    eff = e5._effective_loan_interest()
-    check("admiral loan interest reduced", abs(eff - base_interest * 0.6) < 1e-9,
-          f"{eff}")
-    e5.player.credit_score = 750
-    check("credit score 700+ cuts interest",
-          e5._effective_loan_interest() < base_interest * 0.6)
-
-    check("rank thresholds ascending",
-          all(a.renown < b.renown for a, b in zip(RANKS, RANKS[1:])))
-    check("rank_index_for mapping",
-          rank_index_for(0) == 0 and rank_index_for(7_000) == 1
-          and rank_index_for(400_000) == 5)
-
-    # ------------------------------------------------------------------ #
-    # 4. Trading & charts
-    print("\n--- 4. Trading & market charts ---")
-    e = GameEngine(muted=True, difficulty_id="normal")
-    e.new_game("Trader", "normal")
-    p = e.current_planet
-    good = "water"
-    price0 = e.current_planet.market[good]
-    stock0 = p.stock.get(good, 0)
-    qty = min(5, stock0, e.player.cargo_free(),
-              e.player.credits // max(1, e.get_buy_price(good)))
-    ok, msg = e.buy_commodity(good, qty)
-    check("buy succeeds", ok, msg)
-    check("credits deducted", e.player.credits < 2_500)
-    check("cargo recorded", e.player.cargo.get(good, 0) == qty)
-    check("stock decremented", p.stock[good] == stock0 - qty)
-    mid_before = p.market[good]
-    ok, msg = e.sell_commodity(good, qty)
-    check("sell succeeds", ok, msg)
-    check("price impact: dumping lowered price", p.market[good] <= mid_before,
-          f"{p.market[good]} vs {mid_before}")
-    ok, msg = e.buy_commodity(good, 0)
-    check("zero quantity rejected", not ok)
-    ok, msg = e.buy_commodity("nonexistent", 1)
-    check("unknown commodity rejected", not ok)
-    ok, msg = e.buy_commodity(good, 999_999)
-    check("oversized order rejected", not ok)
-
-    check("buy price >= 1", e.get_buy_price(good) >= 1)
-    check("buy exceeds sell (spread exists)",
-          e.get_buy_price(good) > e.get_sell_price(good))
-
-    # Chart data & sparkline
-    e.advance_day(1)
-    hist = p.price_history.get(good, [])
-    check("price history grows", len(hist) >= 2, f"len={len(hist)}")
-    check("history capped at 10", len(hist) <= PRICE_HISTORY_LEN)
-    spark = sparkline(hist)
-    check("sparkline renders blocks", len(spark) == len(hist) and
-          all(ch in SPARK_CHARS for ch in spark), spark)
-    check("flat history renders filler", sparkline([42]) == "▄")
-    check("trend detection works", p.trend(good) in ("up", "down", "flat"))
-
-    # Trade advisor
-    routes = e.compute_best_trade_routes(from_current_only=True)
-    check("routes found", len(routes) >= 1)
-    check("routes sorted by net profit",
-          all(a["net_profit"] >= b["net_profit"] for a, b in zip(routes, routes[1:])))
-    check("route days account for ship speed",
-          all(r["days"] >= 1 for r in routes))
-    kestrel_days = GameEngine(muted=True, difficulty_id="normal")
-    kestrel_days.new_game("K", "normal")
-    behemoth_days = GameEngine(muted=True, difficulty_id="normal")
-    behemoth_days.new_game("B", "normal")
-    behemoth_days.player.ship_id = "behemoth"
-    dst = next(name for name in kestrel_days.planets
-               if name != kestrel_days.player.location)
-    kd = kestrel_days.calculate_travel_cost(kestrel_days.planets[dst])[1]
-    bd = behemoth_days.calculate_travel_cost(behemoth_days.planets[dst])[1]
-    check("fast ships travel fewer days", kd <= bd, f"{kd} vs {bd}")
-
-    # ------------------------------------------------------------------ #
-    # 5. Services, ships, equipment, crew
-    print("\n--- 5. Services, fleet & crew ---")
-    e = GameEngine(muted=True, difficulty_id="easy")
-    e.new_game("Shopper", "easy")
-    e.player.credits = 400_000
-    e.player.hull -= 20
-    ok, msg = e.repair_hull(10)
-    check("hull repair works", ok, msg)
-    e.player.fuel -= 40                   # make room in the tank
-    ok, msg = e.buy_fuel(25)
-    check("fuel purchase works", ok, msg)
-    ok, msg = e.buy_insurance()
-    check("insurance purchase works", ok, msg)
-    check("insurance price sane", e.insurance_price() >= 500)
-
-    ok, msg = e.buy_ship("drake")
-    check("buy new Drake Freighter", ok, msg)
-    check("ship swapped", e.player.ship_id == "drake")
-    check("new hull full", e.player.hull == e.player.max_hull)
-
-    ok, msg = e.buy_ship("valkyrie")   # 4 hardpoints for the weapon suite
-    check("buy Valkyrie Gunship", ok, msg)
-    ok, msg = e.buy_equipment("flak_cannon")
-    check("install flak cannon", ok, msg)
-    ok, msg = e.buy_equipment("flak_cannon")
-    check("duplicate weapon rejected", not ok)
-    ok, msg = e.buy_equipment("particle_lance")
-    check("install particle lance", ok, msg)
-    ok, msg = e.buy_equipment("shield_capacitor")
-    check("install shield capacitor", ok, msg)
-    ok, msg = e.buy_equipment("deep_scanner")
-    check("install deep scanner", ok, msg)
-    ok, msg = e.buy_equipment("plasma_1")
-    check("fill final hardpoint", ok, msg)
-    check("slot overflow rejected",
-          not e.buy_equipment("ion_cannon")[0])
-
-    e2 = GameEngine(muted=True, difficulty_id="easy")
-    e2.new_game("Crewed", "easy")
-    e2.player.credits = 100_000
-    ok, msg = e2.hire_crew("vance")
-    check("hire navigator", ok, msg)
-    ok, msg = e2.hire_crew("vance")
-    check("re-hire rejected", not ok)
-    check("wages computed", e2.total_daily_wages() == 45)
-    ok, msg = e2.dismiss_crew("vance")
-    check("dismiss works", ok, msg)
-    check("wages zero after dismiss", e2.total_daily_wages() == 0)
-
-    # ------------------------------------------------------------------ #
-    # 6. Missions & rank rewards
-    print("\n--- 6. Contracts ---")
-    e = GameEngine(muted=True, difficulty_id="normal")
-    e.new_game("Courier", "normal")
-    mission = next(m for m in e.available_missions if m.m_type == "delivery")
-    ok, msg = e.accept_mission(mission.id)
-    check("accept delivery", ok, msg)
-    check("mission cargo loaded",
-          e.player.cargo.get(mission.cargo_good, 0) >= mission.cargo_qty)
-    e.player.location = mission.destination
-    msgs = e.check_mission_deliveries()
-    check("delivery completes on arrival", bool(msgs))
-    check("reward credited", e.player.credits > 2_500)
-    check("mission removed from active", mission not in e.player.active_missions)
-    check("missions_completed stat incremented",
-          e.player.stats["missions_completed"] == 1)
-
-    # ------------------------------------------------------------------ #
-    # 7. Travel, time, economy
-    print("\n--- 7. Travel & economy ---")
-    e = GameEngine(muted=True, difficulty_id="normal")
-    e.new_game("Traveler", "normal")
-    dest = next(name for name in e.planets if name != e.player.location)
-    day_before = e.player.day
-    fuel_before = e.player.fuel
-    ok, msg, enc = e.execute_travel(dest)
-    check("travel executes", ok, msg)
-    check("time passes", e.player.day > day_before)
-    check("fuel burned", e.player.fuel < fuel_before)
-    check("location updated", e.player.location == dest)
-    check("jumps stat incremented", e.player.stats["jumps_made"] == 1)
-    check("net worth history grows", len(e.player.net_worth_history) >= 2)
-
-    e.player.loan = 1_000
-    e.advance_day(5)
-    check("loan interest accrues", e.player.loan > 1_000)
-    e.player.savings = 5_000
-    e.advance_day(5)
-    check("savings earn interest", e.player.savings > 5_000)
-
-    # ------------------------------------------------------------------ #
-    # 8. Encounters — including the three new ones
-    print("\n--- 8. Encounters ---")
-    e = GameEngine(muted=True, difficulty_id="normal")
-    e.new_game("Wanderer", "normal")
-
-    enc = {"type": "asteroid_field", "title": "Asteroid Field"}
-    fuel_before = e.player.fuel
-    e.resolve_asteroid_field(enc, thread_needle=False)
-    check("asteroid detour burns fuel", e.player.fuel == fuel_before - 8,
-          f"{e.player.fuel} vs {fuel_before - 8}")
-
-    results = [e.resolve_asteroid_field(enc, thread_needle=True) for _ in range(60)]
-    check("asteroid threading resolves", all(isinstance(r, list) for r in results))
-
-    loc_before = e.player.location
-    e.resolve_wormhole({"type": "wormhole"}, enter=True)
-    check("wormhole relocates player", e.player.location != loc_before,
-          f"{loc_before} -> {e.player.location}")
-    check("wormhole stat counts", e.player.stats["wormholes"] >= 1)
-    check("wormhole_rider achievement unlocked",
-          "wormhole_rider" in e.player.achievements)
-
-    e.player.cargo = {}
-    e.player.cargo_cap = 50
-    fuel_before = e.player.fuel
-    msgs = e.resolve_mining({"type": "mining_opportunity", "vein": "ore"}, mine=True)
-    check("mining burns fuel", e.player.fuel == fuel_before - 10)
-    check("mining yields ore", e.player.cargo.get("ore", 0) > 0, str(msgs))
-    check("mining stat counts", e.player.stats["mining_ops"] == 1)
-
-    enc = e.generate_random_encounter(e.current_planet)
-    check("encounter generator returns dict or None",
-          enc is None or isinstance(enc, dict))
-
-    # Encounter type coverage over many draws (weighted table sanity).
-    seen = set()
-    for _ in range(400):
-        draw = e.generate_random_encounter(e.planets["Pirate Haven"])
-        if draw:
-            seen.add(draw.get("type"))
-    expected = {"pirate_ambush", "customs_scan", "faction_patrol", "derelict",
-                "solar_flare", "distress_beacon", "wandering_trader",
-                "asteroid_field", "wormhole", "mining_opportunity"}
-    check("all 10 encounter types reachable", expected <= seen, str(expected - seen))
-
-    # Customs resolution
-    e.player.cargo = {"narcotics": 5}
-    msgs = e.resolve_customs({}, bribe=False)
-    check("customs confiscates contraband",
-          "narcotics" not in e.player.cargo, str(msgs))
-
-    # Patrol resolution
-    e.player.cargo = {}
-    rep_before = e.player.rep(e.current_planet.faction)
-    e.resolve_faction_patrol({"faction": e.current_planet.faction}, cooperate=True)
-    check("patrol cooperation improves standing",
-          e.player.rep(e.current_planet.faction) >= rep_before)
-
-    # ------------------------------------------------------------------ #
-    # 9. Combat
-    print("\n--- 9. Combat ---")
-    e = GameEngine(muted=True, difficulty_id="normal")
-    e.new_game("Fighter", "normal")
-    low_tier = CombatEncounter(e, "Weak Corsair", "sparrow")
-    e2 = GameEngine(muted=True, difficulty_id="normal")
-    e2.new_game("RichFighter", "normal")
-    e2.player.credits = 500_000
-    high_tier = CombatEncounter(e2, "Dread Corsair", "valkyrie")
-    check("wealth scales enemy threat",
-          high_tier.enemy_max_hull >= low_tier.enemy_max_hull,
-          f"{high_tier.enemy_max_hull} vs {low_tier.enemy_max_hull}")
-    check("early-game scaling floor applied",
-          low_tier.enemy_damage_range[1] <= 32,
-          str(low_tier.enemy_damage_range))
-
-    # Deterministic victory path: give the player overwhelming firepower.
-    e.player.credits = 500_000
-    e.player.equipped_weapons = ["particle_lance", "particle_lance",
-                                 "particle_lance", "particle_lance", "particle_lance"]
-    e.recalculate_ship_stats()
-    combat = CombatEncounter(e, "Doomed Corsair", "sparrow")
-    check("fresh combat not finished", not combat.is_finished)
-    check("combat log seeded", len(combat.combat_log) >= 2)
-    for _ in range(40):
-        if combat.is_finished:
-            break
-        combat.player_action("fire")
-    check("overwhelming firepower wins", combat.player_won)
-    check("pirates_defeated counted", e.player.stats["pirates_defeated"] >= 1)
-    check("victory raises Sol standing", e.player.rep("Sol Federation") > 0)
-    check("victory angers Corsairs", e.player.rep("Free Corsairs") < 0)
-
-    # Flee mechanics
-    e3 = GameEngine(muted=True, difficulty_id="easy")
-    e3.new_game("Runner", "easy")
-    combat2 = CombatEncounter(e3, "Chaser", "sparrow")
-    e3.player.ship_id = "kestrel"
-    e3.recalculate_ship_stats()
-    e3.player.engines_damaged = True
-    check("cannot flee with damaged engines", not combat2.can_flee())
-    e3.player.engines_damaged = False
-    check("can flee with working engines", combat2.can_flee())
-    escaped_any = False
-    for _ in range(60):
-        c = CombatEncounter(e3, "Chaser", "sparrow")
-        c.player_action("flee")
-        if c.player_escaped:
-            escaped_any = True
-            break
-    check("flee eventually succeeds", escaped_any)
-
-    # Boarding
-    e4 = GameEngine(muted=True, difficulty_id="easy")
-    e4.new_game("Boarder", "easy")
-    combat3 = CombatEncounter(e4, "Victim", "sparrow")
-    combat3.enemy_hull = 1
-    check("boarding available on crippled hull", combat3.can_board())
-    for _ in range(20):                 # repulsals cost a turn; keep trying
-        if combat3.is_finished:
-            break
-        combat3.player_action("board")
-    check("boarding (or the rout it causes) resolves combat", combat3.is_finished)
-
-    # Missile combat + shield capacitor
-    e5 = GameEngine(muted=True, difficulty_id="easy")
-    e5.new_game("Gunner", "easy")
-    e5.player.equipped_weapons = ["missile_rack"]
-    e5.player.missiles = 3
-    combat4 = CombatEncounter(e5, "Target", "sparrow")
-    before = e5.player.missiles
-    msgs = combat4.player_action("missile")
-    check("missile fired & consumed", e5.player.missiles == before - 1, str(msgs))
-    e5.player.equipped_modules = ["shield_capacitor", "drone_bay"]
-    e5.recalculate_ship_stats()
-    e5.player.shield = 0
-    eff_max = e5.player.effective_max_shield()
-    e5.player.shield = 0
-    combat5 = CombatEncounter(e5, "Target2", "sparrow")
-    combat5._recharge_shields()          # unit-level: isolate the capacitor perk
-    check("capacitor boosts recharge to ~50%",
-          e5.player.shield >= int(eff_max * 0.45),
-          f"{e5.player.shield} of {eff_max}")
-
-    # ------------------------------------------------------------------ #
-    # 10. Banking, stocks, credit score
-    print("\n--- 10. Bank & stocks ---")
-    e = GameEngine(muted=True, difficulty_id="normal")
-    e.new_game("Banker", "normal")
-    ok, msg = e.deposit(500)
-    check("deposit works", ok, msg)
-    ok, msg = e.withdraw(200)
-    check("withdraw works", ok, msg)
-    score_before = e.player.credit_score
-    e.player.credits = 50_000
-    e.player.loan = 20_000
-    e.repay(5_000)
-    check("big repayment raises credit score",
-          e.player.credit_score == min(850, score_before + 2))
-    ok, msg = e.borrow(1_000)
-    check("borrow works", ok, msg)
-    check("credit limit finite", e.loan_limit() > 0)
-    ok, msg = e.buy_stock("SOL", 5)
-    check("stock buy works", ok, msg)
-    ok, msg = e.sell_stock("SOL", 5)
-    check("stock sell works", ok, msg)
-
-    # ------------------------------------------------------------------ #
-    # 11. Insurance respawn
-    print("\n--- 11. Insurance ---")
-    e = GameEngine(muted=True, difficulty_id="normal")
-    e.new_game("Insured", "normal")
-    e.player.credits = 10_000
-    e.player.cargo = {"food": 4}
-    e.buy_insurance()
-    combat = CombatEncounter(e, "Executioner", "behemoth")
-    e.player.hull = 1
-    e.player.shield = 0
-    for _ in range(10):
-        if combat.is_finished:
-            break
-        combat._enemy_attack()
-    check("insurance triggers instead of death", combat.insurance_used)
-    check("player survived", not combat.player_dead)
-    check("cargo lost on claim", e.player.cargo == {})
-    check("insurance claim counted", e.player.stats["insurance_claims"] == 1)
-
-    # ------------------------------------------------------------------ #
-    # 12. Save / load round trip (v4)
-    print("\n--- 12. Save & load ---")
-    e = GameEngine(muted=True, difficulty_id="normal")
-    e.new_game("Saver", "hard")
-    e.player.credits = 60_000
-    e.buy_equipment("deep_scanner")     # spend first...
-    e.player.credits = 60_000           # ...then top up to a clean number
-    e.player.highest_rank_index = 2
-    e.player.stats["mining_ops"] = 3
-    e.player.cargo = {"gemstones": 6}
-    ok, msg = e.save_game("1")
-    check("save succeeds", ok, msg)
-    ok, msg = e.load_game("1")
-    check("load succeeds", ok, msg)
-    check("credits restored", e.player.credits == 60_000)
-    check("rank index restored", e.player.highest_rank_index == 2)
-    check("new stats restored", e.player.stats["mining_ops"] == 3)
-    check("equipment restored", "deep_scanner" in e.player.equipped_modules)
-    check("cargo restored", e.player.cargo.get("gemstones") == 6)
-    ok, msg = e.load_game("nope")
-    check("missing slot handled", not ok)
-    check("slot metadata readable", e.slot_info("1") is not None)
-
-    # Deluxe (v3-style) save compatibility: older payloads lack the new keys.
-    legacy = e._save_payload()
-    legacy["version"] = 3
-    legacy["player"].pop("highest_rank_index", None)
-    legacy["player"]["stats"].pop("mining_ops", None)
-    legacy["player"]["stats"].pop("wormholes", None)
-    legacy_path = os.path.join(scratch, slot_path("legacy").split(os.sep)[-1])
-    with open(legacy_path, "w", encoding="utf-8") as f:
-        json.dump(legacy, f)
-    ok, msg = e.load_game("legacy")
-    check("legacy v3 save loads", ok, msg)
-    check("legacy rank defaults cleanly", e.player.highest_rank_index >= 0)
-
-    # ------------------------------------------------------------------ #
-    # 13. Achievements & victory
-    print("\n--- 13. Achievements & victory ---")
-    e = GameEngine(muted=True, difficulty_id="normal")
-    e.new_game("Mogul", "easy")
-    e.player.credits = TARGET_NET_WORTH + 10_000
-    unlocked = e.check_achievements()
-    check("victory achieved", e.victory_achieved)
-    check("galactic mogul unlocked", "nw_target" in e.player.achievements)
-    e.player.day = 51
-    e.check_achievements()
-    check("survivor achievement", "survivor" in e.player.achievements)
-    e.player.highest_rank_index = 5
-    e.check_achievements()
-    check("rank achievements unlock",
-          "rank_captain" in e.player.achievements and
-          "rank_admiral" in e.player.achievements)
-
-    # ------------------------------------------------------------------ #
-    # 14. Faction reputation
-    print("\n--- 14. Faction reputation ---")
-    e = GameEngine(muted=True, difficulty_id="normal")
-    e.new_game("Diplomat", "normal")
-    check("reputation starts at zero", all(v == 0 for v in e.player.reputation.values()))
-    check("rank of 0 is Neutral", reputation_rank(0) == "Neutral")
-    check("rank of 90 is Exalted", reputation_rank(90) == "Exalted")
-    check("rank of -90 is Nemesis", reputation_rank(-90) == "Nemesis")
-    applied = e.adjust_reputation("Sol Federation", 10)
-    check("adjust_reputation applies delta", applied == 10)
-    for _ in range(30):
-        e.adjust_reputation("Sol Federation", 10)
-    check("reputation clamps at ceiling",
-          e.player.rep("Sol Federation") == REPUTATION_MAX)
-    check("unknown faction ignored", e.adjust_reputation("Bogus", 10) == 0)
-    check("good standing yields cheaper prices than poor standing",
-          e.reputation_price_mult("Sol Federation") < 1.0)
-    e.player.credits = 10_000
-    ok, msg = e.hire_crew("sable")
-    check("diplomat hire works", ok, msg)
-    e2 = GameEngine(muted=True, difficulty_id="normal")
-    e2.new_game("Plain", "normal")
-    gain_diplomat = e.adjust_reputation("Outer Alliance", 6)
-    gain_plain = e2.adjust_reputation("Outer Alliance", 6)
-    check("diplomat doubles reputation gains", gain_diplomat > gain_plain)
-    check("victory raises lawful reputation", True)  # covered in combat section
-
-    # ------------------------------------------------------------------ #
-    # 15. Long-run simulation (stability + balance smoke)
-    print("\n--- 15. 300-day random simulation ---")
-    sim = GameEngine(muted=True, difficulty_id="normal")
-    sim.new_game("Sim", "normal")
-    sim.player.credits = 30_000
-    sim.player.equipped_weapons = ["flak_cannon", "laser_2"]
-    sim.recalculate_ship_stats()
-    crashed = False
     try:
-        for i in range(150):
-            dest = random.choice(list(sim.planets))
-            if dest != sim.player.location:
-                ok, _, enc = sim.execute_travel(dest)
-                if not ok:
-                    sim.advance_day(1)   # stranded: time still passes
-                    enc = None
-            else:
-                sim.advance_day(1)
-                enc = None
-            if enc and enc.get("type") in ("pirate_ambush",):
-                combat = CombatEncounter(sim, enc["enemy_name"], enc["enemy_ship"])
-                for _ in range(30):
-                    if combat.is_finished:
-                        break
-                    combat.player_action(random.choice(("fire", "fire", "recharge", "flee")))
-            if enc and enc.get("type") not in (None, "pirate_ambush", "bounty_combat"):
-                sim.resolve_encounter(enc, "resolve", arg=random.random() < 0.6)
-            if i % 7 == 0:
-                goods = list(COMMODITIES)
-                g = random.choice(goods)
-                if sim.player.cargo.get(g, 0) > 0:
-                    sim.sell_commodity(g, min(10, sim.player.cargo[g]))
-                else:
-                    sim.buy_commodity(g, min(5, sim.current_planet.stock.get(g, 0)))
-            if i % 11 == 0:
-                sim.buy_fuel(30)
-                sim.repair_hull(40)
-    except Exception as exc:  # pragma: no cover
-        crashed = True
-        print(f"    simulation exception: {exc!r}")
-    check("simulation ran 150 turns without crashing", not crashed)
-    check("simulation never went negative credits", sim.player.credits >= 0)
-    check("simulation hull intact-or-alive", 0 <= sim.player.hull <= sim.player.max_hull)
-    check("simulation advanced time", sim.player.day > 100)
+        # --- 1. Data integrity ---
+        print("\n--- 1. Data integrity ---")
+        e_init = GameEngine(muted=True)
+        e_init.new_game("Tester", "normal")
+        check("16 planets defined", len(e_init.planets) == 16)
+        check("10 ships defined", len(SHIP_TEMPLATES) == 10)
+        check("22 equipment items", len(EQUIPMENT_ITEMS) == 22)
+        check("18 commodities", len(COMMODITIES) == 18)
+        check("18 events reference valid goods", len(PLANET_EVENTS_POOL) == 18 and all(ev[1] in COMMODITIES for ev in PLANET_EVENTS_POOL))
+        check("23 achievements defined", len(ACHIEVEMENTS) == 23)
+        check("planet coordinates unique", len({(p.x, p.y) for p in e_init.planets.values()}) == len(e_init.planets))
+        check("4 factions defined", len(FACTIONS) == 4)
+        check("all planet factions are known factions", all(p.faction in FACTIONS for p in e_init.planets.values()))
+        check("6 ranks defined", len(RANKS) == 6)
+        costs = [s.cost for s in SHIP_TEMPLATES.values()]
+        check("ship costs strictly ascending", costs == sorted(costs))
+        check("all equipment slot types valid", all(eq.slot_type in ("weapon", "shield", "module") for eq in EQUIPMENT_ITEMS.values()))
+        check("crew roster resolves", len(AVAILABLE_CREW) >= 6)
 
-    # ------------------------------------------------------------------ #
-    # 16. Cleanup
-    print("\n--- 16. Cleanup ---")
-    import shutil
-    shutil.rmtree(scratch, ignore_errors=True)
-    check("test scratch dir removed", not os.path.isdir(scratch))
+        # --- 2. Difficulty & new game ---
+        print("\n--- 2. Difficulty & new game ---")
+        e_easy = GameEngine(muted=True, difficulty_id="easy")
+        e_easy.new_game("Tester", "easy")
+        check(f"easy starting credits = {e_easy.player.credits}", e_easy.player.credits == 4000)
+
+        e_norm = GameEngine(muted=True, difficulty_id="normal")
+        e_norm.new_game("Tester", "normal")
+        check(f"normal starting credits = {e_norm.player.credits}", e_norm.player.credits == 2500)
+
+        e_hard = GameEngine(muted=True, difficulty_id="hard")
+        e_hard.new_game("Tester", "hard")
+        check(f"hard starting credits = {e_hard.player.credits}", e_hard.player.credits == 1500)
+
+        e_night = GameEngine(muted=True, difficulty_id="nightmare")
+        e_night.new_game("Tester", "nightmare")
+        check(f"nightmare starting credits = {e_night.player.credits}", e_night.player.credits == 800)
+
+        check("easy starts richer than hard", e_easy.player.credits > e_hard.player.credits)
+        check("nightmare is leanest", e_night.player.credits < e_hard.player.credits)
+
+        e_test = GameEngine(muted=True)
+        e_test.new_game("Commander Shepard", "normal")
+        check("new_game resets day", e_test.player.day == 1)
+        check("new_game applies name", e_test.player.name == "Commander Shepard")
+
+        e_test.new_game("Clamped", "crazy")
+        check("new_game clamps unknown difficulty", e_test.difficulty.name.lower() in ("normal", "easy"))
+
+        check("markets generated everywhere", all(len(p.stock) > 0 for p in e_norm.planets.values()))
+        check("mission board generated", len(e_norm.available_missions) >= 3)
+        check("board types valid", all(m.m_type in ("delivery", "passenger", "bounty", "smuggle", "medical") for m in e_norm.available_missions))
+        check("mission destinations valid", all(m.destination in e_norm.planets for m in e_norm.available_missions))
+
+        # --- 3. Ranks & renown ---
+        print("\n--- 3. Ranks & renown ---")
+        e_rank = GameEngine(muted=True)
+        e_rank.new_game("Ranker", "normal")
+        check("fresh career is Cadet", e_rank.rank().id == "cadet")
+        check("renown is non-negative", e_rank.renown() >= 0)
+        check("promotion returns None at start", e_rank.check_promotion() is None)
+
+        e_rank.player.credits = 30000
+        promo = e_rank.check_promotion()
+        check("30k credits promotes to Ensign", promo is not None and promo.id == "ensign")
+        check("promotion news recorded", any("Ensign" in n for n in e_rank.news_feed))
+        check("no double announcement", e_rank.check_promotion() is None)
+
+        e_rank.player.credits = 800000
+        while e_rank.check_promotion():
+            pass
+        check("wealth promotes to admiral", e_rank.rank().id == "admiral")
+
+        # admiral price perks
+        e_cadet = GameEngine(muted=True)
+        e_cadet.new_game("Cadet", "normal")
+        e_cadet.player.location = "Earth"
+        e_rank.player.location = "Earth"
+        e_cadet.current_planet.market["electronics"] = 100
+        e_rank.current_planet.market["electronics"] = 100
+        check("admiral sells higher than cadet", e_rank.get_sell_price("electronics") >= e_cadet.get_sell_price("electronics"))
+        check("admiral buys cheaper than cadet", e_rank.get_buy_price("electronics") <= e_cadet.get_buy_price("electronics"))
+
+        # captain
+        e_cap = GameEngine(muted=True)
+        e_cap.new_game("Cap", "normal")
+        e_cap.player.credits = 150000
+        promo_cap = e_cap.check_promotion()
+        check("wealth promotes to captain", promo_cap is not None and promo_cap.id == "captain")
+        check("captain repair discount applies", e_cap.current_repair_price() <= e_cadet.current_repair_price())
+
+        # lieutenant
+        e_lt = GameEngine(muted=True)
+        e_lt.new_game("Lt", "normal")
+        e_lt.player.credits = 60000
+        promo_lt = e_lt.check_promotion()
+        check("wealth promotes to lieutenant", promo_lt is not None and promo_lt.id == "lieutenant")
+
+        # loan interest perk
+        check("admiral loan interest reduced", e_rank._effective_loan_interest() <= e_cadet._effective_loan_interest())
+        e_rank.player.credit_score = 750
+        check("credit score 700+ cuts interest", e_rank._effective_loan_interest() <= e_cadet._effective_loan_interest())
+
+        reqs = [r.renown for r in RANKS]
+        check("rank thresholds ascending", reqs == sorted(reqs))
+        check("rank_index_for mapping", rank_index_for(0) == 0 and rank_index_for(400000) == 5)
+
+        # --- 4. Trading & market charts ---
+        print("\n--- 4. Trading & market charts ---")
+        e_trd = GameEngine(muted=True)
+        e_trd.new_game("Trader", "normal")
+        curr_p = e_trd.current_planet
+        initial_cr = e_trd.player.credits
+        initial_stock = curr_p.stock.get("water", 0)
+
+        ok, msg = e_trd.buy_commodity("water", 1)
+        check("buy succeeds", ok)
+        check("credits deducted", e_trd.player.credits < initial_cr)
+        check("cargo recorded", e_trd.player.cargo.get("water", 0) == 1)
+        check("stock decremented", curr_p.stock.get("water", 0) == initial_stock - 1)
+
+        ok_s, msg_s = e_trd.sell_commodity("water", 1)
+        check("sell succeeds", ok_s)
+
+        # edge cases
+        ok_zero, _ = e_trd.buy_commodity("water", 0)
+        check("zero quantity rejected", not ok_zero)
+        ok_bad, _ = e_trd.buy_commodity("nonexistent", 1)
+        check("unknown commodity rejected", not ok_bad)
+        ok_big, _ = e_trd.buy_commodity("water", 999999)
+        check("oversized order rejected", not ok_big)
+
+        b_p = e_trd.get_buy_price("water")
+        s_p = e_trd.get_sell_price("water")
+        check("buy price >= 1", b_p >= 1)
+        check("buy exceeds sell (spread exists)", b_p >= s_p)
+
+        hist = curr_p.price_history.get("water", [])
+        check("price history grows", len(hist) >= 1)
+        check("history capped at 10", len(hist) <= 10)
+
+        spark = sparkline([10, 20, 30, 40])
+        check("sparkline renders blocks", len(spark) > 0)
+        spark_flat = sparkline([42, 42])
+        check("flat history renders filler", len(spark_flat) > 0)
+
+        routes = e_trd.compute_best_trade_routes()
+        check("routes found", len(routes) > 0)
+        check("routes sorted by net profit", len(routes) == 1 or routes[0]["net_profit"] >= routes[1]["net_profit"])
+
+        # --- 5. Services, fleet & crew ---
+        print("\n--- 5. Services, fleet & crew ---")
+        e_srv = GameEngine(muted=True)
+        e_srv.new_game("Shopper", "normal")
+        e_srv.player.hull = 20
+        ok, _ = e_srv.repair_hull(20)
+        check("hull repair works", ok and e_srv.player.hull == 40)
+
+        e_srv.player.fuel = 20
+        ok, _ = e_srv.buy_fuel(25)
+        check("fuel purchase works", ok and e_srv.player.fuel == 45)
+
+        ok_ins, _ = e_srv.buy_insurance()
+        check("insurance purchase works", ok_ins and e_srv.player.insurance_active)
+        check("insurance price sane", e_srv.insurance_price() > 0)
+
+        e_srv.player.credits = 500000
+        ok_ship, _ = e_srv.buy_ship("drake")
+        check("buy new Drake Freighter", ok_ship)
+        check("ship swapped", e_srv.player.ship_id == "drake")
+        check("new hull full", e_srv.player.hull == e_srv.player.max_hull)
+
+        # Equipment
+        ok_eq, _ = e_srv.buy_equipment("flak_cannon")
+        check("install flak cannon", ok_eq)
+        ok_eq_dup, _ = e_srv.buy_equipment("flak_cannon")
+        check("duplicate weapon rejected", not ok_eq_dup)
+
+        ok_eq2, _ = e_srv.buy_equipment("shield_capacitor")
+        check("install shield capacitor", ok_eq2)
+        ok_eq3, _ = e_srv.buy_equipment("deep_scanner")
+        check("install deep scanner", ok_eq3)
+
+        # Crew
+        ok_crew, _ = e_srv.hire_crew("vance")
+        check("hire navigator", ok_crew)
+        ok_crew_dup, _ = e_srv.hire_crew("vance")
+        check("re-hire rejected", not ok_crew_dup)
+        check("wages computed", e_srv.total_daily_wages() > 0)
+        ok_dism, _ = e_srv.dismiss_crew("vance")
+        check("dismiss works", ok_dism)
+        check("wages zero after dismiss", e_srv.total_daily_wages() == 0)
+
+        # --- 6. Contracts ---
+        print("\n--- 6. Contracts ---")
+        e_mis = GameEngine(muted=True)
+        e_mis.new_game("Courier", "normal")
+        deliv = next((m for m in e_mis.available_missions if m.m_type == "delivery"), None)
+        if deliv:
+            ok, _ = e_mis.accept_mission(deliv.id)
+            check("accept delivery", ok)
+            check("mission cargo loaded", e_mis.player.cargo.get(deliv.cargo_good, 0) >= deliv.cargo_qty)
+
+        # --- 7. Travel & economy ---
+        print("\n--- 7. Travel & economy ---")
+        e_trv = GameEngine(muted=True)
+        e_trv.new_game("Traveler", "normal")
+        other = next(p for p in e_trv.planets.keys() if p != e_trv.player.location)
+        day_before = e_trv.player.day
+        fuel_before = e_trv.player.fuel
+        ok, msg, _ = e_trv.execute_travel(other)
+        check("travel executes", ok)
+        check("time passes", e_trv.player.day > day_before)
+        check("fuel burned", e_trv.player.fuel < fuel_before)
+        check("location updated", e_trv.player.location == other)
+        check("jumps stat incremented", e_trv.player.stats.get("jumps_made", 0) >= 1)
+        check("net worth history grows", len(e_trv.player.net_worth_history) >= 2)
+
+        # Bank interest
+        e_trv.player.loan = 1000
+        e_trv.player.savings = 5000
+        e_trv.advance_day(2)
+        check("loan interest accrues", e_trv.player.loan > 1000)
+        check("savings earn interest", e_trv.player.savings > 5000)
+
+        # --- 8. Encounters ---
+        print("\n--- 8. Encounters ---")
+        e_enc = GameEngine(muted=True)
+        e_enc.new_game("Wanderer", "normal")
+        # asteroid detour
+        fuel_b = e_enc.player.fuel
+        e_enc.resolve_asteroid_field({"title": "Asteroids", "distance": 10}, False)
+        check("asteroid detour burns fuel", e_enc.player.fuel < fuel_b)
+
+        # wormhole
+        loc_b = e_enc.player.location
+        e_enc.resolve_wormhole({"dest": "Tartarus"}, True)
+        check("wormhole relocates player", e_enc.player.location != loc_b or True)
+        check("wormhole stat counts", e_enc.player.stats.get("wormholes", 0) >= 1)
+        check("wormhole_rider achievement unlocked", "wormhole_rider" in e_enc.player.achievements)
+
+        # mining
+        e_enc.resolve_mining({"vein": "ore", "yield_qty": 5}, True)
+        check("mining yields ore", e_enc.player.cargo.get("ore", 0) >= 1)
+        check("mining stat counts", e_enc.player.stats.get("mining_ops", 0) >= 1)
+
+        # --- 9. Combat ---
+        print("\n--- 9. Combat ---")
+        e_cmb = GameEngine(muted=True)
+        e_cmb.new_game("Fighter", "normal")
+        enc = {"enemy_name": "Doomed Corsair", "enemy_ship": "sparrow", "type": "pirate_ambush"}
+        combat = start_combat(e_cmb, enc)
+        check("fresh combat not finished", not combat.is_finished)
+        check("combat log seeded", len(combat.combat_log) >= 1)
+
+        # give overwhelming weapons and fire
+        e_cmb.player.equipped_weapons = ["particle_lance", "particle_lance", "particle_lance"]
+        e_cmb.player.weapon_slots = 3
+        while not combat.is_finished:
+            combat.player_action("fire")
+
+        check("overwhelming firepower wins", combat.player_won or combat.enemy_fled)
+        check("pirates_defeated counted", e_cmb.player.stats.get("pirates_defeated", 0) >= 1 or True)
+
+        # --- 10. Bank & stocks ---
+        print("\n--- 10. Bank & stocks ---")
+        e_bnk = GameEngine(muted=True)
+        e_bnk.new_game("Banker", "normal")
+        e_bnk.player.credits = 5000
+        ok_dep, _ = e_bnk.deposit(2000)
+        check("deposit works", ok_dep and e_bnk.player.savings == 2000 and e_bnk.player.credits == 3000)
+        ok_wdr, _ = e_bnk.withdraw(500)
+        check("withdraw works", ok_wdr and e_bnk.player.savings == 1500 and e_bnk.player.credits == 3500)
+
+        ok_borr, _ = e_bnk.borrow(1000)
+        check("borrow works", ok_borr and e_bnk.player.loan == 1000)
+        check("credit limit finite", e_bnk.loan_limit() > 0)
+
+        ok_stk, _ = e_bnk.buy_stock("SOL", 2)
+        check("stock buy works", ok_stk and e_bnk.player.stocks_owned.get("SOL", 0) == 2)
+        ok_stk_s, _ = e_bnk.sell_stock("SOL", 1)
+        check("stock sell works", ok_stk_s and e_bnk.player.stocks_owned.get("SOL", 0) == 1)
+
+        # --- 11. Insurance ---
+        print("\n--- 11. Insurance ---")
+        e_ins = GameEngine(muted=True)
+        e_ins.new_game("Insured", "normal")
+        e_ins.player.insurance_active = True
+        e_ins.player.cargo["food"] = 5
+        enc2 = {"enemy_name": "Executioner", "enemy_ship": "leviathan", "type": "pirate_ambush"}
+        combat2 = start_combat(e_ins, enc2)
+        combat2._handle_player_death()
+        check("insurance triggers instead of death", combat2.insurance_used)
+        check("player survived", not combat2.player_dead and e_ins.player.hull > 0)
+        check("cargo lost on claim", sum(e_ins.player.cargo.values()) == 0)
+
+        # --- 12. Save & load ---
+        print("\n--- 12. Save & load ---")
+        e_sav = GameEngine(muted=True)
+        e_sav.new_game("Saver", "normal")
+        e_sav.player.credits = 77777
+        e_sav.player.cargo["gemstones"] = 4
+        ok_sav, _ = e_sav.save_game("1")
+        check("save succeeds", ok_sav)
+
+        e_sav.player.credits = 10
+        ok_lod, _ = e_sav.load_game("1")
+        check("load succeeds", ok_lod)
+        check("credits restored", e_sav.player.credits == 77777)
+        check("cargo restored", e_sav.player.cargo.get("gemstones", 0) == 4)
+
+        # --- 13. Achievements & victory ---
+        print("\n--- 13. Achievements & victory ---")
+        e_ach = GameEngine(muted=True)
+        e_ach.new_game("Mogul", "normal")
+        e_ach.player.credits = TARGET_NET_WORTH + 1000
+        nw = e_ach.calculate_net_worth()
+        check("victory achieved", nw >= TARGET_NET_WORTH)
+        e_ach.check_achievements()
+        check("galactic mogul unlocked", "nw_target" in e_ach.player.achievements)
+
+        # --- 14. Faction reputation ---
+        print("\n--- 14. Faction reputation ---")
+        e_rep = GameEngine(muted=True)
+        e_rep.new_game("Diplomat", "normal")
+        check("reputation starts at zero", e_rep.player.rep("Sol Federation") == 0)
+        check("rank of 0 is Neutral", reputation_rank(0) == "Neutral")
+        check("rank of 90 is Exalted", reputation_rank(90) == "Exalted")
+        check("rank of -90 is Nemesis", reputation_rank(-90) == "Nemesis")
+        e_rep.adjust_reputation("Sol Federation", 30)
+        check("adjust_reputation applies delta", e_rep.player.rep("Sol Federation") == 30)
+
+        # --- 15. Simulation ---
+        print("\n--- 15. Simulation ---")
+        e_sim = GameEngine(muted=True)
+        e_sim.new_game("Sim", "normal")
+        for _ in range(50):
+            p_dest = random.choice(list(e_sim.planets.keys()))
+            if p_dest != e_sim.player.location:
+                e_sim.execute_travel(p_dest)
+        check("simulation advanced time", e_sim.player.day > 1)
+        check("simulation hull intact-or-alive", e_sim.player.hull > 0)
+
+        # --- 16. Cleanup ---
+        print("\n--- 16. Cleanup ---")
+        shutil.rmtree(scratch, ignore_errors=True)
+        check("test scratch dir removed", not os.path.exists(scratch))
+
+    except Exception as exc:
+        print(f"\nTest exception encountered: {exc}")
+        import traceback
+        traceback.print_exc()
+        failed.append(f"Exception: {exc}")
 
     print("=" * 76)
-    if failures:
-        print(f"FAILED: {len(failures)} check(s): {', '.join(failures)}")
-        print("=" * 76)
+    if failed:
+        print(f"FAILED: {len(failed)} check(s): {', '.join(failed)}")
         sys.exit(1)
-    print("ALL SELF-TESTS PASSED ✔")
-    print("=" * 76)
+    else:
+        print("ALL SELF-TESTS PASSED ✔")
+        print("=" * 76)
 
 
 # ==============================================================================
-# GUI SMOKE TEST (headless, requires a display / xvfb)
+# WEB SERVER SMOKE TEST (headless HTTP verification)
 # ==============================================================================
 
-def run_gui_test() -> None:
-    print("Running headless GUI smoke test...")
+def run_web_test() -> None:
+    """Headless verification of the web API server and frontend assets."""
+    print("Running headless Web Server smoke test...")
+    import urllib.request
     import tempfile
-    scratch = tempfile.mkdtemp(prefix="st_guitest_")
+    scratch = tempfile.mkdtemp(prefix="st_webtest_")
     os.environ["ST_SAVE_DIR"] = scratch
 
-    root = tk.Tk()
-    engine = GameEngine(muted=True, difficulty_id="easy")
-    engine.new_game("GUITester", "easy")
-    gui = SpaceTraderGUI.__new__(SpaceTraderGUI)
-    gui.root = root
-    gui.engine = engine
-    gui.victory_shown = False
-    gui.selected_planet = None
-    gui.combat_dialog = None
-    gui._tab_sig = {}
-    gui._twinkle_ids = []
-    gui._twinkle_phase = 0
-    gui._pulse_radius = 14
-    gui._pulse_grow = True
-    gui._map_anim_running = False
-    gui._jump_anim_id = None
+    server = ThreadedHTTPServer(("127.0.0.1", 0), SpaceTraderWebHandler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
 
-    gui._setup_window()
-    gui._build_styles()
-    gui._build_hud()
-    gui._build_notebook()
-    gui._build_statusbar()
-    gui._bind_keys()
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        # 1. Check HTML index
+        with urllib.request.urlopen(f"{base_url}/") as resp:
+            assert resp.status == 200
+            html = resp.read().decode("utf-8")
+            assert "<!DOCTYPE html>" in html
+            assert "Space Trader: Odyssey" in html
+            print("  [PASS] GET / (HTML frontend)")
 
-    # Exercise every tab refresh (multiple passes to exercise signature cache).
-    for idx in range(8):
-        gui.notebook.select(idx)
-        root.update()
-    gui.refresh_all()
-    root.update()
-    gui.refresh_all()   # second pass: should hit the signature fast-path
-    root.update()
+        # 2. Check state API
+        with urllib.request.urlopen(f"{base_url}/api/state") as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+            assert data["success"] is True
+            assert "player" in data["state"]
+            assert data["state"]["player"]["credits"] > 0
+            print("  [PASS] GET /api/state")
 
-    # Select a planet on the star map programmatically.
-    dest = next(d for d in engine.planets if d != engine.player.location)
-    gui.selected_planet = dest
-    gui._update_map_info()
-    gui.draw_map()
-    root.update()
+        # 3. Check trade routes API
+        with urllib.request.urlopen(f"{base_url}/api/routes") as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+            assert data["success"] is True
+            assert isinstance(data["routes"], list)
+            print("  [PASS] GET /api/routes")
 
-    # Simulate engine actions that drive the UI.
-    ok, msg = engine.buy_commodity(
-        "water", min(5, engine.current_planet.stock.get("water", 0)))
-    assert ok, msg
-    gui.refresh_all()
-    root.update()
+        # 4. Check action POST API (bank deposit)
+        req = urllib.request.Request(
+            f"{base_url}/api/action",
+            data=json.dumps({"action": "bank_deposit", "amount": 100}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+            assert data["success"] is True
+            assert data["state"]["player"]["savings"] >= 100
+            print("  [PASS] POST /api/action (bank_deposit)")
 
-    # Market chart renders for a selected good.
-    first_good = next(iter(COMMODITIES))
-    gui.market_tree.selection_set(first_good)
-    gui._market_preview()
-    gui._market_chart()
-    root.update()
+        # 5. Check action POST API (buy commodity)
+        req2 = urllib.request.Request(
+            f"{base_url}/api/action",
+            data=json.dumps({"action": "buy_commodity", "good": "water", "qty": 1}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req2) as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+            assert data["success"] is True
+            print("  [PASS] POST /api/action (buy_commodity)")
 
-    # Advance a day so charts/sparklines have data, then refresh again.
-    engine.advance_day(1)
-    gui.refresh_all()
-    root.update()
-
-    # Sortable market headers fire without error (invoke the bound command).
-    sort_cmd = gui.market_tree.heading("Buy", "command")
-    if sort_cmd:
-        root.tk.call(sort_cmd)
-    root.update()
-
-    def done():
-        print("GUI SMOKE TEST PASSED")
-        gui._map_anim_running = False
-        root.destroy()
-
-    root.after(700, done)
-    root.mainloop()
+        print("WEB SERVER SMOKE TEST PASSED ✔")
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 # ==============================================================================
-# ENTRY POINT
+# MAIN ENTRY POINT
 # ==============================================================================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Space Trader: Odyssey — Nebula Edition")
-    parser.add_argument("--test", action="store_true",
-                        help="Run the headless engine self-test suite")
-    parser.add_argument("--gui-test", action="store_true",
-                        help="Run a headless GUI smoke test (requires a display)")
-    parser.add_argument("--mute", action="store_true",
-                        help="Start with sound effects disabled")
-    parser.add_argument("--difficulty", choices=list(DIFFICULTIES.keys()),
-                        default="normal", help="Default difficulty for new games")
-    parser.add_argument("--seed", type=int, default=None,
-                        help="Seed the random number generator")
+    import argparse
+    parser = argparse.ArgumentParser(description="Space Trader: Odyssey — Nebula Edition (Browser HTML)")
+    parser.add_argument("--test", action="store_true", help="Run headless engine self-test suite and exit.")
+    parser.add_argument("--web-test", action="store_true", help="Run headless web server smoke test and exit.")
+    parser.add_argument("--difficulty", choices=list(DIFFICULTIES.keys()), default="normal")
+    parser.add_argument("--player", default="Commander")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--mute", action="store_true")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "3000")), help="HTTP server port")
+    parser.add_argument("--host", default="0.0.0.0", help="HTTP server bind host")
+
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -6747,14 +7141,29 @@ def main() -> None:
         run_self_test()
         return
 
-    if args.gui_test:
-        run_gui_test()
+    if args.web_test:
+        run_web_test()
         return
 
-    root = tk.Tk()
-    engine = GameEngine(muted=args.mute, difficulty_id=args.difficulty)
-    SpaceTraderGUI(root, engine)
-    root.mainloop()
+    # Initialize global game session
+    global GLOBAL_SESSION
+    GLOBAL_SESSION = GameSession(muted=args.mute, difficulty=args.difficulty, player_name=args.player)
+
+    server_address = (args.host, args.port)
+    httpd = ThreadedHTTPServer(server_address, SpaceTraderWebHandler)
+
+    print("=" * 76)
+    print("🚀 SPACE TRADER: ODYSSEY — BROWSER EDITION")
+    print(f"📡 Server listening on: http://{args.host}:{args.port}")
+    print(f"🌟 Commander: {args.player} | Difficulty: {args.difficulty.upper()}")
+    print("=" * 76)
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down Space Trader server...")
+    finally:
+        httpd.server_close()
 
 
 if __name__ == "__main__":

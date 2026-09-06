@@ -1,0 +1,11 @@
+{
+  "name": "space-trader-odyssey",
+  "version": "1.0.0",
+  "description": "Space Trader: Odyssey — Sci-Fi RPG and Trading Simulator",
+  "scripts": {
+    "dev": "python3 spacetrader.py",
+    "build": "python3 spacetrader.py --test",
+    "start": "python3 spacetrader.py",
+    "test": "python3 spacetrader.py --test"
+  }
+}
