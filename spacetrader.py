@@ -1,56 +1,37 @@
 #!/usr/bin/env python3
 """
 ================================================================================
- SPACE TRADER: ODYSSEY — Nebula Edition
+ SPACE TRADER: ODYSSEY — Nebula Edition (Browser HTML)
 ================================================================================
-A complete sci-fi trading, exploration, and combat RPG with a full graphical
-user interface built on Python's built-in tkinter toolkit. No third-party
-dependencies are required — one file, zero installs, pure stdlib.
-
-WHAT'S NEW IN THE NEBULA EDITION
---------------------------------
-* CAPTAIN RANK PROGRESSION: earn Renown through trading, contracts, bounties
-  and exploration. Rise from Cadet to Ensign, Lieutenant, Captain, Commodore
-  and finally Admiral — each rank grants a tangible career perk (better
-  prices, richer contracts, cheaper services, faster reputation, softer
-  loans). Promotions are announced sector-wide.
-* NEON COSMOS UI: a fully re-themed deep-space interface — animated star map
-  with twinkling stars, drifting nebulae, faction territory rings, orbit
-  paths, a pulsing home-world beacon and a jump animation; glowing HUD with
-  rank insignia and a net-worth progress arc.
-* LIVE PRICE CHARTS: every commodity on the Market tab now carries a 10-day
-  unicode sparkline, and selecting a good opens a full detail chart with
-  min / max / average and value-vs-base analysis plus a trade calculator.
-* NET WORTH TELEMETRY: the Captain's Log graphs your entire career as a
-  glowing net-worth curve.
-* EXPANDED FLEET & OUTFITTER (10 ships / 22 items): the armored Drake
-  Freighter and the long-range Phoenix Explorer join the shipyard; new gear
-  includes the Flak Cannon, the endgame Particle Beam Lance, a Shield
-  Capacitor bank and a Deep Space Scanner that reads remote markets.
-* THREE NEW ENCOUNTERS: thread dense asteroid fields, ride unstable
-  wormholes across the sector, and strip-mine rich asteroid veins.
-* SMOOTHER CAMPAIGN CURVE: gentler early-game pirates (threat now scales
-  through net-worth tiers), fairer fines, richer contract payouts, ship
-  speed now shortens travel time, and a credit score that shapes your loan
-  interest. Less grind, more decisions.
-* QUALITY-OF-LIFE: sortable market columns, hover tooltips on the star map,
-  a help manual, per-tab smart refresh (big performance win), fixed the
-  mid-combat escape exploit, and Nightmare difficulty selectable from every
-  new-game dialog.
-* Save system: 3 manual slots + autosave + pre-combat snapshot (fully
-  compatible with Deluxe Edition saves). Saves can be relocated with the
-  ST_SAVE_DIR environment variable.
-* Cross-platform sound tones, 23 achievements, and a built-in self-test
-  suite covering every engine system.
+A complete sci-fi trading, exploration, and combat RPG with a modern browser
+interface served by a built-in threaded HTTP server. Pure Python stdlib —
+one file, zero installs, no third-party dependencies.
 
 HOW TO RUN
 ----------
-    python spacetrader.py                 Launch the game (GUI)
-    python spacetrader.py --test          Run the headless engine self-test suite
-    python spacetrader.py --gui-test      Run a headless GUI smoke check (needs X)
-    python spacetrader.py --mute          Start with sound disabled
-    python spacetrader.py --difficulty easy|normal|hard|nightmare
-    python spacetrader.py --seed N        Deterministic RNG for testing
+    python3 spacetrader.py                    Start the web server and play in
+                                              your browser (default port 3000)
+    python3 spacetrader.py --port 8080        Serve on a custom port
+    python3 spacetrader.py --test             Run the headless engine self-tests
+    python3 spacetrader.py --web-test         Run the web server smoke test
+    python3 spacetrader.py --difficulty easy|normal|hard|nightmare
+    python3 spacetrader.py --player NAME      Set the captain's callsign
+    python3 spacetrader.py --seed N           Deterministic RNG for testing
+
+The PORT environment variable is honoured (defaults to 3000). Saves live
+next to the script (or $ST_SAVE_DIR) as JSON flight records.
+
+WHAT'S INSIDE
+-------------
+* 16 planetary systems with living economies, 18 commodities, 18 market
+  events, price histories and sparkline charts.
+* 10 hulls, 22 equipment items, 7 hireable officers, 5 mission types
+  (delivery / smuggle / bounty / medical / passenger).
+* Tactical turn-based combat with subsystem targeting, missiles, drones,
+  boarding actions and four AI personalities.
+* Ranks (Cadet → Admiral), faction reputation, achievements, banking,
+  a stock exchange, and 10 deep-space encounter types.
+* Multi-slot saves with autosave on jump and a pre-combat snapshot.
 
 GOAL
 ----
@@ -75,9 +56,6 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 
 import http.server
 import socketserver
-import urllib.parse
-import threading
-import webbrowser
 import urllib.parse
 import threading
 import webbrowser
@@ -1081,6 +1059,30 @@ def generate_mission_board(
         desc=f"Outbreak reported on {dst_med.name}! Rush {med_qty}x Bio-Vaccines to save lives."
     ))
 
+    # 5. VIP passenger charter — no cargo bay required.
+    if random.random() < 0.75:
+        dst_psg = pick_dst()
+        passengers = random.randint(1, 6)
+        psg_dist = math.hypot(current_planet.x - dst_psg.x, current_planet.y - dst_psg.y)
+        psg_reward = int((900 * passengers + psg_dist * 150 + 400) * tier_mult)
+        psg_days = max(3, int(psg_dist * 0.6) + 3)
+
+        missions.append(Mission(
+            id=new_id("psg"),
+            title=f"VIP Charter: {passengers} Passenger{'s' if passengers > 1 else ''} to {dst_psg.name}",
+            m_type="passenger",
+            origin=current_planet.name,
+            destination=dst_psg.name,
+            cargo_good=None,
+            cargo_qty=passengers,
+            bounty_target_name=None,
+            bounty_target_ship=None,
+            reward_credits=psg_reward,
+            days_left=psg_days,
+            desc=(f"A wealthy delegation requests discreet passage to {dst_psg.name}. "
+                  f"No cargo space required — deliver them safely within {psg_days} days.")
+        ))
+
     return missions
 
 
@@ -1980,6 +1982,8 @@ class GameEngine:
         elif eq.slot_type == "shield":
             if len(self.player.equipped_shields) >= tmpl.shield_slots:
                 return False, f"No open shield generator bays (max {tmpl.shield_slots})."
+            if eq_id in self.player.equipped_shields:
+                return False, f"{eq.name} is already installed."
             self.player.equipped_shields.append(eq_id)
         elif eq.slot_type == "module":
             if len(self.player.equipped_modules) >= tmpl.module_slots:
@@ -2058,7 +2062,28 @@ class GameEngine:
         completed_msgs: List[str] = []
         for m in list(self.player.active_missions):
             if m.destination == self.player.location and not m.completed and not m.failed:
-                if m.m_type in ("delivery", "smuggle", "medical"):
+                if m.m_type == "passenger":
+                    # VIPs disembark on arrival — no cargo hand-over needed.
+                    bonus_mult = 1.0 + RANK_CONTRACT_BONUS[self.rank_index()]
+                    payout = int(m.reward_credits * bonus_mult)
+                    self.player.credits += payout
+                    m.completed = True
+                    self.player.active_missions.remove(m)
+                    self.player.stats["missions_completed"] += 1
+                    dest_planet = self.planets.get(m.destination)
+                    rep_note = ""
+                    if dest_planet:
+                        gain = self.adjust_reputation(dest_planet.faction, 5)
+                        if gain:
+                            rep_note = f" ({dest_planet.faction} standing +{gain})"
+                    rank_note = "" if payout == m.reward_credits else \
+                        f" [Lieutenant's share +{money(payout - m.reward_credits)} CR]"
+                    completed_msgs.append(
+                        f"Passengers delivered: '{m.title}' complete! Fare: {money(payout)} CR."
+                        f"{rank_note}{rep_note}"
+                    )
+                    self.sound.play("victory")
+                elif m.m_type in ("delivery", "smuggle", "medical"):
                     if m.cargo_good and self.player.cargo.get(m.cargo_good, 0) >= m.cargo_qty:
                         self.player.remove_cargo(m.cargo_good, m.cargo_qty)
                         bonus_mult = 1.0 + RANK_CONTRACT_BONUS[self.rank_index()]
@@ -2092,7 +2117,12 @@ class GameEngine:
 
     def calculate_travel_cost(self, dest: Planet) -> Tuple[int, int]:
         """(fuel_cost, days_cost). Faster hulls genuinely arrive sooner."""
-        dist = self.calculate_distance(self.current_planet, dest)
+        return self.calculate_travel_cost_between(self.current_planet, dest)
+
+    def calculate_travel_cost_between(self, src: Planet, dest: Planet) -> Tuple[int, int]:
+        """Travel cost between two arbitrary worlds (route advisor uses this
+        so warp boosters / navigator perks are reflected in its estimates)."""
+        dist = self.calculate_distance(src, dest)
         fuel_cost = int(dist * 3.0) + 4
 
         if self.player.has_module("warp_booster"):
@@ -2481,6 +2511,14 @@ class GameEngine:
         self.player.stats["wormholes"] += 1
         self.sound.play("wormhole")
         self.add_news(f"Wormhole transit: spat out at {dest.name}!")
+        # The local contract board is planet-specific — regenerate it for the
+        # new arrival system so the mission tab is not left empty.
+        self.available_missions = generate_mission_board(
+            self.current_planet,
+            list(self.planets.values()),
+            self.player.day,
+            career_tier=self.career_tier(),
+        )
         msgs = [f"The wormhole swallows your ship whole and vomits it out near {dest.name}!"]
         if random.random() < 0.3:
             dmg = random.randint(4, 12)
@@ -2543,6 +2581,28 @@ class GameEngine:
     # ------------------------------------------------------------------ #
     # Trade advisor
 
+    def remote_top_deals(self, planet: Planet, limit: int = 5) -> List[Dict[str, Any]]:
+        """Best goods to buy at a remote planet and sell where you are now.
+        Used by the Deep Space Scanner module for the star-map dossier."""
+        deals: List[Dict[str, Any]] = []
+        for gid, comm in COMMODITIES.items():
+            buy_remote = self.get_buy_price(gid, planet)
+            sell_local = self.get_sell_price(gid, self.current_planet)
+            margin = sell_local - buy_remote
+            stock = planet.stock.get(gid, 0)
+            if stock > 0 and margin > 0:
+                deals.append({
+                    "good": comm.name,
+                    "good_id": gid,
+                    "buy_price": buy_remote,
+                    "sell_price": sell_local,
+                    "margin": margin,
+                    "stock": stock,
+                    "is_contraband": comm.is_contraband,
+                })
+        deals.sort(key=lambda d: d["margin"], reverse=True)
+        return deals[:limit]
+
     def compute_best_trade_routes(self, from_current_only: bool = False) -> List[Dict[str, Any]]:
         routes: List[Dict[str, Any]] = []
         planets_list = list(self.planets.values())
@@ -2562,7 +2622,7 @@ class GameEngine:
                         continue
 
                     dist = self.calculate_distance(src, dst)
-                    fuel_units = int(dist * 3.0) + 4
+                    fuel_units, _days = self.calculate_travel_cost_between(src, dst)
                     fuel_credit_estimate = fuel_units * max(
                         4, int(src.fuel_price * self.difficulty.fuel_mult))
 
@@ -2572,7 +2632,7 @@ class GameEngine:
 
                     total_profit = margin * potential_qty
                     net_profit = total_profit - fuel_credit_estimate
-                    days = max(1, int(dist * 0.55 / max(0.5, my_ship.speed)))
+                    days = _days
 
                     routes.append({
                         "good": comm.name,
@@ -3047,6 +3107,11 @@ class CombatEncounter:
         if self.drones_active and action != "drones":
             msgs.extend(self._drone_strike())
 
+        # Set when an action already resolves the enemy's counter-attack
+        # internally (e.g. a repelled boarding attempt) — the enemy must not
+        # strike twice in a single turn.
+        enemy_responded = False
+
         if action == "fire":
             msgs.extend(self._player_attack(None))
         elif action == "target_engines":
@@ -3062,7 +3127,8 @@ class CombatEncounter:
         elif action == "recharge":
             msgs.extend(self._recharge_shields())
         elif action == "board":
-            msgs.extend(self._board_enemy())
+            board_msgs, enemy_responded = self._board_enemy()
+            msgs.extend(board_msgs)
         elif action == "flee":
             escaped, flee_msgs = self._player_flee()
             msgs.extend(flee_msgs)
@@ -3072,7 +3138,8 @@ class CombatEncounter:
         if self.is_finished:
             return msgs
 
-        msgs.extend(self._enemy_turn())
+        if not enemy_responded:
+            msgs.extend(self._enemy_turn())
         return msgs
 
     # ------------------------------------------------------------------ #
@@ -3213,10 +3280,16 @@ class CombatEncounter:
         msgs = [f"Diverted reactor power to shields! Restored {recharge} shield HP."]
         return msgs
 
-    def _board_enemy(self) -> List[str]:
+    def _board_enemy(self) -> Tuple[List[str], bool]:
+        """Attempt a boarding action.
+
+        Returns (messages, enemy_responded). On a repelled boarding the enemy
+        counter-attacks (overpowered) *inside* this method, so the caller must
+        skip the regular enemy turn to avoid a double strike.
+        """
         p = self._p()
         if not self.can_board():
-            return ["Boarding requires the enemy hull to be at 25% integrity or less."]
+            return ["Boarding requires the enemy hull to be at 25% integrity or less."], False
         bonus = 0.15 if p.has_crew("drake") else 0.0
         bonus += 0.20 if p.has_module("boarding_pod") else 0.0
         success_chance = min(0.95, 0.55 + bonus)
@@ -3238,11 +3311,13 @@ class CombatEncounter:
                         + (f" and {missiles_found} missile(s)!" if missiles_found else "!"))
             self.enemy_hull = 0
             msgs.extend(self._victory(boarded=True))
-        else:
-            msgs.append(">> BOARDING REPULSED! Your party is forced back under heavy fire.")
-            p.shield = 0
-            msgs.extend(self._enemy_turn(overpowered=True))
-        return msgs
+            return msgs, False
+        msgs.append(">> BOARDING REPULSED! Your party is forced back under heavy fire.")
+        p.shield = 0
+        # Overpowered counter-attack happens here — flag it so the caller
+        # does not trigger a second enemy turn.
+        msgs.extend(self._enemy_turn(overpowered=True))
+        return msgs, True
 
     def _player_flee(self) -> Tuple[bool, List[str]]:
         p = self._p()
@@ -4102,6 +4177,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="hud-stat-item">
         <span class="hud-stat-label">Net Worth (Target: 500k CR)</span>
         <span class="hud-stat-val" style="color: var(--green);" id="hud-networth">6,625 CR</span>
+        <div class="meter-bar-outer" style="width: 110px; margin-top: 3px;">
+          <div id="hud-networth-bar" class="meter-bar-inner" style="width: 0%; background: var(--green);"></div>
+        </div>
       </div>
     </div>
 
@@ -4222,6 +4300,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <div id="dossier-event-desc" style="margin-top: 4px; font-size: 11px; opacity: 0.9;"></div>
           </div>
 
+          <div id="dossier-scan-box" style="display: none; background: var(--purple-dim); border: 1px solid var(--purple); border-radius: 6px; padding: 10px; font-size: 12px;">
+            <strong style="color: var(--purple);">🔭 Deep Space Scanner Readout</strong>
+            <div style="font-size: 11px; color: var(--fg-dim); margin-bottom: 6px;">Top margins if bought there, sold at your current station:</div>
+            <div id="dossier-scan-list" style="display: flex; flex-direction: column; gap: 3px;"></div>
+          </div>
+
           <button id="dossier-btn-engage" class="dossier-btn-engage" disabled onclick="executeTravel()">
             ⚡ Engage Hyperdrive
           </button>
@@ -4246,12 +4330,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
         <div class="market-filter-bar">
           <div class="filter-pills" id="market-category-filters">
-            <button class="filter-pill active" onclick="setMarketCategory('all')">All Goods</button>
-            <button class="filter-pill" onclick="setMarketCategory('Essentials')">Essentials</button>
-            <button class="filter-pill" onclick="setMarketCategory('Raw Materials')">Raw Materials</button>
-            <button class="filter-pill" onclick="setMarketCategory('High Tech')">High Tech</button>
-            <button class="filter-pill" onclick="setMarketCategory('Luxury')">Luxury</button>
-            <button class="filter-pill" onclick="setMarketCategory('Contraband')">Contraband</button>
+            <button class="filter-pill active" onclick="setMarketCategory('all', this)">All Goods</button>
+            <button class="filter-pill" onclick="setMarketCategory('Essentials', this)">Essentials</button>
+            <button class="filter-pill" onclick="setMarketCategory('Raw Materials', this)">Raw Materials</button>
+            <button class="filter-pill" onclick="setMarketCategory('High Tech', this)">High Tech</button>
+            <button class="filter-pill" onclick="setMarketCategory('Luxury', this)">Luxury</button>
+            <button class="filter-pill" onclick="setMarketCategory('Contraband', this)">Contraband</button>
           </div>
           <input type="text" id="market-search" class="search-input" placeholder="🔍 Search commodities..." oninput="filterMarketTable()">
         </div>
@@ -4274,6 +4358,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <!-- Dynamically populated -->
             </tbody>
           </table>
+        </div>
+      </div>
+
+      <!-- Cargo Hold Manifest -->
+      <div class="panel-card">
+        <div class="panel-card-header">
+          <div>
+            <div class="panel-card-title">📦 Cargo Hold Manifest</div>
+            <div class="panel-card-subtitle">Freight aboard and estimated liquidation value at this station.</div>
+          </div>
+          <div style="font-size: 12px; color: var(--fg-dim);">
+            Hold Value: <strong id="cargo-total-value" style="color: var(--gold);">0</strong> CR
+          </div>
+        </div>
+        <div id="cargo-hold-grid" class="grid-4">
+          <!-- Dynamically populated -->
         </div>
       </div>
     </div>
@@ -4414,7 +4514,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </div>
             <div id="depot-insurance-status" style="font-size: 13px;">Policy: Inactive</div>
             <button id="btn-buy-insurance" class="btn-action-sm btn-buy" style="margin-top: auto;" onclick="buyInsurance()">
-              Purchase Policy (2,000 CR)
+              Purchase Policy
             </button>
           </div>
         </div>
@@ -4488,7 +4588,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <span style="font-weight: 700; color: var(--green);">Secure Savings Account</span>
                 <span id="bank-savings-bal" style="font-family: var(--font-mono); font-weight: 700; color: var(--green); font-size: 16px;">0 CR</span>
               </div>
-              <div style="font-size: 12px; color: var(--fg-dim); margin-bottom: 12px;">Earns 0.25% compound interest every sector travel day.</div>
+              <div style="font-size: 12px; color: var(--fg-dim); margin-bottom: 12px;">Earns 0.8% compound interest every sector travel day.</div>
               <div style="display: flex; gap: 8px;">
                 <button class="btn-action-sm btn-buy" onclick="promptDeposit()">Deposit Credits</button>
                 <button class="btn-action-sm btn-sell" onclick="promptWithdraw()">Withdraw Credits</button>
@@ -4691,6 +4791,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button class="btn-action-sm" onclick="sendCombatAction('target_engines')">🎯 Target Thrusters</button>
         <button class="btn-action-sm" onclick="sendCombatAction('target_shields')">🎯 Target Shields</button>
         <button class="btn-action-sm btn-sell" id="btn-combat-missile" onclick="sendCombatAction('missile')">🚀 Fire Torpedo</button>
+        <button class="btn-action-sm" id="btn-combat-drones" onclick="sendCombatAction('drones')">🛸 Deploy Drones</button>
         <button class="btn-action-sm" onclick="sendCombatAction('recharge')">🛡️ Boost Capacitor</button>
         <button class="btn-action-sm" id="btn-combat-board" onclick="sendCombatAction('board')">🏴‍☠️ Board Vessel</button>
         <button class="btn-action-sm" style="color: var(--red);" onclick="sendCombatAction('flee')">🏃 Emergency Warp</button>
@@ -4802,6 +4903,59 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- GAME OVER MODAL -->
+  <div id="gameover-modal" class="generic-modal">
+    <div class="modal-box" style="text-align: center; border-color: var(--red);">
+      <div style="font-size: 48px; margin-bottom: 10px;">💀</div>
+      <h3 style="color: var(--red); font-size: 22px; margin-bottom: 8px;">VESSEL DESTROYED</h3>
+      <p style="font-size: 13px; color: var(--fg-dim); margin-bottom: 20px; line-height: 1.6;">
+        Your ship broke apart in the void. The sector remembers your final transmission.<br>
+        Recovery options are available from your flight recorder archives.
+      </p>
+      <div style="display: flex; flex-direction: column; gap: 10px;">
+        <button class="dossier-btn-engage" onclick="recoverSave('precombat')">⏪ Load Pre-Combat Snapshot</button>
+        <button class="dossier-btn-engage" style="background: var(--gold); color: #020514;" onclick="recoverSave('autosave')">💾 Load Last Autosave</button>
+        <button class="hud-btn" style="justify-content: center; padding: 12px;" onclick="openNewGameModal()">🔄 Start New Career</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- VICTORY MODAL -->
+  <div id="victory-modal" class="generic-modal">
+    <div class="modal-box" style="text-align: center; border-color: var(--gold); box-shadow: 0 0 60px rgba(255, 183, 3, 0.3);">
+      <div style="font-size: 48px; margin-bottom: 10px;">🏆</div>
+      <h3 style="color: var(--gold); font-size: 22px; margin-bottom: 8px;">GALACTIC MOGUL ACHIEVED</h3>
+      <p style="font-size: 13px; color: var(--fg-dim); margin-bottom: 20px; line-height: 1.6;">
+        Net worth has surpassed <strong style="color: var(--green);">500,000 CR</strong>!<br>
+        The sector bows to your commercial empire, <strong id="victory-captain-name" style="color: var(--cyan);">Commander</strong>.
+      </p>
+      <div style="display: flex; flex-direction: column; gap: 10px;">
+        <button class="dossier-btn-engage" style="background: var(--gold); color: #020514;" onclick="dismissVictory()">Continue Playing (Sandbox Mode)</button>
+        <button class="hud-btn" style="justify-content: center; padding: 12px;" onclick="dismissVictory(); openNewGameModal();">🔄 Begin a New Career</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- AMOUNT INPUT MODAL (bank / stocks) -->
+  <div id="amount-modal" class="generic-modal">
+    <div class="modal-box">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+        <h3 id="amount-modal-title" style="color: var(--cyan); font-size: 18px;">Enter Amount</h3>
+        <button class="btn-action-sm" onclick="closeAmountModal()">✕</button>
+      </div>
+      <p id="amount-modal-hint" style="font-size: 12px; color: var(--fg-dim); margin-bottom: 10px;"></p>
+      <input type="number" id="amount-modal-input" class="search-input" style="width: 100%; font-size: 16px; padding: 10px;" min="1" value="500">
+      <div style="display: flex; gap: 8px; margin-top: 12px;">
+        <button class="btn-action-sm" onclick="setAmountModalValue(100)">100</button>
+        <button class="btn-action-sm" onclick="setAmountModalValue(500)">500</button>
+        <button class="btn-action-sm" onclick="setAmountModalValue(1000)">1,000</button>
+        <button class="btn-action-sm" onclick="setAmountModalValue(5000)">5,000</button>
+        <button class="btn-action-sm" onclick="setAmountModalValue(10000)">10,000</button>
+      </div>
+      <button class="dossier-btn-engage" id="amount-modal-confirm" style="margin-top: 16px;" onclick="confirmAmountModal()">Confirm</button>
+    </div>
+  </div>
+
   <!-- TOAST CONTAINER -->
   <div id="toast-container"></div>
 
@@ -4892,6 +5046,69 @@ HTML_PAGE = r"""<!DOCTYPE html>
         gain.connect(audioCtx.destination);
         osc.start(now);
         osc.stop(now + 0.25);
+      } else if (type === 'shield_hit') {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(330, now);
+        osc.frequency.exponentialRampToValueAtTime(180, now + 0.18);
+        gain.gain.setValueAtTime(0.16, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.18);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + 0.18);
+      } else if (type === 'death') {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(220, now);
+        osc.frequency.exponentialRampToValueAtTime(40, now + 0.9);
+        gain.gain.setValueAtTime(0.22, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.9);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + 0.9);
+      } else if (type === 'mine') {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(90, now);
+        osc.frequency.setValueAtTime(60, now + 0.15);
+        gain.gain.setValueAtTime(0.25, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + 0.3);
+      } else if (type === 'wormhole') {
+        const osc = audioCtx.createOscillator();
+        const osc2 = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc2.type = 'sine';
+        osc.frequency.setValueAtTime(200, now);
+        osc.frequency.exponentialRampToValueAtTime(900, now + 0.5);
+        osc2.frequency.setValueAtTime(205, now);
+        osc2.frequency.exponentialRampToValueAtTime(880, now + 0.5);
+        gain.gain.setValueAtTime(0.18, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.55);
+        osc.connect(gain); osc2.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now); osc2.start(now);
+        osc.stop(now + 0.55); osc2.stop(now + 0.55);
+      } else if (type === 'click') {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(660, now);
+        gain.gain.setValueAtTime(0.08, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.06);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + 0.06);
       } else if (type === 'victory' || type === 'rank_up') {
         [523.25, 659.25, 783.99, 1046.50].forEach((freq, i) => {
           const osc = audioCtx.createOscillator();
@@ -4983,12 +5200,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     // --- Master Render ---
+    let victoryShown = false;
+
     function renderAll() {
       if (!gameState) return;
       renderHUD();
       renderVitals();
       renderStarMap();
       renderMarket();
+      renderCargoHold();
       renderShipyard();
       renderServices();
       renderCrew();
@@ -4997,6 +5217,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       renderLog();
       checkEncounter();
       checkCombat();
+      checkGameOver();
+      checkVictory();
     }
 
     function renderHUD() {
@@ -5013,6 +5235,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('hud-day').textContent = 'Day ' + p.day;
       document.getElementById('hud-credits').textContent = p.credits.toLocaleString() + ' CR';
       document.getElementById('hud-networth').textContent = p.net_worth.toLocaleString() + ' CR';
+      const nwBar = document.getElementById('hud-networth-bar');
+      nwBar.style.width = p.net_worth_pct + '%';
+      nwBar.style.background = p.net_worth_pct >= 100 ? 'var(--gold)' : 'var(--green)';
     }
 
     function renderVitals() {
@@ -5144,10 +5369,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const eventBox = document.getElementById('dossier-event-box');
       if (planet.active_event) {
         eventBox.style.display = 'block';
-        document.getElementById('dossier-event-title').textContent = planet.active_event.title;
+        document.getElementById('dossier-event-title').textContent = planet.active_event.name;
         document.getElementById('dossier-event-desc').textContent = planet.active_event.desc;
       } else {
         eventBox.style.display = 'none';
+      }
+
+      // Deep Space Scanner readout (module-gated remote market intel)
+      const scanBox = document.getElementById('dossier-scan-box');
+      const scanList = document.getElementById('dossier-scan-list');
+      if (gameState.player.has_deep_scanner && planet.remote_deals && planet.remote_deals.length) {
+        scanBox.style.display = 'block';
+        scanList.innerHTML = planet.remote_deals.map(d => `
+          <div style="display: flex; justify-content: space-between; font-size: 11px;">
+            <span>${d.is_contraband ? '🔴' : '🔸'} ${d.good} <span style="color: var(--fg-dim);">(x${d.stock})</span></span>
+            <span style="color: var(--green); font-family: var(--font-mono);">+${d.margin} CR</span>
+          </div>
+        `).join('');
+      } else if (gameState.player.has_deep_scanner && !planet.is_current) {
+        scanBox.style.display = 'block';
+        scanList.innerHTML = '<div style="font-size: 11px; color: var(--fg-dim);">No profitable buy signals detected at this world.</div>';
+      } else {
+        scanBox.style.display = 'none';
       }
 
       const btn = document.getElementById('dossier-btn-engage');
@@ -5169,10 +5412,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     // --- Commodity Market ---
-    function setMarketCategory(cat) {
+    function setMarketCategory(cat, el) {
       marketCategoryFilter = cat;
       document.querySelectorAll('#market-category-filters .filter-pill').forEach(p => p.classList.remove('active'));
-      event.target.classList.add('active');
+      if (el) el.classList.add('active');
       renderMarket();
     }
 
@@ -5303,6 +5546,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
     }
 
+    // --- Cargo Hold Manifest ---
+    function renderCargoHold() {
+      if (!gameState) return;
+      const grid = document.getElementById('cargo-hold-grid');
+      const items = gameState.player.cargo_detail || [];
+      let total = 0;
+      let html = '';
+      items.forEach(c => {
+        total += c.total_value;
+        html += `
+          <div style="background: var(--bg2); border: 1px solid ${c.is_contraband ? 'var(--red)' : 'var(--panel-border)'}; border-radius: 8px; padding: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <strong style="color: ${c.is_contraband ? 'var(--red)' : 'var(--fg)'}; font-size: 13px;">${c.name}</strong>
+              <span class="pill ${c.is_contraband ? 'pill-red' : 'pill-cyan'}" style="font-size: 10px;">${c.qty} T</span>
+            </div>
+            <div style="font-size: 11px; color: var(--fg-dim);">Sell here: <strong style="color: var(--gold);">${c.sell_price} CR</strong>/unit</div>
+            <div style="font-size: 11px; color: var(--fg-dim);">Value: <strong style="color: var(--gold);">${c.total_value.toLocaleString()} CR</strong></div>
+            <button class="btn-action-sm btn-sell" style="margin-top: 8px; width: 100%;" onclick="openTradeModal('${c.id}', 'sell')">Sell All</button>
+          </div>
+        `;
+      });
+      grid.innerHTML = html || '<div style="color: var(--fg-dim); font-size: 12px; grid-column: 1 / -1;">Cargo hold is empty. Purchase commodities from the exchange above.</div>';
+      document.getElementById('cargo-total-value').textContent = total.toLocaleString();
+    }
+
     // --- Trade Advisor ---
     async function fetchTradeRoutes() {
       try {
@@ -5413,10 +5681,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         insStatus.textContent = 'Policy: Active (Vessel guaranteed against loss)';
         insStatus.style.color = 'var(--green)';
         insBtn.disabled = true;
+        insBtn.textContent = 'Policy Active';
       } else {
         insStatus.textContent = 'Policy: Inactive';
         insStatus.style.color = 'var(--fg-dim)';
-        insBtn.disabled = false;
+        insBtn.disabled = p.credits < p.insurance_price;
+        insBtn.textContent = `Purchase Policy (${p.insurance_price.toLocaleString()} CR)`;
       }
     }
 
@@ -5459,13 +5729,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const aList = document.getElementById('available-missions-list');
       let aHtml = '';
       gameState.available_missions.forEach(m => {
+        const urgent = m.days_left <= 3;
         aHtml += `
-          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center;">
+          <div style="background: var(--bg2); border: 1px solid ${urgent ? 'var(--red)' : 'var(--panel-border)'}; border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center;">
             <div>
               <div style="font-weight: 700; color: var(--cyan);">${m.title}</div>
-              <div style="font-size: 11px; color: var(--fg-dim);">${m.description}</div>
+              <div style="font-size: 11px; color: var(--fg-dim);">${m.desc}</div>
               <div style="font-size: 11px; color: var(--fg); margin-top: 4px;">
-                Destination: <strong style="color: var(--gold);">${m.destination}</strong> · Deadline: <strong>${m.deadline_days} days</strong>
+                Destination: <strong style="color: var(--gold);">${m.destination}</strong> · Deadline: <strong style="color: ${urgent ? 'var(--red)' : 'var(--fg)'};">${m.days_left} days</strong>
               </div>
             </div>
             <div style="text-align: right; margin-left: 14px;">
@@ -5485,13 +5756,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center;">
             <div>
               <div style="font-weight: 700; color: var(--gold);">${m.title}</div>
-              <div style="font-size: 11px; color: var(--fg-dim);">Deliver to <strong>${m.destination}</strong></div>
-              <div style="font-size: 11px; color: ${m.deadline_days <= 2 ? 'var(--red)' : 'var(--fg)'};">
-                Remaining Time: ${m.deadline_days} Days
+              <div style="font-size: 11px; color: var(--fg-dim);">${m.m_type === 'bounty' ? 'Hunt target near' : 'Deliver to'} <strong>${m.destination}</strong></div>
+              <div style="font-size: 11px; color: ${m.days_left <= 2 ? 'var(--red)' : 'var(--fg)'};">
+                Remaining Time: ${m.days_left} Days
               </div>
             </div>
             <div>
-              ${canDeliver ? `<span class="pill pill-green">Delivered upon arrival!</span>` : `<span class="pill pill-cyan">In Transit</span>`}
+              ${canDeliver && m.m_type !== 'bounty' ? `<span class="pill pill-green">Delivered upon arrival!</span>` : `<span class="pill pill-cyan">In Transit</span>`}
             </div>
           </div>
         `;
@@ -5527,8 +5798,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <div style="font-family: var(--font-mono); font-size: 15px; font-weight: 700; color: var(--gold);">${stk.price} CR</div>
               <div style="font-size: 11px; color: ${trendColor}; font-weight: 700; margin-bottom: 4px;">${stk.change_pct >= 0 ? '+' : ''}${stk.change_pct}%</div>
               <div style="display: flex; gap: 4px;">
-                <button class="btn-action-sm btn-buy" onclick="sendAction('buy_stock', { symbol: '${stk.symbol}', qty: 5 })">+5</button>
-                <button class="btn-action-sm btn-sell" ${stk.shares_owned <= 0 ? 'disabled' : ''} onclick="sendAction('sell_stock', { symbol: '${stk.symbol}', qty: 5 })">-5</button>
+                <button class="btn-action-sm btn-buy" onclick="tradeStock('${stk.symbol}', 'buy')">Buy</button>
+                <button class="btn-action-sm btn-sell" ${stk.shares_owned <= 0 ? 'disabled' : ''} onclick="tradeStock('${stk.symbol}', 'sell')">Sell</button>
               </div>
             </div>
           </div>
@@ -5537,22 +5808,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       sContainer.innerHTML = html;
     }
 
-    function promptDeposit() {
-      const amt = prompt("Enter Credits to deposit into high-yield savings:", "500");
-      if (amt && parseInt(amt, 10) > 0) sendAction('bank_deposit', { amount: parseInt(amt, 10) });
-    }
-    function promptWithdraw() {
-      const amt = prompt("Enter Credits to withdraw:", "500");
-      if (amt && parseInt(amt, 10) > 0) sendAction('bank_withdraw', { amount: parseInt(amt, 10) });
-    }
-    function promptBorrow() {
-      const amt = prompt("Enter loan amount to borrow from First Galactic Bank:", "1000");
-      if (amt && parseInt(amt, 10) > 0) sendAction('bank_borrow', { amount: parseInt(amt, 10) });
-    }
-    function promptRepay() {
-      const amt = prompt("Enter Credits to repay towards outstanding loan:", "1000");
-      if (amt && parseInt(amt, 10) > 0) sendAction('bank_repay', { amount: parseInt(amt, 10) });
-    }
+    // (bank amount dialogs now live in the styled Amount Input Modal below)
 
     // --- Career & Captain's Log ---
     function renderLog() {
@@ -5629,9 +5885,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const opt1 = document.getElementById('enc-btn-opt1');
       const opt2 = document.getElementById('enc-btn-opt2');
 
+      const ENC_ICONS = {
+        customs_scan: '🛃', faction_patrol: '🚔', derelict: '🛸',
+        solar_flare: '☀️', distress_beacon: '🆘', wandering_trader: '🧳',
+        asteroid_field: '🪨', wormhole: '🌀', mining_opportunity: '⛏️',
+        pirate_ambush: '☠️', bounty_combat: '🎯'
+      };
+      document.getElementById('enc-icon').textContent = ENC_ICONS[t] || '📡';
+
+      if (t === 'solar_flare') {
+        // Unavoidable radiation event — single acknowledge button.
+        opt1.textContent = 'Brace for Impact';
+        opt2.style.display = 'none';
+        modal.classList.add('active');
+        return;
+      }
+      opt2.style.display = '';
+
       if (t === 'customs_scan') {
         opt1.textContent = 'Submit to Security Scan';
-        opt2.textContent = 'Attempt to Bribe Officer (500 CR)';
+        opt2.textContent = 'Attempt to Bribe Officer';
       } else if (t === 'faction_patrol') {
         opt1.textContent = 'Transmit Friendly Identification';
         opt2.textContent = 'Ignore and Divert Course';
@@ -5646,7 +5919,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         opt2.textContent = 'Decline Offer';
       } else if (t === 'asteroid_field') {
         opt1.textContent = 'Thread Through Field (Piloting Test)';
-        opt2.textContent = 'Take Wide Detour (1 Extra Day)';
+        opt2.textContent = 'Take Wide Detour (8 LY Fuel)';
       } else if (t === 'wormhole') {
         opt1.textContent = 'Plunge into Anomaly';
         opt2.textContent = 'Maintain Standard Route';
@@ -5676,7 +5949,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       modal.classList.add('active');
 
       document.getElementById('combat-enemy-name').textContent = c.enemy_name;
-      document.getElementById('combat-enemy-ship').textContent = `Class: ${c.enemy_ship_name} · Behavior: ${c.personality.toUpperCase()}`;
+      document.getElementById('combat-enemy-ship').textContent = `Class: ${c.enemy_ship_name} · Behavior: ${c.personality.toUpperCase()} — ${c.personality_desc || ''}`;
       document.getElementById('combat-turn-counter').textContent = `Combat Turn ${c.turn_count}`;
 
       // Player combat gauges
@@ -5695,6 +5968,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       // Torpedo Button
       document.getElementById('btn-combat-missile').textContent = `🚀 Fire Torpedo (${c.player_missiles} left)`;
       document.getElementById('btn-combat-missile').disabled = (c.player_missiles <= 0);
+
+      // Drone Bay Button
+      const droneBtn = document.getElementById('btn-combat-drones');
+      droneBtn.disabled = !c.has_drone_bay;
+      droneBtn.textContent = c.drones_active ? '🛸 Drones Active' : '🛸 Deploy Drones';
 
       // Boarding Button
       document.getElementById('btn-combat-board').disabled = !c.can_board;
@@ -5801,6 +6079,121 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('manual-modal').classList.remove('active');
     }
 
+    // --- Game Over / Victory ---
+    function checkGameOver() {
+      const modal = document.getElementById('gameover-modal');
+      if (gameState && gameState.player.is_game_over) {
+        if (!modal.classList.contains('active')) {
+          modal.classList.add('active');
+          playSound('death');
+        }
+      } else {
+        modal.classList.remove('active');
+      }
+    }
+
+    function recoverSave(slot) {
+      document.getElementById('gameover-modal').classList.remove('active');
+      sendAction('load_game', { slot });
+    }
+
+    function checkVictory() {
+      const modal = document.getElementById('victory-modal');
+      if (gameState && gameState.player.victory && !victoryShown) {
+        victoryShown = true;
+        document.getElementById('victory-captain-name').textContent = gameState.player.name;
+        modal.classList.add('active');
+        playSound('victory');
+      }
+      if (!gameState || !gameState.player.victory) {
+        victoryShown = false;
+        modal.classList.remove('active');
+      }
+    }
+
+    function dismissVictory() {
+      document.getElementById('victory-modal').classList.remove('active');
+    }
+
+    // --- Amount Input Modal (bank / stocks) ---
+    let amountModalAction = null;
+    let amountModalPayload = {};
+
+    function openAmountModal(title, hint, confirmLabel, defaultValue, action, payload = {}) {
+      amountModalAction = action;
+      amountModalPayload = payload;
+      document.getElementById('amount-modal-title').textContent = title;
+      document.getElementById('amount-modal-hint').textContent = hint;
+      document.getElementById('amount-modal-confirm').textContent = confirmLabel;
+      const input = document.getElementById('amount-modal-input');
+      input.value = defaultValue;
+      document.getElementById('amount-modal').classList.add('active');
+      setTimeout(() => input.focus(), 50);
+    }
+
+    function closeAmountModal() {
+      document.getElementById('amount-modal').classList.remove('active');
+      amountModalAction = null;
+      amountModalPayload = {};
+    }
+
+    function setAmountModalValue(v) {
+      document.getElementById('amount-modal-input').value = v;
+    }
+
+    function confirmAmountModal() {
+      const val = parseInt(document.getElementById('amount-modal-input').value, 10);
+      if (!amountModalAction || isNaN(val) || val <= 0) {
+        showToast('Please enter a valid positive quantity.');
+        return;
+      }
+      const action = amountModalAction;
+      const payload = amountModalPayload;
+      closeAmountModal();
+      sendAction(action, { ...payload, [payload.key || 'amount']: val });
+    }
+
+    // --- Bank prompt replacements ---
+    function promptDeposit() {
+      openAmountModal('🏦 Deposit to Savings',
+        `Available credits: ${gameState.player.credits.toLocaleString()} CR. Savings earn 0.8% daily.`,
+        'Deposit Credits', Math.min(500, gameState.player.credits),
+        'bank_deposit', { key: 'amount' });
+    }
+    function promptWithdraw() {
+      openAmountModal('🏦 Withdraw from Savings',
+        `Savings balance: ${gameState.player.savings.toLocaleString()} CR.`,
+        'Withdraw Credits', Math.min(500, gameState.player.savings),
+        'bank_withdraw', { key: 'amount' });
+    }
+    function promptBorrow() {
+      openAmountModal('🏦 Borrow from First Galactic Bank',
+        `Credit limit remaining: ${(gameState.player.loan_limit - gameState.player.loan).toLocaleString()} CR at ${gameState.player.effective_interest_rate}% daily interest.`,
+        'Borrow Funds', 1000,
+        'bank_borrow', { key: 'amount' });
+    }
+    function promptRepay() {
+      openAmountModal('🏦 Repay Loan',
+        `Outstanding debt: ${gameState.player.loan.toLocaleString()} CR. On-time repayments boost your credit score.`,
+        'Repay Loan', Math.min(1000, gameState.player.loan),
+        'bank_repay', { key: 'amount' });
+    }
+    function tradeStock(symbol, mode) {
+      const stk = gameState.all_stocks.find(s => s.symbol === symbol);
+      if (!stk) return;
+      if (mode === 'buy') {
+        openAmountModal(`📊 Buy ${stk.symbol} Shares`,
+          `Current price: ${stk.price.toFixed(2)} CR/share. You hold ${stk.shares_owned} shares.`,
+          'Buy Shares', 5,
+          'buy_stock', { key: 'qty', symbol });
+      } else {
+        openAmountModal(`📊 Sell ${stk.symbol} Shares`,
+          `Current price: ${stk.price.toFixed(2)} CR/share. You hold ${stk.shares_owned} shares.`,
+          'Sell Shares', Math.min(5, stk.shares_owned),
+          'sell_stock', { key: 'qty', symbol });
+      }
+    }
+
     // --- Keyboard Shortcuts ---
     window.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
@@ -5838,8 +6231,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 class GameSession:
     """Holds the active game engine and current encounter / combat state."""
-    def __init__(self, muted: bool = False, difficulty: str = "normal", player_name: str = "Commander"):
-        self.engine = GameEngine(muted=muted, difficulty_id=difficulty)
+    def __init__(self, muted: bool = True, difficulty: str = "normal", player_name: str = "Commander"):
+        # The browser client renders its own Web Audio effects — keep the
+        # headless server-side SoundManager silent so terminal bells never
+        # pollute the server console.
+        self.engine = GameEngine(muted=True, difficulty_id=difficulty)
         self.engine.new_game(player_name, difficulty)
         self.active_encounter: Optional[Dict[str, Any]] = None
         self.active_combat: Optional[CombatEncounter] = None
@@ -5916,6 +6312,7 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
         })
 
     # Planets list
+    has_scanner = player.has_module("deep_scanner")
     all_planets = []
     for p in engine.planets.values():
         dist = engine.calculate_distance(current_p, p)
@@ -5942,6 +6339,7 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "days_cost": days_cost,
             "in_range": player.fuel >= fuel_cost,
             "is_current": p.name == current_p.name,
+            "remote_deals": engine.remote_top_deals(p) if has_scanner else None,
         })
 
     # Market commodities on current planet
@@ -6103,6 +6501,7 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "can_board": c.can_board(),
             "can_flee": c.can_flee(),
             "player_missiles": c.player_missiles(),
+            "has_drone_bay": engine.player.has_drone_bay(),
             "is_bounty": c.is_bounty,
             "bounty_reward": c.bounty_reward,
         }
@@ -6180,6 +6579,11 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "reputation": {f: player.rep(f) for f in FACTIONS},
             "standing": {f: reputation_rank(player.rep(f)) for f in FACTIONS},
             "victory": net_worth >= TARGET_NET_WORTH,
+            "is_game_over": engine.is_game_over,
+            "effective_max_shield": player.effective_max_shield(),
+            "has_drone_bay": player.has_drone_bay(),
+            "has_deep_scanner": player.has_module("deep_scanner"),
+            "has_missile_rack": player.has_missile_rack(),
         },
         "current_planet": {
             "name": current_p.name,
@@ -6251,6 +6655,11 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
         global GLOBAL_SESSION
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
 
         if path in ("/", "/index.html"):
             self._set_headers(content_type="text/html; charset=utf-8")
@@ -6366,8 +6775,11 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
                     t = enc.get("type")
                     enc_logs: List[str] = []
                     if t == "customs_scan":
-                        enc_logs = engine.resolve_customs(enc, choice)
-                        sound = "alarm" if choice else "coin"
+                        # UI semantics: opt1 (choice=True) = "Submit to Scan",
+                        # opt2 (choice=False) = "Attempt to Bribe" — the engine
+                        # expects bribe=True, hence the inversion here.
+                        enc_logs = engine.resolve_customs(enc, bribe=not choice)
+                        sound = "coin" if not choice else "alarm"
                     elif t == "faction_patrol":
                         enc_logs = engine.resolve_faction_patrol(enc, choice)
                         sound = "coin" if choice else "alarm"
@@ -6438,9 +6850,15 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
                 combat = GLOBAL_SESSION.active_combat
                 if combat and combat.is_finished:
                     GLOBAL_SESSION.active_combat = None
-                    engine.autosave()
-                    success = True
-                    message = "Disengaged from combat arena."
+                    if combat.player_dead:
+                        # Never persist a destroyed ship over the autosave —
+                        # the pre-combat snapshot is the recovery point.
+                        success = True
+                        message = "Vessel lost. Recovery options available."
+                    else:
+                        engine.autosave()
+                        success = True
+                        message = "Disengaged from combat arena."
                 else:
                     success = False
                     message = "Combat is still in progress."
@@ -7021,8 +7439,117 @@ def run_self_test() -> None:
         check("simulation advanced time", e_sim.player.day > 1)
         check("simulation hull intact-or-alive", e_sim.player.hull > 0)
 
-        # --- 16. Cleanup ---
-        print("\n--- 16. Cleanup ---")
+        # --- 16. Regression: boarding double-attack fix ---
+        print("\n--- 16. Regression: boarding counter-attack ---")
+        e_brd = GameEngine(muted=True)
+        e_brd.new_game("Boarder", "normal")
+        enc_brd = {"enemy_name": "Test Corsair", "enemy_ship": "sparrow", "type": "pirate_ambush"}
+        combat_brd = start_combat(e_brd, enc_brd)
+        combat_brd.enemy_hull = max(1, int(combat_brd.enemy_max_hull * 0.10))
+        # Force the boarding attempt to fail: success chance is 0.55 < 0.99.
+        real_random = random.random
+        random.random = lambda: 0.99  # board fails; enemy hits; no dodge
+        try:
+            msgs_brd = combat_brd.player_action("board")
+        finally:
+            random.random = real_random
+        attack_lines = [m for m in msgs_brd if "shields for" in m or "hull damage" in m]
+        check("repelled boarding triggers exactly ONE counter-attack", len(attack_lines) == 1,
+              f"got {len(attack_lines)}: {attack_lines}")
+
+        # --- 17. Regression: wormhole regenerates local mission board ---
+        print("\n--- 17. Regression: wormhole mission board ---")
+        e_wh = GameEngine(muted=True)
+        e_wh.new_game("Wormholer", "normal")
+        loc_before_wh = e_wh.player.location
+        e_wh.resolve_wormhole({}, True)
+        check("wormhole relocates player", e_wh.player.location != loc_before_wh or len(e_wh.planets) == 1)
+        check("mission board regenerated for new system",
+              all(m.origin == e_wh.player.location for m in e_wh.available_missions))
+        check("board offers contracts after wormhole", len(e_wh.available_missions) >= 3)
+
+        # --- 18. Regression: customs & shields ---
+        print("\n--- 18. Regression: customs & equipment ---")
+        e_cst = GameEngine(muted=True)
+        e_cst.new_game("Smuggler", "normal")
+        e_cst.player.cargo["narcotics"] = 5
+        e_cst.player.credits = 100          # cannot afford any bribe
+        msgs_cst = e_cst.resolve_customs({}, bribe=True)
+        check("unaffordable bribe falls through to scan",
+              any("CONTRABAND CONFISCATED" in m for m in msgs_cst))
+        check("contraband seized by customs", "narcotics" not in e_cst.player.cargo)
+
+        e_shd = GameEngine(muted=True)
+        e_shd.new_game("Shielder", "normal")
+        # Default Sparrow already carries one Deflector Barrier in its single
+        # shield bay — buying another of the same model must be rejected.
+        ok_dup_shd, _ = e_shd.buy_equipment("shield_1")
+        check("duplicate shield purchase rejected", not ok_dup_shd)
+        e_shd.player.credits = 500_000
+        e_shd.buy_ship("drake")                 # armored hauler: 2 shield bays
+        ok_shd2, _ = e_shd.buy_equipment("shield_2")
+        check("distinct second shield accepted", ok_shd2)
+        ok_dup_shd2, _ = e_shd.buy_equipment("shield_2")
+        check("duplicate second shield rejected", not ok_dup_shd2)
+
+        # --- 19. Passenger missions ---
+        print("\n--- 19. Passenger charters ---")
+        e_psg = GameEngine(muted=True)
+        e_psg.new_game("Chauffeur", "normal")
+        # Deterministic: directly craft a passenger mission and complete it.
+        psg_dst = next(p for p in e_psg.planets.values() if p != e_psg.current_planet)
+        psg_m = Mission(
+            id="mis_psg_test_0001", title="VIP Charter Test",
+            m_type="passenger", origin=e_psg.player.location,
+            destination=psg_dst.name, cargo_good=None, cargo_qty=3,
+            bounty_target_name=None, bounty_target_ship=None,
+            reward_credits=2_000, days_left=10,
+            desc="Transport 3 dignitaries.",
+        )
+        e_psg.available_missions.append(psg_m)
+        ok_psg, _ = e_psg.accept_mission(psg_m.id)
+        check("passenger charter accepted without cargo", ok_psg)
+        check("no cargo loaded for passengers", e_psg.player.cargo_used() == 0)
+        e_psg.player.location = psg_dst.name
+        delivered_psg = e_psg.check_mission_deliveries()
+        check("passenger charter completes on arrival", len(delivered_psg) == 1)
+        check("fare paid on arrival", e_psg.player.credits > 2_500)
+        check("passenger mission removed from active list", psg_m.id not in
+              [m.id for m in e_psg.player.active_missions])
+        # Generator also produces passenger missions sometimes.
+        boards_have_psg = False
+        for _ in range(30):
+            if any(m.m_type == "passenger" for m in generate_mission_board(
+                    e_psg.current_planet, list(e_psg.planets.values()), 1)):
+                boards_have_psg = True
+                break
+        check("generator offers passenger charters", boards_have_psg)
+
+        # --- 20. Death, game over & remote scanner ---
+        print("\n--- 20. Death & deep scanner ---")
+        e_dth = GameEngine(muted=True)
+        e_dth.new_game("Doomed", "normal")
+        enc_dth = {"enemy_name": "Executioner", "enemy_ship": "leviathan", "type": "pirate_ambush"}
+        combat_dth = start_combat(e_dth, enc_dth)
+        combat_dth._handle_player_death()
+        check("death sets engine game-over flag", e_dth.is_game_over)
+        check("no insurance used on plain death", not combat_dth.insurance_used)
+        e_dth.player.credits = 100
+        ok_revive, _ = e_dth.load_game("precombat")
+        check("precombat snapshot restores a live career",
+              ok_revive and not e_dth.is_game_over and e_dth.player.hull > 0)
+
+        e_dth.player.equipped_modules = ["deep_scanner"]
+        deals = e_dth.remote_top_deals(e_dth.current_planet)
+        check("deep scanner returns deal list", isinstance(deals, list))
+        check("remote deals well-formed", all(
+            d["margin"] > 0 and d["stock"] > 0 for d in deals))
+        e_dth.player.equipped_modules = []
+        check("remote deals sorted by margin",
+              [d["margin"] for d in deals] == sorted([d["margin"] for d in deals], reverse=True))
+
+        # --- 21. Cleanup ---
+        print("\n--- 21. Cleanup ---")
         shutil.rmtree(scratch, ignore_errors=True)
         check("test scratch dir removed", not os.path.exists(scratch))
 
@@ -7121,14 +7648,13 @@ def run_web_test() -> None:
 # ==============================================================================
 
 def main() -> None:
-    import argparse
     parser = argparse.ArgumentParser(description="Space Trader: Odyssey — Nebula Edition (Browser HTML)")
     parser.add_argument("--test", action="store_true", help="Run headless engine self-test suite and exit.")
     parser.add_argument("--web-test", action="store_true", help="Run headless web server smoke test and exit.")
     parser.add_argument("--difficulty", choices=list(DIFFICULTIES.keys()), default="normal")
     parser.add_argument("--player", default="Commander")
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--mute", action="store_true")
+    parser.add_argument("--mute", action="store_true", help="Legacy flag: server audio is always silent (browser handles sound).")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "3000")), help="HTTP server port")
     parser.add_argument("--host", default="0.0.0.0", help="HTTP server bind host")
 
@@ -7147,7 +7673,7 @@ def main() -> None:
 
     # Initialize global game session
     global GLOBAL_SESSION
-    GLOBAL_SESSION = GameSession(muted=args.mute, difficulty=args.difficulty, player_name=args.player)
+    GLOBAL_SESSION = GameSession(difficulty=args.difficulty, player_name=args.player)
 
     server_address = (args.host, args.port)
     httpd = ThreadedHTTPServer(server_address, SpaceTraderWebHandler)
@@ -7155,6 +7681,7 @@ def main() -> None:
     print("=" * 76)
     print("🚀 SPACE TRADER: ODYSSEY — BROWSER EDITION")
     print(f"📡 Server listening on: http://{args.host}:{args.port}")
+    print(f"   Open http://localhost:{args.port} in your web browser to play.")
     print(f"🌟 Commander: {args.player} | Difficulty: {args.difficulty.upper()}")
     print("=" * 76)
 
