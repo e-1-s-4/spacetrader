@@ -110,6 +110,8 @@ def save_dir() -> str:
 
 
 def slot_path(slot: str) -> str:
+    if slot not in SAVE_SLOTS + (AUTO_SLOT, PRECOMBAT_SLOT):
+        raise ValueError("Invalid save slot.")
     return os.path.join(save_dir(), f"st_odyssey_save_{slot}.json")
 
 
@@ -1932,6 +1934,9 @@ class GameEngine:
         if template_id not in SHIP_TEMPLATES:
             return False, "Invalid ship model."
 
+        if template_id == self.player.ship_id:
+            return False, "You are already flying this ship model."
+
         tmpl = SHIP_TEMPLATES[template_id]
         cur_val = self.ship_trade_in_value()
         net_cost = max(0, tmpl.cost - cur_val)
@@ -2847,7 +2852,10 @@ class GameEngine:
         return self.save_game(PRECOMBAT_SLOT)
 
     def has_save(self, slot: str) -> bool:
-        return os.path.exists(slot_path(slot))
+        try:
+            return os.path.exists(slot_path(slot))
+        except ValueError:
+            return False
 
     def any_saves_exist(self) -> bool:
         return any(self.has_save(s) for s in (AUTO_SLOT, PRECOMBAT_SLOT) + SAVE_SLOTS)
@@ -2855,7 +2863,10 @@ class GameEngine:
     @staticmethod
     def slot_info(slot: str) -> Optional[Dict[str, Any]]:
         """Lightweight metadata for the save/load dialogs."""
-        path = slot_path(slot)
+        try:
+            path = slot_path(slot)
+        except ValueError:
+            return None
         if not os.path.exists(path):
             return None
         try:
@@ -2876,7 +2887,10 @@ class GameEngine:
                     "location": "?", "credits": 0, "difficulty": "?"}
 
     def load_game(self, slot: str = "1") -> Tuple[bool, str]:
-        path = slot_path(slot)
+        try:
+            path = slot_path(slot)
+        except ValueError:
+            return False, "Invalid save slot."
         if not os.path.exists(path):
             return False, f"Save slot '{slot}' not found."
 
@@ -6725,6 +6739,27 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"success": False, "error": f"Invalid JSON: {e}"}).encode("utf-8"))
             return
 
+        for numeric_key in ("qty", "amount", "hp"):
+            if numeric_key not in data:
+                continue
+            value = data[numeric_key]
+            if isinstance(value, bool):
+                self._set_headers(status=400)
+                self.wfile.write(json.dumps({
+                    "success": False,
+                    "error": f"{numeric_key} must be an integer.",
+                }).encode("utf-8"))
+                return
+            try:
+                data[numeric_key] = int(value)
+            except (TypeError, ValueError):
+                self._set_headers(status=400)
+                self.wfile.write(json.dumps({
+                    "success": False,
+                    "error": f"{numeric_key} must be an integer.",
+                }).encode("utf-8"))
+                return
+
         action = data.get("action", "")
         success = False
         message = ""
@@ -7267,6 +7302,9 @@ def run_self_test() -> None:
         check("buy new Drake Freighter", ok_ship)
         check("ship swapped", e_srv.player.ship_id == "drake")
         check("new hull full", e_srv.player.hull == e_srv.player.max_hull)
+        e_srv.player.hull = 1
+        ok_same_ship, _ = e_srv.buy_ship("drake")
+        check("same ship purchase rejected", not ok_same_ship and e_srv.player.hull == 1)
 
         # Equipment
         ok_eq, _ = e_srv.buy_equipment("flak_cannon")
@@ -7406,6 +7444,8 @@ def run_self_test() -> None:
         check("load succeeds", ok_lod)
         check("credits restored", e_sav.player.credits == 77777)
         check("cargo restored", e_sav.player.cargo.get("gemstones", 0) == 4)
+        ok_bad_slot, _ = e_sav.save_game("../../outside")
+        check("invalid save slot rejected", not ok_bad_slot)
 
         # --- 13. Achievements & victory ---
         print("\n--- 13. Achievements & victory ---")
@@ -7636,6 +7676,18 @@ def run_web_test() -> None:
             data = json.loads(resp.read().decode("utf-8"))
             assert data["success"] is True
             print("  [PASS] POST /api/action (buy_commodity)")
+
+        bad_req = urllib.request.Request(
+            f"{base_url}/api/action",
+            data=json.dumps({"action": "buy_commodity", "good": "water", "qty": "many"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            urllib.request.urlopen(bad_req)
+            raise AssertionError("malformed quantity should be rejected")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400
+            print("  [PASS] malformed numeric action rejected")
 
         print("WEB SERVER SMOKE TEST PASSED ✔")
     finally:
