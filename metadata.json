@@ -1,8 +1,6 @@
 {
   "name": "Space Trader: Odyssey",
-  "description": "A comprehensive sci-fi space trading, exploration, and tactical combat RPG game with real-time sector economy and celestial navigation.",
+  "description": "A comprehensive sci-fi space trading, exploration, and tactical combat RPG game with real-time sector economy, celestial navigation, persistent Hall of Fame, and 13 deep-space encounter types.",
   "requestFramePermissions": [],
-  "majorCapabilities": [
-    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
-  ]
+  "majorCapabilities": []
 }
