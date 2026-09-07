@@ -5162,6 +5162,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let tradeMode = 'buy';
     let marketCategoryFilter = 'all';
 
+    // Escapes a value for safe embedding inside a single-quoted string
+    // literal within an inline HTML event handler attribute (e.g.
+    // onclick="fn('${escJs(name)}')"). Without this, names containing an
+    // apostrophe (like "Nebula's Rest") break out of the JS string and
+    // throw "Uncaught SyntaxError: missing ) after argument list".
+    function escJs(str) {
+      return String(str)
+        .replace(/\\/g, '\\\\')
+        .replace(/'/g, "\\'")
+        .replace(/"/g, '&quot;');
+    }
+
     function switchTab(tabId) {
       currentTab = tabId;
       document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -5350,7 +5362,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const nodeRadius = isCurrent ? 12 : 9;
 
         html += `
-          <g class="map-planet-node" onclick="selectPlanet('${p.name}')">
+          <g class="map-planet-node" onclick="selectPlanet('${escJs(p.name)}')">
             <circle cx="${px}" cy="${py}" r="${nodeRadius + 4}" fill="${p.color}" opacity="0.15" />
             <circle class="planet-body" cx="${px}" cy="${py}" r="${nodeRadius}" fill="${p.color}" stroke="${strokeColor}" stroke-width="${strokeWidth}" />
             <text x="${px}" y="${py + 22}" text-anchor="middle" fill="${isSelected ? 'var(--cyan)' : 'var(--fg)'}" font-size="12" font-weight="${isSelected ? 'bold' : 'normal'}" font-family="system-ui">
@@ -5605,7 +5617,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <td>${r.days} Days</td>
                 <td><strong style="color: var(--green);">${r.profit_per_day.toLocaleString()} CR/day</strong></td>
                 <td>
-                  <button class="btn-action-sm btn-buy" onclick="selectPlanet('${r.dst}'); switchTab('map');">Plot Course</button>
+                  <button class="btn-action-sm btn-buy" onclick="selectPlanet('${escJs(r.dst)}'); switchTab('map');">Plot Course</button>
                 </td>
               </tr>
             `;
