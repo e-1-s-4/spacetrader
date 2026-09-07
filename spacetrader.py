@@ -58,7 +58,6 @@ import http.server
 import socketserver
 import urllib.parse
 import threading
-import webbrowser
 
 
 # ==============================================================================
@@ -238,7 +237,7 @@ RANKS: List[Rank] = [
     Rank("commodore", "Commodore", 150_000, "✦",
          "Reputation gains +50% · bounty rewards +15%"),
     Rank("admiral", "Admiral", 350_000, "✦✦",
-         "+5% sell · 3% cheaper buys · loan interest -40% · insurance -25%"),
+         "+8% sell · 5% cheaper buys · loan interest -40% · insurance -25%"),
 ]
 
 
@@ -2611,7 +2610,6 @@ class GameEngine:
     def compute_best_trade_routes(self, from_current_only: bool = False) -> List[Dict[str, Any]]:
         routes: List[Dict[str, Any]] = []
         planets_list = list(self.planets.values())
-        my_ship = SHIP_TEMPLATES[self.player.ship_id]
 
         for gid, comm in COMMODITIES.items():
             for src in planets_list:
@@ -2626,7 +2624,6 @@ class GameEngine:
                     if margin <= 3:
                         continue
 
-                    dist = self.calculate_distance(src, dst)
                     fuel_units, _days = self.calculate_travel_cost_between(src, dst)
                     fuel_credit_estimate = fuel_units * max(
                         4, int(src.fuel_price * self.difficulty.fuel_mult))
@@ -4513,6 +4510,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <div style="font-size: 12px; color: var(--fg-dim);">
               Lock-on anti-ship ordnance bypassing kinetic energy shields.
             </div>
+            <div style="font-size: 12px; color: var(--fg-dim);">
+              Torpedo Price: <strong id="depot-missiles-price" style="color: var(--red);">400</strong> CR each
+            </div>
             <div style="font-size: 13px;">Magazine: <span id="depot-missiles-count">0</span> / 8 Torpedoes</div>
             <div style="display: flex; gap: 8px; margin-top: auto;">
               <button class="btn-action-sm btn-buy" onclick="buyMissiles(1)">Arm 1 Torpedo</button>
@@ -5675,7 +5675,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const cp = gameState.current_planet;
 
       document.getElementById('services-sub').textContent = `Spaceport Facilities at ${cp.name}`;
-      document.getElementById('depot-fuel-price').textContent = cp.fuel_price;
+      document.getElementById('depot-fuel-price').textContent = p.fuel_unit_price;
       document.getElementById('depot-fuel-current').textContent = p.fuel;
       document.getElementById('depot-fuel-max').textContent = p.max_fuel;
 
@@ -5685,9 +5685,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       const hasDamaged = p.weapons_damaged || p.engines_damaged || p.shields_damaged;
       document.getElementById('depot-subsystem-status').textContent = hasDamaged ? 'MALFUNCTION: Damaged systems detected.' : 'All subsystems nominal.';
-      document.getElementById('btn-repair-subsystems').disabled = !hasDamaged;
+      const subBtn = document.getElementById('btn-repair-subsystems');
+      subBtn.disabled = !hasDamaged;
+      subBtn.textContent = `Overhaul Damaged Modules (${p.subsystem_repair_cost.toLocaleString()} CR)`;
 
       document.getElementById('depot-missiles-count').textContent = p.missiles;
+      document.getElementById('depot-missiles-price').textContent = p.missile_price;
 
       const insStatus = document.getElementById('depot-insurance-status');
       const insBtn = document.getElementById('btn-buy-insurance');
@@ -6551,6 +6554,10 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "missiles": player.missiles,
             "max_missiles": PLAYER_MISSILE_CAP,
             "missile_price": engine.missile_price(),
+            "fuel_unit_price": max(1, int(
+                current_p.fuel_price * engine.difficulty.fuel_mult
+                * (1.0 - RANK_SERVICE_DISCOUNT[engine.rank_index()])
+            )),
             "insurance_active": player.insurance_active,
             "insurance_price": engine.insurance_price(),
             "weapons_damaged": player.weapons_damaged,
@@ -6581,7 +6588,7 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "shield_slots": ship_tmpl.shield_slots,
             "module_slots": ship_tmpl.module_slots,
             "hired_crew": player.hired_crew,
-            "total_daily_wages": engine.total_daily_wages(),
+            "total_daily_wages": int(engine.total_daily_wages()),
             "active_missions": active_missions,
             "stocks_owned": player.stocks_owned,
             "achievements": list(player.achievements),
@@ -6768,7 +6775,6 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
 
         with GLOBAL_SESSION.lock:
             engine = GLOBAL_SESSION.engine
-            player = engine.player
 
             if action == "new_game":
                 name = str(data.get("name", "Commander")).strip() or "Commander"
@@ -7109,11 +7115,11 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 # ==============================================================================
-# ENGINE SELF-TEST SUITE & RUNNER (16 Subsystems Headless Verification)
+# ENGINE SELF-TEST SUITE & RUNNER (21-suite headless verification)
 # ==============================================================================
 
 def run_self_test() -> None:
-    """Headless verification of the entire engine with the full 16-suite verification."""
+    """Headless verification of the entire engine with the full 21-suite verification."""
     print("=" * 76)
     print("SPACE TRADER: ODYSSEY — NEBULA EDITION · SELF-TEST SUITE")
     print("=" * 76)
