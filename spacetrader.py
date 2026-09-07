@@ -1205,6 +1205,7 @@ class Player:
     shields_damaged: bool = False
     highest_rank_index: int = 0
     cargo: Dict[str, int] = field(default_factory=dict)
+    cargo_cost_basis: Dict[str, float] = field(default_factory=dict)
     equipped_weapons: List[str] = field(default_factory=lambda: ["laser_1"])
     equipped_shields: List[str] = field(default_factory=lambda: ["shield_1"])
     equipped_modules: List[str] = field(default_factory=list)
@@ -1768,6 +1769,13 @@ class GameEngine:
 
         self.player.credits -= total_cost
         p.stock[good] = stock - qty
+
+        # Track weighted average cost basis
+        old_qty = self.player.cargo.get(good, 0)
+        old_basis = self.player.cargo_cost_basis.get(good, float(price))
+        new_basis = (old_qty * old_basis + qty * price) / max(1, old_qty + qty)
+        self.player.cargo_cost_basis[good] = round(new_basis, 2)
+
         added = self.player.add_cargo(good, qty)
         self._price_impact(good, qty, "buy")
         self.sound.play("buy")
@@ -1787,8 +1795,15 @@ class GameEngine:
 
         price = self.get_sell_price(good)
         total_income = price * qty
+        basis = self.player.cargo_cost_basis.get(good, float(price))
+        unit_profit = price - basis
+        total_profit = int(round(unit_profit * qty))
+        pct_return = (unit_profit / max(1.0, basis)) * 100.0
 
         self.player.remove_cargo(good, qty)
+        if self.player.cargo.get(good, 0) <= 0:
+            self.player.cargo_cost_basis.pop(good, None)
+
         self.player.credits += total_income
         self.current_planet.stock[good] = self.current_planet.stock.get(good, 0) + qty
         self._price_impact(good, qty, "sell")
@@ -1799,7 +1814,8 @@ class GameEngine:
 
         self.sound.play("sell")
         self.check_achievements()
-        msg = f"Sold {qty}x {COMMODITIES[good].name} for {money(total_income)} CR."
+        profit_tag = f" (Profit: {('+' if total_profit >= 0 else '')}{money(total_profit)} CR, {pct_return:+.1f}%)" if basis > 0 else ""
+        msg = f"Sold {qty}x {COMMODITIES[good].name} for {money(total_income)} CR{profit_tag}."
         self.announce(msg)
         return True, msg
 
@@ -2005,6 +2021,34 @@ class GameEngine:
         self.announce(msg)
         return True, msg
 
+    def sell_equipment(self, eq_id: str) -> Tuple[bool, str]:
+        if eq_id not in EQUIPMENT_ITEMS:
+            return False, "Invalid equipment item."
+
+        eq = EQUIPMENT_ITEMS[eq_id]
+        removed = False
+
+        if eq_id in self.player.equipped_weapons:
+            self.player.equipped_weapons.remove(eq_id)
+            removed = True
+        elif eq_id in self.player.equipped_shields:
+            self.player.equipped_shields.remove(eq_id)
+            removed = True
+        elif eq_id in self.player.equipped_modules:
+            self.player.equipped_modules.remove(eq_id)
+            removed = True
+
+        if not removed:
+            return False, f"{eq.name} is not installed on your ship."
+
+        refund = int(eq.cost * 0.75)
+        self.player.credits += refund
+        self.recalculate_ship_stats()
+        self.sound.play("sell")
+        msg = f"Dismounted {eq.name} and received {money(refund)} CR salvage value."
+        self.announce(msg)
+        return True, msg
+
     def hire_crew(self, crew_id: str) -> Tuple[bool, str]:
         c = CREW_INDEX.get(crew_id)
         if not c:
@@ -2061,6 +2105,23 @@ class GameEngine:
                 self.announce(msg)
                 return True, msg
         return False, "Mission no longer available."
+
+    def abandon_mission(self, mission_id: str) -> Tuple[bool, str]:
+        for m in list(self.player.active_missions):
+            if m.id == mission_id:
+                if m.cargo_good and m.cargo_qty > 0:
+                    self.player.remove_cargo(m.cargo_good, m.cargo_qty)
+                self.player.active_missions.remove(m)
+                dest_p = self.planets.get(m.destination)
+                rep_msg = ""
+                if dest_p:
+                    loss = self.adjust_reputation(dest_p.faction, -5)
+                    if loss:
+                        rep_msg = f" ({dest_p.faction} standing changed by {loss})"
+                msg = f"Forfeited contract '{m.title}'.{rep_msg}"
+                self.announce(msg)
+                return True, msg
+        return False, "Contract not found in active missions."
 
     def check_mission_deliveries(self) -> List[str]:
         completed_msgs: List[str] = []
@@ -2807,6 +2868,7 @@ class GameEngine:
                 "shields_damaged": self.player.shields_damaged,
                 "highest_rank_index": self.player.highest_rank_index,
                 "cargo": self.player.cargo,
+                "cargo_cost_basis": self.player.cargo_cost_basis,
                 "equipped_weapons": self.player.equipped_weapons,
                 "equipped_shields": self.player.equipped_shields,
                 "equipped_modules": self.player.equipped_modules,
@@ -2930,6 +2992,10 @@ class GameEngine:
             self.player.highest_rank_index = int(p_data.get("highest_rank_index", 0))
             self.player.cargo = {
                 g: int(q) for g, q in dict(p_data.get("cargo", {})).items()
+                if g in COMMODITIES
+            }
+            self.player.cargo_cost_basis = {
+                g: float(b) for g, b in dict(p_data.get("cargo_cost_basis", {})).items()
                 if g in COMMODITIES
             }
             self.player.equipped_weapons = list(p_data.get("equipped_weapons", ["laser_1"]))
@@ -4083,6 +4149,63 @@ HTML_PAGE = r"""<!DOCTYPE html>
       padding: 24px;
       box-shadow: 0 0 40px rgba(255, 82, 82, 0.2);
     }
+    @keyframes flightDash {
+      to { stroke-dashoffset: -20; }
+    }
+    .flight-vector {
+      stroke-dasharray: 6 4;
+      animation: flightDash 1.2s linear infinite;
+    }
+    .dmg-float {
+      position: absolute;
+      font-family: var(--font-mono);
+      font-weight: 800;
+      font-size: 14px;
+      text-shadow: 0 2px 8px rgba(0,0,0,0.8);
+      animation: floatUpFade 1.4s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+      pointer-events: none;
+    }
+    @keyframes floatUpFade {
+      0% { opacity: 1; transform: translateY(0) scale(1); }
+      50% { transform: translateY(-22px) scale(1.1); }
+      100% { opacity: 0; transform: translateY(-44px) scale(0.9); }
+    }
+    .shake-anim {
+      animation: shipShake 0.4s ease;
+    }
+    @keyframes shipShake {
+      0%, 100% { transform: translate(0, 0); }
+      20% { transform: translate(-5px, 3px); }
+      40% { transform: translate(5px, -3px); }
+      60% { transform: translate(-3px, -2px); }
+      80% { transform: translate(3px, 2px); }
+    }
+    .laser-beam {
+      stroke-dasharray: 400;
+      stroke-dashoffset: 400;
+      animation: beamShoot 0.4s ease-out forwards;
+    }
+    @keyframes beamShoot {
+      to { stroke-dashoffset: 0; }
+    }
+    .hardpoint-slot {
+      background: var(--bg2);
+      border: 1px dashed var(--panel-border-hi);
+      border-radius: 6px;
+      padding: 10px 14px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .hardpoint-mounted {
+      background: var(--panel);
+      border: 1px solid var(--panel-border-hi);
+      border-radius: 6px;
+      padding: 10px 14px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
 
     /* Generic Modal */
     .generic-modal {
@@ -4317,6 +4440,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <div id="dossier-scan-list" style="display: flex; flex-direction: column; gap: 3px;"></div>
           </div>
 
+          <div id="dossier-missions-box" style="display: none; background: var(--gold-dim); border: 1px solid var(--gold); border-radius: 6px; padding: 10px; font-size: 12px;">
+            <strong style="color: var(--gold);">📜 Active Contract Destination</strong>
+            <div id="dossier-missions-list" style="margin-top: 4px; display: flex; flex-direction: column; gap: 4px;"></div>
+          </div>
+
           <button id="dossier-btn-engage" class="dossier-btn-engage" disabled onclick="executeTravel()">
             ⚡ Engage Hyperdrive
           </button>
@@ -4425,6 +4553,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <!-- 4. SHIPYARD & OUTFITTER VIEW -->
     <div id="view-shipyard" class="view-container">
+      <!-- Active Vessel Hardpoint Matrix -->
+      <div class="panel-card" style="margin-bottom: 20px;">
+        <div class="panel-card-header">
+          <div>
+            <div class="panel-card-title">🛸 Active Vessel Hardpoints & Installed Systems</div>
+            <div class="panel-card-subtitle" id="hardpoint-ship-subtitle">Current Vessel Configuration</div>
+          </div>
+        </div>
+        <div class="grid-3" id="hardpoint-matrix-container">
+          <!-- Populated dynamically with weapons, shields, and modules -->
+        </div>
+      </div>
+
       <div class="grid-2">
         <!-- Shipyard Catalog -->
         <div class="panel-card">
@@ -4751,6 +4892,37 @@ HTML_PAGE = r"""<!DOCTYPE html>
           </div>
         </div>
         <span id="combat-turn-counter" class="pill pill-red">Turn 1</span>
+      </div>
+
+      <!-- Holographic Tactical Combat Stage -->
+      <div id="combat-holo-arena" style="position: relative; height: 160px; background: radial-gradient(circle at center, rgba(14,28,70,0.8) 0%, rgba(4,8,28,0.98) 100%); border: 1px solid var(--panel-border); border-radius: 8px; margin-bottom: 16px; overflow: hidden; display: flex; align-items: center; justify-content: space-between; padding: 0 44px;">
+        <!-- Player ship hologram SVG -->
+        <div id="holo-player-ship" class="holo-vessel holo-player" style="display: flex; flex-direction: column; align-items: center; z-index: 2; transition: transform 0.2s;">
+          <svg width="68" height="68" viewBox="0 0 100 100">
+            <polygon points="50,15 85,80 50,65 15,80" fill="rgba(0, 229, 255, 0.15)" stroke="var(--cyan)" stroke-width="3" stroke-linejoin="round" />
+            <polygon points="50,25 75,75 50,62 25,75" fill="none" stroke="var(--blue)" stroke-width="1.5" />
+            <circle cx="50" cy="50" r="42" fill="none" stroke="rgba(0, 229, 255, 0.5)" stroke-dasharray="4 3" id="holo-player-shield-ring" />
+          </svg>
+          <span style="font-size: 10px; font-weight: 700; color: var(--cyan); margin-top: 2px;">YOUR VESSEL</span>
+        </div>
+
+        <!-- Dynamic Laser / Projectile Overlay -->
+        <svg id="holo-fx-overlay" style="position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 3;">
+          <!-- Laser beams and projectile bursts injected dynamically -->
+        </svg>
+
+        <!-- Floating Damage / Status Callouts -->
+        <div id="holo-float-text" style="position: absolute; inset: 0; pointer-events: none; z-index: 4;"></div>
+
+        <!-- Enemy ship hologram SVG -->
+        <div id="holo-enemy-ship" class="holo-vessel holo-enemy" style="display: flex; flex-direction: column; align-items: center; z-index: 2; transition: transform 0.2s;">
+          <svg width="68" height="68" viewBox="0 0 100 100">
+            <polygon points="50,85 15,20 50,35 85,20" fill="rgba(255, 82, 82, 0.15)" stroke="var(--red)" stroke-width="3" stroke-linejoin="round" />
+            <polygon points="50,75 25,25 50,38 75,25" fill="none" stroke="var(--purple)" stroke-width="1.5" />
+            <circle cx="50" cy="50" r="42" fill="none" stroke="rgba(255, 82, 82, 0.5)" stroke-dasharray="4 3" id="holo-enemy-shield-ring" />
+          </svg>
+          <span id="holo-enemy-label" style="font-size: 10px; font-weight: 700; color: var(--red); margin-top: 2px;">HOSTILE TARGET</span>
+        </div>
       </div>
 
       <!-- Combat Vitals Duel -->
@@ -5347,6 +5519,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
           fill="rgba(0, 229, 255, 0.04)" stroke="rgba(0, 229, 255, 0.35)" stroke-dasharray="6 4" stroke-width="1.5" />
       `;
 
+      // Animated Flight Vector to Selected Planet
+      if (selP && selP.name !== cp.name) {
+        html += `
+          <line x1="${mapX(cp.x)}" y1="${mapY(cp.y)}" x2="${mapX(selP.x)}" y2="${mapY(selP.y)}" 
+            stroke="var(--gold)" stroke-width="2.5" class="flight-vector" />
+        `;
+      }
+
       // Planet Nodes
       planets.forEach(p => {
         const px = mapX(p.x), py = mapY(p.y);
@@ -5360,6 +5540,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const strokeColor = isSelected ? 'var(--cyan)' : (isCurrent ? 'var(--green)' : 'rgba(255,255,255,0.4)');
         const strokeWidth = isSelected ? '3' : '1.5';
         const nodeRadius = isCurrent ? 12 : 9;
+        const hasMissions = p.active_missions && p.active_missions.length > 0;
 
         html += `
           <g class="map-planet-node" onclick="selectPlanet('${escJs(p.name)}')">
@@ -5369,6 +5550,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
               ${p.name}
             </text>
             ${p.active_event ? `<text x="${px}" y="${py - 14}" text-anchor="middle" fill="var(--gold)" font-size="10">⚡</text>` : ''}
+            ${hasMissions ? `<text x="${px + 12}" y="${py - 10}" text-anchor="middle" font-size="11">📜</text>` : ''}
           </g>
         `;
       });
@@ -5399,6 +5581,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
         document.getElementById('dossier-event-desc').textContent = planet.active_event.desc;
       } else {
         eventBox.style.display = 'none';
+      }
+
+      // Active Contract Dossier Callout
+      const misBox = document.getElementById('dossier-missions-box');
+      const misList = document.getElementById('dossier-missions-list');
+      if (misBox && misList) {
+        if (planet.active_missions && planet.active_missions.length > 0) {
+          misBox.style.display = 'block';
+          misList.innerHTML = planet.active_missions.map(m => `
+            <div style="font-size: 11px; display: flex; justify-content: space-between;">
+              <span style="color: var(--fg);">${m.title}</span>
+              <strong style="color: var(--green); font-family: var(--font-mono);">+${m.reward_credits.toLocaleString()} CR</strong>
+            </div>
+          `).join('');
+        } else {
+          misBox.style.display = 'none';
+        }
       }
 
       // Deep Space Scanner readout (module-gated remote market intel)
@@ -5490,7 +5689,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <polyline points="${sparkCoords}" fill="none" stroke="${trendColor}" stroke-width="2" />
               </svg>
             </td>
-            <td><strong style="color: var(--cyan);">${g.player_qty}</strong> T</td>
+            <td>
+              <strong style="color: var(--cyan);">${g.player_qty}</strong> T
+              ${g.player_qty > 0 && g.cost_basis > 0 ? `<div style="font-size: 10px; color: ${g.unit_profit >= 0 ? 'var(--green)' : 'var(--red)'}; font-family: var(--font-mono);">${g.unit_profit >= 0 ? '+' : ''}${g.unit_profit} (${g.profit_pct >= 0 ? '+' : ''}${g.profit_pct}%)</div>` : ''}
+            </td>
             <td>
               <div style="display: flex; gap: 4px;">
                 <button class="btn-action-sm btn-buy" ${!g.can_buy ? 'disabled' : ''} onclick="openTradeModal('${g.id}', 'buy')">Buy</button>
@@ -5588,7 +5790,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <span class="pill ${c.is_contraband ? 'pill-red' : 'pill-cyan'}" style="font-size: 10px;">${c.qty} T</span>
             </div>
             <div style="font-size: 11px; color: var(--fg-dim);">Sell here: <strong style="color: var(--gold);">${c.sell_price} CR</strong>/unit</div>
-            <div style="font-size: 11px; color: var(--fg-dim);">Value: <strong style="color: var(--gold);">${c.total_value.toLocaleString()} CR</strong></div>
+            <div style="font-size: 11px; color: var(--fg-dim);">
+              Cost: <strong style="color: var(--fg);">${c.cost_basis} CR</strong> · P/L: <strong style="color: ${c.total_profit >= 0 ? 'var(--green)' : 'var(--red)'}; font-family: var(--font-mono);">${c.total_profit >= 0 ? '+' : ''}${c.total_profit.toLocaleString()} CR (${c.profit_pct >= 0 ? '+' : ''}${c.profit_pct}%)</strong>
+            </div>
+            <div style="font-size: 11px; color: var(--fg-dim);">Total Value: <strong style="color: var(--gold); font-family: var(--font-mono);">${c.total_value.toLocaleString()} CR</strong></div>
             <button class="btn-action-sm btn-sell" style="margin-top: 8px; width: 100%;" onclick="openTradeModal('${c.id}', 'sell')">Sell All</button>
           </div>
         `;
@@ -5632,6 +5837,88 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // --- Shipyard & Outfitter ---
     function renderShipyard() {
       if (!gameState) return;
+      const p = gameState.player;
+      
+      // Hardpoints Matrix
+      const matrixContainer = document.getElementById('hardpoint-matrix-container');
+      if (matrixContainer) {
+        document.getElementById('hardpoint-ship-subtitle').textContent = 
+          `${p.ship_name} [${p.ship_class}] · Hardpoints: ${p.weapon_slots} Weapon, ${p.shield_slots} Shield, ${p.module_slots} Module Bays`;
+        
+        let mHtml = '';
+        // Weapons Column
+        mHtml += `
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 10px;">
+            <div style="font-weight: 700; color: var(--red); font-size: 14px;">⚡ Weapon Mounts (${(p.equipped_weapons || []).length}/${p.weapon_slots})</div>
+        `;
+        const wepDetails = p.equipped_weapons_detail || [];
+        wepDetails.forEach(w => {
+          mHtml += `
+            <div class="hardpoint-mounted">
+              <div>
+                <div style="font-weight: 700; color: var(--fg); font-size: 13px;">${w.name}</div>
+                <div style="font-size: 11px; color: var(--fg-dim);">Dmg: ${w.damage} · Acc: ${w.accuracy}%</div>
+              </div>
+              <button class="btn-action-sm btn-sell" onclick="sendAction('sell_equipment', { eq_id: '${w.id}' })">Dismount (+${w.refund_val.toLocaleString()} CR)</button>
+            </div>
+          `;
+        });
+        const openWeps = p.weapon_slots - wepDetails.length;
+        for (let i = 0; i < openWeps; i++) {
+          mHtml += `<div class="hardpoint-slot"><span style="color: var(--fg-dark); font-size: 12px;">[ Empty Weapon Hardpoint ]</span></div>`;
+        }
+        mHtml += `</div>`;
+
+        // Shields Column
+        mHtml += `
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 10px;">
+            <div style="font-weight: 700; color: var(--cyan); font-size: 14px;">🛡️ Shield Generators (${(p.equipped_shields || []).length}/${p.shield_slots})</div>
+        `;
+        const shdDetails = p.equipped_shields_detail || [];
+        shdDetails.forEach(s => {
+          mHtml += `
+            <div class="hardpoint-mounted">
+              <div>
+                <div style="font-weight: 700; color: var(--fg); font-size: 13px;">${s.name}</div>
+                <div style="font-size: 11px; color: var(--fg-dim);">Cap: +${s.shield_hp} HP</div>
+              </div>
+              <button class="btn-action-sm btn-sell" onclick="sendAction('sell_equipment', { eq_id: '${s.id}' })">Dismount (+${s.refund_val.toLocaleString()} CR)</button>
+            </div>
+          `;
+        });
+        const openShds = p.shield_slots - shdDetails.length;
+        for (let i = 0; i < openShds; i++) {
+          mHtml += `<div class="hardpoint-slot"><span style="color: var(--fg-dark); font-size: 12px;">[ Empty Shield Bay ]</span></div>`;
+        }
+        mHtml += `</div>`;
+
+        // Modules Column
+        mHtml += `
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 10px;">
+            <div style="font-weight: 700; color: var(--purple); font-size: 14px;">⚙️ Utility Modules (${(p.equipped_modules || []).length}/${p.module_slots})</div>
+        `;
+        const modDetails = p.equipped_modules_detail || [];
+        modDetails.forEach(m => {
+          mHtml += `
+            <div class="hardpoint-mounted">
+              <div>
+                <div style="font-weight: 700; color: var(--fg); font-size: 13px;">${m.name}</div>
+                <div style="font-size: 11px; color: var(--fg-dim);">${m.desc.slice(0, 32)}...</div>
+              </div>
+              <button class="btn-action-sm btn-sell" onclick="sendAction('sell_equipment', { eq_id: '${m.id}' })">Dismount (+${m.refund_val.toLocaleString()} CR)</button>
+            </div>
+          `;
+        });
+        const openMods = p.module_slots - modDetails.length;
+        for (let i = 0; i < openMods; i++) {
+          mHtml += `<div class="hardpoint-slot"><span style="color: var(--fg-dark); font-size: 12px;">[ Empty Module Bay ]</span></div>`;
+        }
+        mHtml += `</div>`;
+
+        matrixContainer.innerHTML = mHtml;
+      }
+
+      // Shipyard
       const sContainer = document.getElementById('shipyard-cards');
       let html = '';
       gameState.all_ships.forEach(s => {
@@ -5672,7 +5959,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </div>
             <div style="text-align: right; margin-left: 14px;">
               <div style="font-family: var(--font-mono); font-size: 13px; font-weight: 700; color: var(--gold); margin-bottom: 4px;">${eq.cost.toLocaleString()} CR</div>
-              ${eq.is_equipped ? '<span class="pill pill-green">INSTALLED</span>' : `<button class="btn-action-sm btn-buy" ${!eq.can_afford ? 'disabled' : ''} onclick="sendAction('buy_equipment', { eq_id: '${eq.id}' })">Equip</button>`}
+              ${eq.is_equipped ? `<button class="btn-action-sm btn-sell" onclick="sendAction('sell_equipment', { eq_id: '${eq.id}' })">Dismount (+${eq.refund_val.toLocaleString()} CR)</button>` : `<button class="btn-action-sm btn-buy" ${!eq.can_afford ? 'disabled' : ''} onclick="sendAction('buy_equipment', { eq_id: '${eq.id}' })">Equip</button>`}
             </div>
           </div>
         `;
@@ -5784,14 +6071,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
         actHtml += `
           <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center;">
             <div>
-              <div style="font-weight: 700; color: var(--gold);">${m.title}</div>
-              <div style="font-size: 11px; color: var(--fg-dim);">${m.m_type === 'bounty' ? 'Hunt target near' : 'Deliver to'} <strong>${m.destination}</strong></div>
-              <div style="font-size: 11px; color: ${m.days_left <= 2 ? 'var(--red)' : 'var(--fg)'};">
+              <div style="font-weight: 700; color: var(--gold); font-size: 14px;">${m.title}</div>
+              <div style="font-size: 11px; color: var(--fg-dim); margin-top: 2px;">
+                ${m.m_type === 'bounty' ? 'Hunt target near' : 'Destination:'} <strong style="color: var(--cyan);">${m.destination}</strong> · Reward: <strong style="color: var(--green); font-family: var(--font-mono);">${m.reward_credits.toLocaleString()} CR</strong>
+              </div>
+              <div style="font-size: 11px; color: ${m.days_left <= 2 ? 'var(--red)' : 'var(--fg)'}; margin-top: 2px;">
                 Remaining Time: ${m.days_left} Days
               </div>
             </div>
-            <div>
-              ${canDeliver && m.m_type !== 'bounty' ? `<span class="pill pill-green">Delivered upon arrival!</span>` : `<span class="pill pill-cyan">In Transit</span>`}
+            <div style="display: flex; gap: 8px; align-items: center;">
+              ${canDeliver && m.m_type !== 'bounty' ? `<span class="pill pill-green">Ready to Deliver</span>` : `<button class="btn-action-sm btn-buy" onclick="selectPlanet('${escJs(m.destination)}'); switchTab('map');">Plot Course</button>`}
+              <button class="btn-action-sm btn-sell" onclick="sendAction('abandon_mission', { mission_id: '${m.id}' })">Forfeit</button>
             </div>
           </div>
         `;
@@ -6029,9 +6319,79 @@ HTML_PAGE = r"""<!DOCTYPE html>
         actBar.style.display = 'grid';
         resBox.style.display = 'none';
       }
+
+      // Holographic Combat Stage Updates
+      const pHoloRing = document.getElementById('holo-player-shield-ring');
+      if (pHoloRing) pHoloRing.style.opacity = p.max_shield > 0 ? (p.shield / p.max_shield) : 0;
+      const eHoloRing = document.getElementById('holo-enemy-shield-ring');
+      if (eHoloRing) eHoloRing.style.opacity = c.enemy_max_shield > 0 ? (c.enemy_shield / c.enemy_max_shield) : 0;
+      const eHoloLabel = document.getElementById('holo-enemy-label');
+      if (eHoloLabel) eHoloLabel.textContent = c.enemy_name || 'HOSTILE TARGET';
+    }
+
+    function triggerCombatFx(actionType) {
+      const arena = document.getElementById('combat-holo-arena');
+      const overlay = document.getElementById('holo-fx-overlay');
+      const floatBox = document.getElementById('holo-float-text');
+      const enemyShip = document.getElementById('holo-enemy-ship');
+      const playerShip = document.getElementById('holo-player-ship');
+      if (!arena || !overlay) return;
+
+      const w = arena.clientWidth || 600;
+      const h = arena.clientHeight || 160;
+
+      if (actionType === 'fire' || actionType.startsWith('target_')) {
+        // High-energy laser pulse from player to enemy
+        overlay.innerHTML = `
+          <line x1="110" y1="${h / 2}" x2="${w - 110}" y2="${h / 2}" stroke="#00e5ff" stroke-width="3" class="laser-beam" stroke-linecap="round" />
+          <line x1="110" y1="${h / 2 - 8}" x2="${w - 110}" y2="${h / 2 - 8}" stroke="#7986cb" stroke-width="2" class="laser-beam" stroke-linecap="round" />
+        `;
+        setTimeout(() => {
+          if (enemyShip) {
+            enemyShip.classList.add('shake-anim');
+            setTimeout(() => enemyShip.classList.remove('shake-anim'), 400);
+          }
+          if (floatBox) {
+            const el = document.createElement('div');
+            el.className = 'dmg-float dmg-red';
+            el.style.right = '60px';
+            el.style.top = '25px';
+            el.textContent = actionType === 'fire' ? 'DIRECT HIT!' : 'SUBSYSTEM CRIT!';
+            floatBox.appendChild(el);
+            setTimeout(() => el.remove(), 1300);
+          }
+        }, 120);
+        setTimeout(() => { overlay.innerHTML = ''; }, 500);
+      } else if (actionType === 'missile') {
+        overlay.innerHTML = `
+          <line x1="110" y1="${h / 2 + 10}" x2="${w - 110}" y2="${h / 2}" stroke="#ffab00" stroke-width="4" stroke-dasharray="8 4" class="laser-beam" />
+        `;
+        setTimeout(() => {
+          if (enemyShip) {
+            enemyShip.classList.add('shake-anim');
+            setTimeout(() => enemyShip.classList.remove('shake-anim'), 400);
+          }
+          if (floatBox) {
+            const el = document.createElement('div');
+            el.className = 'dmg-float dmg-red';
+            el.style.right = '60px';
+            el.style.top = '20px';
+            el.textContent = '💥 TORPEDO DETONATION!';
+            floatBox.appendChild(el);
+            setTimeout(() => el.remove(), 1300);
+          }
+        }, 150);
+        setTimeout(() => { overlay.innerHTML = ''; }, 500);
+      } else if (actionType === 'flee') {
+        if (playerShip) {
+          playerShip.style.transform = 'scale(0.8) translateX(-20px)';
+          setTimeout(() => { playerShip.style.transform = ''; }, 500);
+        }
+      }
     }
 
     function sendCombatAction(combat_action) {
+      triggerCombatFx(combat_action);
       sendAction('combat_action', { combat_action });
     }
 
@@ -6297,6 +6657,9 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
         if qty > 0 and gid in COMMODITIES:
             comm = COMMODITIES[gid]
             sell_price = engine.get_sell_price(gid)
+            cost_basis = player.cargo_cost_basis.get(gid, float(sell_price))
+            unit_profit = sell_price - cost_basis
+            profit_pct = round((unit_profit / max(1.0, cost_basis)) * 100.0, 1)
             cargo_detail.append({
                 "id": gid,
                 "name": comm.name,
@@ -6304,6 +6667,10 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
                 "qty": qty,
                 "base_price": comm.base_price,
                 "sell_price": sell_price,
+                "cost_basis": round(cost_basis, 1),
+                "unit_profit": round(unit_profit, 1),
+                "profit_pct": profit_pct,
+                "total_profit": int(round(unit_profit * qty)),
                 "total_value": sell_price * qty,
                 "is_contraband": comm.is_contraband,
                 "desc": comm.desc,
@@ -6346,6 +6713,10 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
     for p in engine.planets.values():
         dist = engine.calculate_distance(current_p, p)
         fuel_cost, days_cost = engine.calculate_travel_cost(p)
+        active_missions_here = [
+            {"id": m.id, "title": m.title, "type": m.m_type, "reward": m.reward_credits, "days_left": m.days_left}
+            for m in player.active_missions if m.destination == p.name
+        ]
         all_planets.append({
             "name": p.name,
             "subtitle": p.subtitle,
@@ -6368,6 +6739,7 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "days_cost": days_cost,
             "in_range": player.fuel >= fuel_cost,
             "is_current": p.name == current_p.name,
+            "active_missions": active_missions_here,
             "remote_deals": engine.remote_top_deals(p) if has_scanner else None,
         })
 
@@ -6393,6 +6765,10 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
         avg_price = sum(history) / len(history) if history else comm.base_price
         pct_diff = round(((buy_p - comm.base_price) / max(1, comm.base_price)) * 100.0, 1)
 
+        p_cost_basis = round(player.cargo_cost_basis.get(gid, 0.0), 1) if p_qty > 0 else 0.0
+        p_unit_profit = round(sell_p - p_cost_basis, 1) if (p_qty > 0 and p_cost_basis > 0) else 0.0
+        p_profit_pct = round((p_unit_profit / max(1.0, p_cost_basis)) * 100.0, 1) if (p_qty > 0 and p_cost_basis > 0) else 0.0
+
         market_items.append({
             "id": gid,
             "name": comm.name,
@@ -6402,6 +6778,9 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "sell_price": sell_p,
             "stock": stock_qty,
             "player_qty": p_qty,
+            "cost_basis": p_cost_basis,
+            "unit_profit": p_unit_profit,
+            "profit_pct": p_profit_pct,
             "trend": trend,
             "price_history": history,
             "is_contraband": comm.is_contraband,
@@ -6451,6 +6830,7 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "name": eq.name,
             "slot_type": eq.slot_type,
             "cost": eq.cost,
+            "refund_val": int(eq.cost * 0.75),
             "damage": eq.damage,
             "shield_hp": eq.shield_hp,
             "accuracy": eq.accuracy,
@@ -6596,6 +6976,40 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "equipped_weapons": player.equipped_weapons,
             "equipped_shields": player.equipped_shields,
             "equipped_modules": player.equipped_modules,
+            "equipped_weapons_detail": [
+                {
+                    "id": eq_id,
+                    "name": EQUIPMENT_ITEMS[eq_id].name,
+                    "cost": EQUIPMENT_ITEMS[eq_id].cost,
+                    "refund_val": int(EQUIPMENT_ITEMS[eq_id].cost * 0.75),
+                    "damage": EQUIPMENT_ITEMS[eq_id].damage,
+                    "accuracy": EQUIPMENT_ITEMS[eq_id].accuracy,
+                    "crit_chance": EQUIPMENT_ITEMS[eq_id].crit_chance,
+                    "desc": EQUIPMENT_ITEMS[eq_id].desc,
+                }
+                for eq_id in player.equipped_weapons if eq_id in EQUIPMENT_ITEMS
+            ],
+            "equipped_shields_detail": [
+                {
+                    "id": eq_id,
+                    "name": EQUIPMENT_ITEMS[eq_id].name,
+                    "cost": EQUIPMENT_ITEMS[eq_id].cost,
+                    "refund_val": int(EQUIPMENT_ITEMS[eq_id].cost * 0.75),
+                    "shield_hp": EQUIPMENT_ITEMS[eq_id].shield_hp,
+                    "desc": EQUIPMENT_ITEMS[eq_id].desc,
+                }
+                for eq_id in player.equipped_shields if eq_id in EQUIPMENT_ITEMS
+            ],
+            "equipped_modules_detail": [
+                {
+                    "id": eq_id,
+                    "name": EQUIPMENT_ITEMS[eq_id].name,
+                    "cost": EQUIPMENT_ITEMS[eq_id].cost,
+                    "refund_val": int(EQUIPMENT_ITEMS[eq_id].cost * 0.75),
+                    "desc": EQUIPMENT_ITEMS[eq_id].desc,
+                }
+                for eq_id in player.equipped_modules if eq_id in EQUIPMENT_ITEMS
+            ],
             "weapon_slots": ship_tmpl.weapon_slots,
             "shield_slots": ship_tmpl.shield_slots,
             "module_slots": ship_tmpl.module_slots,
@@ -6997,6 +7411,15 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
                 if ok:
                     sound = "upgrade"
 
+            elif action == "sell_equipment":
+                eq_id = str(data.get("eq_id", ""))
+                ok, msg = engine.sell_equipment(eq_id)
+                success = ok
+                message = msg
+                logs.append(msg)
+                if ok:
+                    sound = "sell"
+
             elif action == "hire_crew":
                 crew_id = str(data.get("crew_id", ""))
                 ok, msg = engine.hire_crew(crew_id)
@@ -7021,6 +7444,13 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
                 logs.append(msg)
                 if ok:
                     sound = "coin"
+
+            elif action == "abandon_mission":
+                m_id = str(data.get("mission_id", ""))
+                ok, msg = engine.abandon_mission(m_id)
+                success = ok
+                message = msg
+                logs.append(msg)
 
             elif action == "bank_deposit":
                 amount = int(data.get("amount", 100))
@@ -7335,6 +7765,15 @@ def run_self_test() -> None:
         ok_eq3, _ = e_srv.buy_equipment("deep_scanner")
         check("install deep scanner", ok_eq3)
 
+        # Dismount / sell equipment
+        credits_pre_sell = e_srv.player.credits
+        ok_sell, msg_sell = e_srv.sell_equipment("flak_cannon")
+        check("dismount equipment succeeds", ok_sell)
+        check("equipment removed from ship", "flak_cannon" not in e_srv.player.equipped_weapons)
+        check("refund credits awarded", e_srv.player.credits > credits_pre_sell)
+        ok_sell_unowned, _ = e_srv.sell_equipment("flak_cannon")
+        check("selling unequipped item rejected", not ok_sell_unowned)
+
         # Crew
         ok_crew, _ = e_srv.hire_crew("vance")
         check("hire navigator", ok_crew)
@@ -7354,6 +7793,12 @@ def run_self_test() -> None:
             ok, _ = e_mis.accept_mission(deliv.id)
             check("accept delivery", ok)
             check("mission cargo loaded", e_mis.player.cargo.get(deliv.cargo_good, 0) >= deliv.cargo_qty)
+
+            # Abandon mission
+            ok_ab, msg_ab = e_mis.abandon_mission(deliv.id)
+            check("abandon contract succeeds", ok_ab)
+            check("contract removed from active missions", not any(m.id == deliv.id for m in e_mis.player.active_missions))
+            check("delivery cargo reclaimed", e_mis.player.cargo.get(deliv.cargo_good, 0) == 0)
 
         # --- 7. Travel & economy ---
         print("\n--- 7. Travel & economy ---")
