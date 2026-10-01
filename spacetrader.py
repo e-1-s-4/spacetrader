@@ -12,6 +12,7 @@ HOW TO RUN
     python3 spacetrader.py                    Start the web server and play in
                                               your browser (default port 3000)
     python3 spacetrader.py --port 8080        Serve on a custom port
+    python3 spacetrader.py --host 0.0.0.0     Expose on your LAN (default: localhost only)
     python3 spacetrader.py --test             Run the headless engine self-tests
     python3 spacetrader.py --web-test         Run the web server smoke test
     python3 spacetrader.py --difficulty easy|normal|hard|nightmare
@@ -51,6 +52,7 @@ remembered forever on the Hall of Fame board.
 from __future__ import annotations
 
 import argparse
+import copy
 import functools
 import json
 import math
@@ -59,7 +61,9 @@ import platform
 import random
 import re
 import sys
+import tempfile
 import time
+import traceback
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple, Set
 
@@ -89,6 +93,14 @@ PRICE_HISTORY_LEN = 10       # days kept per commodity for the sparkline charts
 HOF_FILENAME = "st_odyssey_scores.json"   # persistent Hall of Fame flight records
 HOF_MAX_ENTRIES = 10
 GIFT_MIN = 500               # minimum diplomatic gift
+MIN_SPREAD = 0.01            # a station always keeps at least a 1% edge per side
+IMPACT_RATE = 0.002          # market-depth: price pressure per unit traded...
+IMPACT_CAP = 0.08            # ...capped at 8% per transaction
+SAVINGS_DAILY_RATE = 0.002   # 0.2% daily on the first SAVINGS_INTEREST_CAP credits
+SAVINGS_INTEREST_CAP = 60_000
+MIN_CREDIT_SCORE = 300
+MAX_CREDIT_SCORE = 850
+MAX_INT_INPUT = 10 ** 9      # API integers are clamped to +/- this magnitude
 
 
 def sanitize_name(name: str) -> str:
@@ -97,6 +109,56 @@ def sanitize_name(name: str) -> str:
     clean = clean.replace("<", "").replace(">", "").replace('"', "'")
     clean = " ".join(clean.split())
     return clean[:24] or "Commander"
+
+
+def to_int(value: Any, lo: int = -MAX_INT_INPUT, hi: int = MAX_INT_INPUT) -> int:
+    """Strictly coerce untrusted input to a bounded int.
+
+    Accepts ints, integral-looking floats and numeric strings. Rejects bools,
+    NaN, +/-inf, containers and gibberish with ValueError, so callers never hit
+    OverflowError/TypeError surprises (``int(float('inf'))`` raises
+    OverflowError, which a plain ``except ValueError`` would miss)."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError("expected an integer")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("expected a finite number")
+        number = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        try:
+            number = int(text)
+        except ValueError:
+            try:
+                as_float = float(text)
+            except ValueError:
+                raise ValueError("expected an integer") from None
+            if not math.isfinite(as_float):
+                raise ValueError("expected a finite number") from None
+            number = int(as_float)
+    else:
+        raise ValueError("expected an integer")
+    return max(lo, min(hi, number))
+
+
+def atomic_write_json(path: str, payload: Any) -> None:
+    """Write JSON so a crash mid-write can never leave a truncated file."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".st_tmp_", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def requires_alive(method):
@@ -942,7 +1004,7 @@ AVAILABLE_CREW: List[CrewCandidate] = [
     CrewCandidate(
         "chen", "Kaelen Chen", "Trade Broker",
         4_000, 75, "trader", 0.08,
-        "Negotiates 8% better buying and selling prices across all spaceports."
+        "Haggles the station spread down by 8 points on every deal (floor: 1%)."
     ),
     CrewCandidate(
         "t800", "Unit 7-Echo (Android)", "System Specialist",
@@ -1286,6 +1348,20 @@ class Player:
 
     def cargo_free(self) -> int:
         return max(0, self.cargo_cap - self.cargo_used())
+
+    def reserved_cargo(self, good: Optional[str] = None) -> int:
+        """Units sealed in the hold for live contracts (not yours to sell)."""
+        total = 0
+        for m in self.active_missions:
+            if m.completed or m.failed or not m.cargo_good or m.cargo_qty <= 0:
+                continue
+            if good is None or m.cargo_good == good:
+                total += m.cargo_qty
+        return total
+
+    def sellable_cargo(self, good: str) -> int:
+        """Units of ``good`` that are free to sell or jettison."""
+        return max(0, self.cargo.get(good, 0) - self.reserved_cargo(good))
 
     def add_cargo(self, good: str, qty: int) -> int:
         if qty <= 0:
@@ -1715,8 +1791,9 @@ class GameEngine:
                 self.player.loan += interest
 
             if self.player.savings > 0:
-                earn = int(self.player.savings * 0.008)
-                self.player.savings += earn
+                # Modest, capped interest: idle cash must never out-earn trading.
+                eligible = min(self.player.savings, SAVINGS_INTEREST_CAP)
+                self.player.savings += int(eligible * SAVINGS_DAILY_RATE)
 
             total_wages = int(self.total_daily_wages())
             if total_wages > 0:
@@ -1803,7 +1880,13 @@ class GameEngine:
                     expired.append(m)
             for em in expired:
                 self.player.active_missions.remove(em)
-                self.add_news(f"Mission failed: contract '{em.title}' expired!")
+                lost_note = ""
+                if em.cargo_good and em.cargo_qty > 0:
+                    # Contract goods belong to the client — they are repossessed.
+                    lost = self._remove_cargo_tracked(em.cargo_good, em.cargo_qty)
+                    if lost:
+                        lost_note = f" {lost}x {COMMODITIES[em.cargo_good].name} repossessed."
+                self.add_news(f"Mission failed: contract '{em.title}' expired!{lost_note}")
 
         nw = self.calculate_net_worth()
         self.player.net_worth_history.append(nw)
@@ -1832,32 +1915,64 @@ class GameEngine:
     # ------------------------------------------------------------------ #
     # Pricing and trading
 
+    def station_spreads(self, planet: Optional[Planet] = None) -> Tuple[float, float]:
+        """(buy_spread, sell_spread): how far above / below the mid-market price
+        a station trades with you.
+
+        Trader officers, rank perks and faction goodwill all NARROW the spread
+        rather than shifting both prices the same way, and a station always
+        keeps MIN_SPREAD on each side. That guarantees sell < mid < buy, so a
+        buy-then-sell loop at one station can never turn a profit."""
+        p = planet or self.current_planet
+        base = BASE_SPREAD * self.difficulty.price_spread_mult
+        perk = self.player.has_crew_perk("trader") or 0.0
+        rep_term = clamp(self.player.rep(p.faction) / 100.0, -1.0, 1.0) * 0.05
+        idx = self.rank_index()
+        buy = max(MIN_SPREAD, base - perk - RANK_BUY_DISCOUNT[idx] - rep_term)
+        sell = max(MIN_SPREAD, base - perk - RANK_SELL_BONUS[idx] - rep_term)
+        return buy, sell
+
     def get_buy_price(self, good: str, planet: Optional[Planet] = None) -> int:
         p = planet or self.current_planet
         mid = p.market.get(good, COMMODITIES[good].base_price)
-        spread = BASE_SPREAD * self.difficulty.price_spread_mult
-        perk = self.player.has_crew_perk("trader") or 0.0
-        rank_cut = RANK_BUY_DISCOUNT[self.rank_index()]
-        rep_mult = self.reputation_price_mult(p.faction)
-        price = mid * (1.0 + spread) * (1.0 - perk) * (1.0 - rank_cut) * rep_mult
-        return max(1, int(math.ceil(price)))
+        buy_spread, _ = self.station_spreads(p)
+        return max(1, int(math.ceil(mid * (1.0 + buy_spread))))
 
     def get_sell_price(self, good: str, planet: Optional[Planet] = None) -> int:
         p = planet or self.current_planet
         mid = p.market.get(good, COMMODITIES[good].base_price)
-        spread = BASE_SPREAD * self.difficulty.price_spread_mult
-        perk = self.player.has_crew_perk("trader") or 0.0
-        rank_bonus = RANK_SELL_BONUS[self.rank_index()]
-        rep_mult = self.reputation_price_mult(p.faction)
-        price = mid * (1.0 - spread) * (1.0 + perk) * (1.0 + rank_bonus) * (2.0 - rep_mult)
-        return max(1, int(math.floor(price)))
+        _, sell_spread = self.station_spreads(p)
+        return max(1, int(math.floor(mid * (1.0 - sell_spread))))
+
+    @staticmethod
+    def market_depth_fee(unit_price: int, qty: int) -> int:
+        """Slippage for moving ``qty`` units in one go (half the price impact
+        the trade itself causes). The browser mirrors this exact formula."""
+        impact = min(IMPACT_CAP, qty * IMPACT_RATE)
+        # floor(x + 0.5): round-half-up, identical in Python and JavaScript
+        return int(math.floor(unit_price * qty * impact / 2.0 + 0.5))
+
+    def quote_buy(self, good: str, qty: int) -> int:
+        unit = self.get_buy_price(good)
+        return unit * qty + self.market_depth_fee(unit, qty)
+
+    def quote_sell(self, good: str, qty: int) -> int:
+        unit = self.get_sell_price(good)
+        return max(0, unit * qty - self.market_depth_fee(unit, qty))
+
+    def _remove_cargo_tracked(self, good: str, qty: int) -> int:
+        """Remove cargo and forget its cost basis once the hold is empty of it."""
+        removed = self.player.remove_cargo(good, qty)
+        if self.player.cargo.get(good, 0) <= 0:
+            self.player.cargo_cost_basis.pop(good, None)
+        return removed
 
     def _price_impact(self, good: str, qty: int, direction: str) -> None:
         """Local supply/demand feedback: trading nudges the market price."""
         p = self.current_planet
         comm = COMMODITIES[good]
         mid = p.market.get(good, comm.base_price)
-        impact = min(0.08, qty * 0.002)
+        impact = min(IMPACT_CAP, qty * IMPACT_RATE)
         if direction == "buy":
             mid = mid * (1.0 + impact)
         else:
@@ -1883,17 +1998,17 @@ class GameEngine:
         if qty > free_space:
             return False, f"Not enough cargo space (free: {free_space})."
 
-        total_cost = price * qty
+        total_cost = self.quote_buy(good, qty)
         if self.player.credits < total_cost:
             return False, f"Insufficient credits! Need {money(total_cost)} CR."
 
         self.player.credits -= total_cost
         p.stock[good] = stock - qty
 
-        # Track weighted average cost basis
+        # Track weighted average cost basis (including market-depth slippage)
         old_qty = self.player.cargo.get(good, 0)
         old_basis = self.player.cargo_cost_basis.get(good, float(price))
-        new_basis = (old_qty * old_basis + qty * price) / max(1, old_qty + qty)
+        new_basis = (old_qty * old_basis + total_cost) / max(1, old_qty + qty)
         self.player.cargo_cost_basis[good] = round(new_basis, 2)
 
         added = self.player.add_cargo(good, qty)
@@ -1913,17 +2028,21 @@ class GameEngine:
         owned = self.player.cargo.get(good, 0)
         if qty > owned:
             return False, f"You only have {owned}x {COMMODITIES[good].name}."
+        sellable = self.player.sellable_cargo(good)
+        if qty > sellable:
+            reserved = owned - sellable
+            return False, (
+                f"{reserved}x {COMMODITIES[good].name} is sealed for an active contract "
+                f"and cannot be sold (sellable: {sellable})."
+            )
 
         price = self.get_sell_price(good)
-        total_income = price * qty
+        total_income = self.quote_sell(good, qty)
         basis = self.player.cargo_cost_basis.get(good, float(price))
-        unit_profit = price - basis
-        total_profit = int(round(unit_profit * qty))
-        pct_return = (unit_profit / max(1.0, basis)) * 100.0
+        total_profit = int(round(total_income - basis * qty))
+        pct_return = ((total_income / qty - basis) / max(1.0, basis)) * 100.0
 
-        self.player.remove_cargo(good, qty)
-        if self.player.cargo.get(good, 0) <= 0:
-            self.player.cargo_cost_basis.pop(good, None)
+        self._remove_cargo_tracked(good, qty)
 
         self.player.credits += total_income
         self.current_planet.stock[good] = self.current_planet.stock.get(good, 0) + qty
@@ -1949,6 +2068,8 @@ class GameEngine:
 
     @requires_alive
     def buy_fuel(self, amount: int) -> Tuple[bool, str]:
+        if amount <= 0:
+            return False, "Enter an amount greater than zero."
         p = self.current_planet
         missing = self.player.max_fuel - self.player.fuel
         if missing <= 0:
@@ -1976,6 +2097,8 @@ class GameEngine:
 
     @requires_alive
     def repair_hull(self, hp: int) -> Tuple[bool, str]:
+        if hp <= 0:
+            return False, "Enter an amount greater than zero."
         missing = self.player.max_hull - self.player.hull
         if missing <= 0:
             return False, "Hull is at pristine 100% integrity."
@@ -2049,6 +2172,8 @@ class GameEngine:
     def buy_missiles(self, qty: int) -> Tuple[bool, str]:
         if not self.player.has_missile_rack():
             return False, "You need a Havoc Missile Launcher installed first."
+        if qty <= 0:
+            return False, "Enter an amount greater than zero."
         cap = PLAYER_MISSILE_CAP
         current = self.player.missiles
         qty = min(qty, cap - current)
@@ -2084,41 +2209,67 @@ class GameEngine:
 
         tmpl = SHIP_TEMPLATES[template_id]
         cur_val = self.ship_trade_in_value()
-        net_cost = max(0, tmpl.cost - cur_val)
+        # Signed on purpose: when the new hull is cheaper than your trade-in the
+        # yard pays you the difference instead of pocketing it.
+        net_cost = tmpl.cost - cur_val
 
-        if self.player.credits < net_cost:
-            return False, f"Need {money(net_cost)} CR (trade-in credited {money(cur_val)} CR)."
-
-        if self.player.cargo_used() > tmpl.cargo_cap:
-            return False, (
-                f"Current cargo ({self.player.cargo_used()}) exceeds new ship capacity "
-                f"({tmpl.cargo_cap}). Sell cargo first."
-            )
-
-        self.player.credits -= net_cost
-
-        # Equipment that will not fit the new hull is sold at standard 75%
-        # salvage value — never silently destroyed.
-        refund = 0
-        dropped: List[str] = []
+        # Work out which fittings survive the refit BEFORE charging anything.
+        kept: Dict[str, List[str]] = {}
+        dropped_ids: List[str] = []
         for lst_name, slots in (
             ("equipped_weapons", tmpl.weapon_slots),
             ("equipped_shields", tmpl.shield_slots),
             ("equipped_modules", tmpl.module_slots),
         ):
             lst = getattr(self.player, lst_name)
-            if len(lst) > slots:
-                for eq_id in lst[slots:]:
-                    if eq_id in EQUIPMENT_ITEMS:
-                        refund += int(EQUIPMENT_ITEMS[eq_id].cost * 0.75)
-                        dropped.append(EQUIPMENT_ITEMS[eq_id].name)
-                setattr(self.player, lst_name, lst[:slots])
+            kept[lst_name] = list(lst[:slots])
+            dropped_ids.extend(lst[slots:])
+
+        kept_cargo_bonus = sum(
+            EQUIPMENT_ITEMS[m].cargo_bonus
+            for m in kept["equipped_modules"] if m in EQUIPMENT_ITEMS
+        )
+        new_cargo_cap = tmpl.cargo_cap + kept_cargo_bonus
+
+        if net_cost > 0 and self.player.credits < net_cost:
+            return False, f"Need {money(net_cost)} CR (trade-in credited {money(cur_val)} CR)."
+
+        if self.player.cargo_used() > new_cargo_cap:
+            return False, (
+                f"Current cargo ({self.player.cargo_used()}) exceeds new ship capacity "
+                f"({new_cargo_cap}). Sell cargo first."
+            )
+
+        self.player.credits -= net_cost   # negative net_cost refunds the difference
+
+        # Equipment that will not fit the new hull is sold at standard 75%
+        # salvage value — never silently destroyed.
+        refund = 0
+        dropped: List[str] = []
+        for eq_id in dropped_ids:
+            if eq_id in EQUIPMENT_ITEMS:
+                refund += int(EQUIPMENT_ITEMS[eq_id].cost * 0.75)
+                dropped.append(EQUIPMENT_ITEMS[eq_id].name)
+        for lst_name, lst in kept.items():
+            setattr(self.player, lst_name, lst)
+
+        # Missiles without a launcher are refunded at half price.
+        if self.player.missiles > 0 and "missile_rack" not in kept["equipped_weapons"]:
+            refund += int(self.player.missiles * self.missile_price() * 0.5)
+            dropped.append(f"{self.player.missiles} missile(s)")
+            self.player.missiles = 0
+
         if refund > 0:
             self.player.credits += refund
             self.add_news(
                 f"Yard crews salvaged {len(dropped)} oversized fitting(s) "
                 f"for {money(refund)} CR: {', '.join(dropped)}."
             )
+
+        # A fresh hull arrives with healthy subsystems.
+        self.player.weapons_damaged = False
+        self.player.engines_damaged = False
+        self.player.shields_damaged = False
 
         self.player.ship_id = template_id
 
@@ -2130,7 +2281,11 @@ class GameEngine:
         self.sound.play("upgrade")
         self.check_achievements()
         self.check_promotion()
-        msg = f"Congratulations! You are now captain of a new {tmpl.name}."
+        if net_cost < 0:
+            msg = (f"Congratulations! You are now captain of a new {tmpl.name}. "
+                   f"The yard paid you {money(-net_cost)} CR for the trade-in difference.")
+        else:
+            msg = f"Congratulations! You are now captain of a new {tmpl.name}."
         self.announce(msg)
         return True, msg
 
@@ -2179,26 +2334,38 @@ class GameEngine:
             return False, "Invalid equipment item."
 
         eq = EQUIPMENT_ITEMS[eq_id]
-        removed = False
+        installed_in: Optional[str] = None
+        for lst_name in ("equipped_weapons", "equipped_shields", "equipped_modules"):
+            if eq_id in getattr(self.player, lst_name):
+                installed_in = lst_name
+                break
 
-        if eq_id in self.player.equipped_weapons:
-            self.player.equipped_weapons.remove(eq_id)
-            removed = True
-        elif eq_id in self.player.equipped_shields:
-            self.player.equipped_shields.remove(eq_id)
-            removed = True
-        elif eq_id in self.player.equipped_modules:
-            self.player.equipped_modules.remove(eq_id)
-            removed = True
-
-        if not removed:
+        if installed_in is None:
             return False, f"{eq.name} is not installed on your ship."
 
+        # A cargo expander may only come out if the hold still fits without it.
+        if installed_in == "equipped_modules" and eq.cargo_bonus > 0:
+            new_cap = self.player.cargo_cap - eq.cargo_bonus
+            if self.player.cargo_used() > new_cap:
+                return False, (
+                    f"Cannot remove {eq.name}: your hold would shrink to {new_cap} units "
+                    f"but carries {self.player.cargo_used()}. Sell or jettison "
+                    f"{self.player.cargo_used() - new_cap} unit(s) first."
+                )
+
+        getattr(self.player, installed_in).remove(eq_id)
+
         refund = int(eq.cost * 0.75)
+        extra = ""
+        if eq_id == "missile_rack" and self.player.missiles > 0:
+            missile_refund = int(self.player.missiles * self.missile_price() * 0.5)
+            extra = f" Unused missiles returned for {money(missile_refund)} CR."
+            refund += missile_refund
+            self.player.missiles = 0
         self.player.credits += refund
         self.recalculate_ship_stats()
         self.sound.play("sell")
-        msg = f"Dismounted {eq.name} and received {money(refund)} CR salvage value."
+        msg = f"Dismounted {eq.name} and received {money(refund)} CR salvage value.{extra}"
         self.announce(msg)
         return True, msg
 
@@ -2266,9 +2433,9 @@ class GameEngine:
     def abandon_mission(self, mission_id: str) -> Tuple[bool, str]:
         for m in list(self.player.active_missions):
             if m.id == mission_id:
-                if m.cargo_good and m.cargo_qty > 0:
-                    self.player.remove_cargo(m.cargo_good, m.cargo_qty)
                 self.player.active_missions.remove(m)
+                if m.cargo_good and m.cargo_qty > 0:
+                    self._remove_cargo_tracked(m.cargo_good, m.cargo_qty)
                 dest_p = self.planets.get(m.destination)
                 rep_msg = ""
                 if dest_p:
@@ -2308,7 +2475,7 @@ class GameEngine:
                     self.sound.play("victory")
                 elif m.m_type in ("delivery", "smuggle", "medical"):
                     if m.cargo_good and self.player.cargo.get(m.cargo_good, 0) >= m.cargo_qty:
-                        self.player.remove_cargo(m.cargo_good, m.cargo_qty)
+                        self._remove_cargo_tracked(m.cargo_good, m.cargo_qty)
                         bonus_mult = 1.0 + RANK_CONTRACT_BONUS[self.rank_index()]
                         payout = int(m.reward_credits * bonus_mult)
                         self.player.credits += payout
@@ -2740,6 +2907,7 @@ class GameEngine:
         if not thread_needle:
             detour_cost = 8
             if self.player.fuel < detour_cost:
+                self.player.hull = max(1, self.player.hull - 4)
                 return ["Not enough fuel for the detour — you are forced to thread the rocks! "
                         "Hull scuffed for 4 damage."]
             self.player.fuel -= detour_cost
@@ -2767,6 +2935,7 @@ class GameEngine:
         others = [p for p in self.planets.values() if p.name != self.player.location]
         dest = random.choice(others)
         self.player.location = dest.name
+        self.player.mark_visited(dest.name)
         self.player.stats["wormholes"] += 1
         self.sound.play("wormhole")
         self.add_news(f"Wormhole transit: spat out at {dest.name}!")
@@ -3039,6 +3208,8 @@ class GameEngine:
 
     @requires_alive
     def deposit(self, amount: int) -> Tuple[bool, str]:
+        if amount <= 0:
+            return False, "Enter an amount greater than zero."
         amount = min(amount, self.player.credits)
         if amount <= 0:
             return False, "No credits available to deposit."
@@ -3051,6 +3222,8 @@ class GameEngine:
 
     @requires_alive
     def withdraw(self, amount: int) -> Tuple[bool, str]:
+        if amount <= 0:
+            return False, "Enter an amount greater than zero."
         amount = min(amount, self.player.savings)
         if amount <= 0:
             return False, "No savings available to withdraw."
@@ -3063,6 +3236,8 @@ class GameEngine:
 
     @requires_alive
     def borrow(self, amount: int) -> Tuple[bool, str]:
+        if amount <= 0:
+            return False, "Enter an amount greater than zero."
         can_borrow = max(0, self.loan_limit() - self.player.loan)
         amount = min(amount, can_borrow)
         if amount <= 0:
@@ -3076,6 +3251,8 @@ class GameEngine:
 
     @requires_alive
     def repay(self, amount: int) -> Tuple[bool, str]:
+        if amount <= 0:
+            return False, "Enter an amount greater than zero."
         amount = min(amount, self.player.credits, self.player.loan)
         if amount <= 0:
             return False, "No loan payment can be made."
@@ -3100,7 +3277,7 @@ class GameEngine:
             return False, "Quantity must be positive."
 
         stk = self.stocks[symbol]
-        cost = int(stk.price * qty)
+        cost = int(math.ceil(round(stk.price * qty, 2)))
         if self.player.credits < cost:
             return False, f"Insufficient funds! Need {money(cost)} CR for {qty} shares."
 
@@ -3115,12 +3292,14 @@ class GameEngine:
     def sell_stock(self, symbol: str, qty: int) -> Tuple[bool, str]:
         if symbol not in self.stocks:
             return False, "Unknown stock symbol."
+        if qty <= 0:
+            return False, "Quantity must be positive."
         owned = self.player.stocks_owned.get(symbol, 0)
         to_sell = min(qty, owned)
         if to_sell <= 0:
             return False, f"You own no shares of ${symbol}."
 
-        income = int(self.stocks[symbol].price * to_sell)
+        income = int(math.floor(round(self.stocks[symbol].price * to_sell, 2)))
         self.player.stocks_owned[symbol] = owned - to_sell
         if self.player.stocks_owned[symbol] <= 0:
             self.player.stocks_owned.pop(symbol, None)
@@ -3202,9 +3381,11 @@ class GameEngine:
         owned = self.player.cargo.get(good, 0)
         if owned <= 0:
             return False, f"No {COMMODITIES[good].name} in the hold."
-        dumped = self.player.remove_cargo(good, qty)
-        if self.player.cargo.get(good, 0) <= 0:
-            self.player.cargo_cost_basis.pop(good, None)
+        free_units = self.player.sellable_cargo(good)
+        if free_units <= 0:
+            return False, (f"All {COMMODITIES[good].name} aboard is sealed for an active "
+                           f"contract. Abandon the contract first.")
+        dumped = self._remove_cargo_tracked(good, min(qty, free_units))
         self.player.stats["cargo_jettisoned"] += dumped
         self.sound.play("warp")
         msg = f"Jettisoned {dumped}x {COMMODITIES[good].name} into the void."
@@ -3284,8 +3465,7 @@ class GameEngine:
             ]
             entries.append(entry)
             entries.sort(key=lambda e: e.get("net_worth", 0), reverse=True)
-            with open(self.hof_path(), "w", encoding="utf-8") as f:
-                json.dump(entries[:HOF_MAX_ENTRIES * 3], f, indent=2)
+            atomic_write_json(self.hof_path(), entries[:HOF_MAX_ENTRIES * 3])
         except Exception:
             pass
 
@@ -3363,10 +3543,11 @@ class GameEngine:
         }
 
     def save_game(self, slot: str = "1") -> Tuple[bool, str]:
+        if self.is_game_over:
+            return False, "A destroyed ship cannot be saved. Load a flight record instead."
         try:
             path = slot_path(slot)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._save_payload(), f, indent=2)
+            atomic_write_json(path, self._save_payload())
             return True, f"Game saved to slot '{slot}'."
         except Exception as e:
             return False, f"Failed to save game: {e}"
@@ -3420,9 +3601,20 @@ class GameEngine:
         if not os.path.exists(path):
             return False, f"Save slot '{slot}' not found."
 
+        # Loading mutates live state field by field. Snapshot first so a corrupt
+        # or truncated file can never leave the running game half-overwritten.
+        backup = (
+            copy.deepcopy(self.player), copy.deepcopy(self.planets),
+            copy.deepcopy(self.stocks), list(self.news_feed),
+            list(self.available_missions), self.difficulty_id,
+            self.is_game_over, self._hof_recorded,
+        )
+
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            if not isinstance(data, dict) or not isinstance(data.get("player"), dict):
+                raise ValueError("not a flight record")
 
             p_data = data.get("player", {})
 
@@ -3486,9 +3678,16 @@ class GameEngine:
             } or {self.player.location}
             self._hof_recorded = False
 
-            self.player.active_missions = [
-                Mission(**m_dict) for m_dict in p_data.get("active_missions", [])
-            ]
+            loaded_missions: List[Mission] = []
+            for m_dict in p_data.get("active_missions", []):
+                if not isinstance(m_dict, dict):
+                    continue
+                clean = {k: v for k, v in m_dict.items() if k in Mission.__dataclass_fields__}
+                try:
+                    loaded_missions.append(Mission(**clean))
+                except TypeError:
+                    continue   # skip malformed contract entries
+            self.player.active_missions = loaded_missions
 
             planets_data = data.get("planets", {})
             for p_name, p_info in planets_data.items():
@@ -3500,12 +3699,19 @@ class GameEngine:
                     p.fuel_price = int(p_info.get("fuel_price", BASE_FUEL_PRICE))
                     p.repair_cost = int(p_info.get("repair_cost", BASE_REPAIR_COST))
                     ev_dict = p_info.get("active_event")
-                    p.active_event = PlanetEvent(**ev_dict) if ev_dict else None
+                    if isinstance(ev_dict, dict):
+                        ev_clean = {k: v for k, v in ev_dict.items()
+                                    if k in PlanetEvent.__dataclass_fields__}
+                        p.active_event = PlanetEvent(**ev_clean)
+                    else:
+                        p.active_event = None
 
             stocks_data = data.get("stocks", {})
             for sym, s_info in stocks_data.items():
-                if sym in self.stocks:
-                    self.stocks[sym] = StockData(**s_info)
+                if sym in self.stocks and isinstance(s_info, dict):
+                    s_clean = {k: v for k, v in s_info.items()
+                               if k in StockData.__dataclass_fields__}
+                    self.stocks[sym] = StockData(**s_clean)
 
             self.news_feed = list(data.get("news_feed", []))
 
@@ -3530,7 +3736,7 @@ class GameEngine:
                 self.player.highest_rank_index, self.rank_index())
 
             self.is_game_over = False
-            self.recalculate_ship_stats()
+            self._sanitize_player()
             self.available_missions = generate_mission_board(
                 self.current_planet,
                 list(self.planets.values()),
@@ -3541,7 +3747,60 @@ class GameEngine:
             self.sound.play("buy")
             return True, f"Save slot '{slot}' loaded. Welcome back, {self.player.name}."
         except Exception as e:
+            (self.player, self.planets, self.stocks, self.news_feed,
+             self.available_missions, self.difficulty_id,
+             self.is_game_over, self._hof_recorded) = backup
             return False, f"Failed to load save: {e}"
+
+    def _sanitize_player(self) -> None:
+        """Clamp a freshly-loaded career into the legal state space so a
+        hand-edited or legacy save can never break the game's invariants."""
+        p = self.player
+        tmpl = SHIP_TEMPLATES[p.ship_id]
+
+        p.credits = max(0, int(p.credits))
+        p.savings = max(0, int(p.savings))
+        p.loan = max(0, int(p.loan))
+        p.day = max(1, int(p.day))
+        p.credit_score = int(clamp(p.credit_score, MIN_CREDIT_SCORE, MAX_CREDIT_SCORE))
+        p.missiles = int(clamp(p.missiles, 0, PLAYER_MISSILE_CAP))
+
+        def unique(items: List[str]) -> List[str]:
+            seen: List[str] = []
+            for it in items:
+                if it not in seen:
+                    seen.append(it)
+            return seen
+
+        p.equipped_weapons = unique(p.equipped_weapons)[:tmpl.weapon_slots]
+        p.equipped_shields = unique(p.equipped_shields)[:tmpl.shield_slots]
+        p.equipped_modules = unique(p.equipped_modules)[:tmpl.module_slots]
+        p.hired_crew = unique(p.hired_crew)[:MAX_CREW]
+        p.active_missions = p.active_missions[:MAX_ACTIVE_MISSIONS]
+        p.cargo = {g: q for g, q in p.cargo.items() if q > 0}
+        p.cargo_cost_basis = {g: b for g, b in p.cargo_cost_basis.items() if g in p.cargo}
+        clean_stocks: Dict[str, int] = {}
+        for sym, qty in p.stocks_owned.items():
+            try:
+                qty = int(qty)
+            except (TypeError, ValueError):
+                continue
+            if sym in self.stocks and qty > 0:
+                clean_stocks[sym] = qty
+        p.stocks_owned = clean_stocks
+        p.reputation = {
+            f: int(clamp(v, REPUTATION_MIN, REPUTATION_MAX))
+            for f, v in p.reputation.items()
+        }
+
+        self.recalculate_ship_stats()
+
+        # A hold that no longer fits (edited save / changed fittings) sheds its
+        # largest stacks until it does — contract cargo is shed last.
+        while p.cargo_used() > p.cargo_cap and p.cargo:
+            victim = max(p.cargo, key=lambda g: (p.sellable_cargo(g) > 0, p.cargo[g]))
+            excess = p.cargo_used() - p.cargo_cap
+            self._remove_cargo_tracked(victim, excess)
 
 
 # ==============================================================================
@@ -3689,6 +3948,10 @@ class CombatEncounter:
         # Autonomous drones strike first.
         if self.drones_active and action != "drones":
             msgs.extend(self._drone_strike())
+            if self.is_finished:
+                # The swarm already finished the fight — don't burn a missile
+                # or a volley on a wreck.
+                return msgs
 
         # Set when an action already resolves the enemy's counter-attack
         # internally (e.g. a repelled boarding attempt) — the enemy must not
@@ -3743,6 +4006,8 @@ class CombatEncounter:
 
         fired_any = False
         for eq_id in p.equipped_weapons:
+            if self.enemy_hull <= 0:
+                break                          # already destroyed — stop firing
             eq = EQUIPMENT_ITEMS.get(eq_id)
             if not eq or eq.damage <= 0:      # missile rack has no beam attack
                 continue
@@ -3980,14 +4245,16 @@ class CombatEncounter:
     def _handle_player_death(self) -> List[str]:
         p = self._p()
         self.is_finished = True
-        self.engine.record_hall_of_fame(won=False)
         if p.insurance_active:
+            # An insured wreck is not the end of the career, so it is NOT a
+            # Hall of Fame entry (and must not burn the one-shot record flag).
             self.insurance_used = True
             msgs = ["CRITICAL FAILURE: Your ship breaks apart around you..."]
             msgs.extend(self.engine.insurance_respawn())
             return msgs
         self.player_dead = True
         self.engine.is_game_over = True
+        self.engine.record_hall_of_fame(won=False)
         self.engine.sound.play("death")
         return [
             "CRITICAL FAILURE: Ship destroyed in combat! Hull integrity collapsed.",
@@ -4794,6 +5061,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
     @keyframes slideInToast {
       from { transform: translateX(100%); opacity: 0; }
       to { transform: translateX(0); opacity: 1; }
+    }
+
+    .toast-msg.toast-error { border-left-color: var(--red); }
+    #conn-banner {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 900;
+      background: var(--red); color: #fff; text-align: center;
+      padding: 6px 12px; font-weight: 700; font-size: 13px;
+      transform: translateY(-100%); transition: transform 0.25s ease;
+    }
+    #conn-banner.active { transform: translateY(0); }
+    body.busy { cursor: progress; }
+    body.busy button { pointer-events: none; }
+    :focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
     }
 
     /* Grid Layouts */
@@ -5739,7 +6022,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <!-- TOAST CONTAINER -->
-  <div id="toast-container"></div>
+  <div id="conn-banner" role="alert">⚠ Connection to the game server lost — retrying…</div>
+  <div id="toast-container" aria-live="polite"></div>
 
   <!-- APPLICATION LOGIC JAVASCRIPT -->
   <script>
@@ -5908,10 +6192,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     // --- Toast Notifications ---
-    function showToast(msg) {
+    function showToast(msg, kind) {
       const c = document.getElementById('toast-container');
+      while (c.children.length >= 5) c.removeChild(c.firstChild);
       const t = document.createElement('div');
-      t.className = 'toast-msg';
+      t.className = 'toast-msg' + (kind === 'error' ? ' toast-error' : '');
       t.textContent = msg;
       c.appendChild(t);
       setTimeout(() => {
@@ -5972,21 +6257,49 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     // --- API Interactions ---
+    let lastRevision = -1;
+    let actionBusy = false;
+
+    function setConnection(ok) {
+      const el = document.getElementById('conn-banner');
+      if (el) el.classList.toggle('active', !ok);
+    }
+
+    // Accept a server snapshot unless it is older than what is on screen, and
+    // skip the (expensive) re-render when nothing changed since the last one.
+    function applyState(state) {
+      if (!state) return;
+      const rev = (typeof state.revision === 'number') ? state.revision : null;
+      if (rev !== null) {
+        if (rev < lastRevision) return;
+        if (rev === lastRevision && gameState) return;
+        lastRevision = rev;
+      }
+      gameState = state;
+      renderAll();
+    }
+
     async function fetchState() {
+      if (actionBusy) return;   // an action response is about to carry fresher state
       try {
         const res = await fetch('/api/state');
         const json = await res.json();
+        setConnection(true);
         if (json.success && json.state) {
-          gameState = json.state;
           if (json.sound) playSound(json.sound);
-          renderAll();
+          applyState(json.state);
         }
       } catch (err) {
-        console.error("Failed to fetch state:", err);
+        setConnection(false);
       }
     }
 
+    // One action at a time: double-clicks and held keys must not fire a
+    // purchase, jump or volley twice.
     async function sendAction(action, payload = {}) {
+      if (actionBusy) return null;
+      actionBusy = true;
+      document.body.classList.add('busy');
       try {
         const res = await fetch('/api/action', {
           method: 'POST',
@@ -5994,17 +6307,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
           body: JSON.stringify({ action, ...payload })
         });
         const json = await res.json();
+        setConnection(true);
+        const failed = json.success === false;
         if (json.logs && json.logs.length) {
-          json.logs.forEach(l => showToast(l));
+          json.logs.forEach(l => showToast(l, failed ? 'error' : 'ok'));
+        } else if (failed && (json.message || json.error)) {
+          showToast(json.message || json.error, 'error');
         }
         if (json.sound) playSound(json.sound);
-        if (json.state) {
-          gameState = json.state;
-          renderAll();
-        }
+        if (json.state) applyState(json.state);
         return json;
       } catch (err) {
-        showToast("Communication error: " + err);
+        setConnection(false);
+        showToast("Communication error: " + err, 'error');
+        return null;
+      } finally {
+        actionBusy = false;
+        document.body.classList.remove('busy');
       }
     }
 
@@ -6342,6 +6661,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     // --- Trade Slider Modal ---
+    // Mirrors GameEngine.market_depth_fee / quote_buy / quote_sell exactly.
+    function marketFee(unit, qty) {
+      const eco = (gameState && gameState.economy) || { impact_rate: 0.002, impact_cap: 0.08 };
+      const impact = Math.min(eco.impact_cap, qty * eco.impact_rate);
+      return Math.floor(unit * qty * impact / 2 + 0.5);
+    }
+    function tradeTotal(unit, qty, mode) {
+      const fee = marketFee(unit, qty);
+      return mode === 'buy' ? unit * qty + fee : Math.max(0, unit * qty - fee);
+    }
+
     function openTradeModal(goodId, mode) {
       selectedGoodId = goodId;
       tradeMode = mode;
@@ -6351,13 +6681,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const p = gameState.player;
       let maxQty = 1;
       if (mode === 'buy') {
-        const affordable = Math.floor(p.credits / Math.max(1, g.buy_price));
-        maxQty = Math.max(1, Math.min(g.stock, p.cargo_free, affordable));
+        let cap = Math.min(g.stock, p.cargo_free);
+        while (cap > 1 && tradeTotal(g.buy_price, cap, 'buy') > p.credits) cap--;
+        maxQty = Math.max(1, cap);
         document.getElementById('trade-modal-title').textContent = `Purchase ${g.name}`;
         document.getElementById('trade-btn-confirm').textContent = 'Confirm Purchase';
         document.getElementById('trade-unit-price').textContent = `${g.buy_price} CR`;
       } else {
-        maxQty = Math.max(1, g.player_qty);
+        maxQty = Math.max(1, g.sellable_qty !== undefined ? g.sellable_qty : g.player_qty);
         document.getElementById('trade-modal-title').textContent = `Sell ${g.name}`;
         document.getElementById('trade-btn-confirm').textContent = 'Confirm Sale';
         document.getElementById('trade-unit-price').textContent = `${g.sell_price} CR`;
@@ -6384,7 +6715,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const qty = parseInt(val, 10);
       document.getElementById('trade-qty-display').textContent = qty;
       const unitP = tradeMode === 'buy' ? g.buy_price : g.sell_price;
-      document.getElementById('trade-total-display').textContent = `${(qty * unitP).toLocaleString()} CR`;
+      document.getElementById('trade-total-display').textContent = `${tradeTotal(unitP, qty, tradeMode).toLocaleString()} CR`;
     }
 
     function setTradeQty(val) {
@@ -6429,9 +6760,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
               Cost: <strong style="color: var(--fg);">${c.cost_basis} CR</strong> · P/L: <strong style="color: ${c.total_profit >= 0 ? 'var(--green)' : 'var(--red)'}; font-family: var(--font-mono);">${c.total_profit >= 0 ? '+' : ''}${c.total_profit.toLocaleString()} CR (${c.profit_pct >= 0 ? '+' : ''}${c.profit_pct}%)</strong>
             </div>
             <div style="font-size: 11px; color: var(--fg-dim);">Total Value: <strong style="color: var(--gold); font-family: var(--font-mono);">${c.total_value.toLocaleString()} CR</strong></div>
+            ${c.reserved > 0 ? `<div style="font-size: 11px; color: var(--cyan);">🔒 ${c.reserved} T sealed for active contracts</div>` : ''}
             <div style="display: flex; gap: 6px; margin-top: 8px;">
-              <button class="btn-action-sm btn-sell" style="flex: 1;" onclick="openTradeModal('${c.id}', 'sell')">Sell All</button>
-              <button class="btn-action-sm" style="flex: 1; color: var(--red);" title="Dump cargo into space (no refund, no customs fine)" onclick="promptJettison('${c.id}', ${c.qty})">♻ Jettison</button>
+              <button class="btn-action-sm btn-sell" style="flex: 1;" ${c.sellable <= 0 ? 'disabled' : ''} onclick="openTradeModal('${c.id}', 'sell')">Sell All</button>
+              <button class="btn-action-sm" style="flex: 1; color: var(--red);" ${c.sellable <= 0 ? 'disabled' : ''} title="Dump cargo into space (no refund, no customs fine)" onclick="promptJettison('${c.id}', ${c.sellable})">♻ Jettison</button>
             </div>
           </div>
         `;
@@ -6596,7 +6928,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
               </div>
             </div>
             <div style="text-align: right; margin-left: 16px;">
-              <div style="font-family: var(--font-mono); font-size: 14px; font-weight: 700; color: var(--gold);">${s.net_cost.toLocaleString()} CR</div>
+              <div style="font-family: var(--font-mono); font-size: 14px; font-weight: 700; color: var(--gold);">${s.net_cost < 0 ? '+' + (-s.net_cost).toLocaleString() + ' CR refund' : s.net_cost.toLocaleString() + ' CR'}</div>
               <div style="font-size: 10px; color: var(--fg-dim); margin-bottom: 6px;">(Trade-in: -${s.trade_in_value.toLocaleString()} CR)</div>
               ${s.is_current ? '' : `<button class="btn-action-sm btn-buy" ${!s.can_afford ? 'disabled' : ''} onclick="sendAction('buy_ship', { ship_id: '${s.id}' })">Commission</button>`}
             </div>
@@ -7293,7 +7625,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // --- Bank prompt replacements ---
     function promptDeposit() {
       openAmountModal('🏦 Deposit to Savings',
-        `Available credits: ${gameState.player.credits.toLocaleString()} CR. Savings earn 0.8% daily.`,
+        `Available credits: ${gameState.player.credits.toLocaleString()} CR. Savings earn ${gameState.economy.savings_rate_pct}% daily on the first ${gameState.economy.savings_interest_cap.toLocaleString()} CR.`,
         'Deposit Credits', Math.min(500, gameState.player.credits),
         'bank_deposit', { key: 'amount' });
     }
@@ -7340,6 +7672,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
         return;
       }
+      // Ignore browser shortcuts (Ctrl+R reload, Ctrl+F find...) and held keys.
+      if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
       if (e.key === '1') switchTab('map');
       if (e.key === '2') switchTab('market');
       if (e.key === '3') switchTab('advisor');
@@ -7398,6 +7732,9 @@ class GameSession:
         self.last_logs: List[str] = ["Welcome to Space Trader: Odyssey. Engines online, all systems nominal."]
         self.sound_event: Optional[str] = None
         self.lock = threading.Lock()
+        # Bumped on every processed action. The browser uses it to discard stale
+        # poll responses and to skip redundant re-renders.
+        self.revision = 0
 
     def set_sound(self, name: str) -> None:
         self.sound_event = name
@@ -7432,6 +7769,8 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
                 "name": comm.name,
                 "category": comm.category,
                 "qty": qty,
+                "reserved": player.reserved_cargo(gid),
+                "sellable": player.sellable_cargo(gid),
                 "base_price": comm.base_price,
                 "sell_price": sell_price,
                 "cost_basis": round(cost_basis, 1),
@@ -7545,6 +7884,8 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "sell_price": sell_p,
             "stock": stock_qty,
             "player_qty": p_qty,
+            "reserved_qty": player.reserved_cargo(gid),
+            "sellable_qty": player.sellable_cargo(gid),
             "cost_basis": p_cost_basis,
             "unit_profit": p_unit_profit,
             "profit_pct": p_profit_pct,
@@ -7555,15 +7896,16 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "icon": comm.icon,
             "avg_price": int(avg_price),
             "pct_diff": pct_diff,
-            "can_buy": (player.credits >= buy_p and (player.cargo_cap - cargo_used) > 0 and stock_qty > 0),
-            "can_sell": p_qty > 0,
+            "can_buy": (player.credits >= engine.quote_buy(gid, 1)
+                        and (player.cargo_cap - cargo_used) > 0 and stock_qty > 0),
+            "can_sell": player.sellable_cargo(gid) > 0,
         })
 
     # Shipyard
     ships_list = []
     trade_in_val = engine.ship_trade_in_value()
     for sid, st in SHIP_TEMPLATES.items():
-        cost_after_trade = max(0, st.cost - trade_in_val)
+        cost_after_trade = st.cost - trade_in_val      # negative => the yard pays you
         ships_list.append({
             "id": sid,
             "name": st.name,
@@ -7860,6 +8202,14 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             for i, r in enumerate(RANKS)
         ],
         "news_feed": engine.news_feed[-15:],
+        "revision": session.revision,
+        "economy": {
+            "impact_rate": IMPACT_RATE,
+            "impact_cap": IMPACT_CAP,
+            "savings_rate_pct": round(SAVINGS_DAILY_RATE * 100, 2),
+            "savings_interest_cap": SAVINGS_INTEREST_CAP,
+            "min_spread_pct": round(MIN_SPREAD * 100, 2),
+        },
         "active_encounter": session.active_encounter,
         "active_combat": combat_data,
         "last_logs": session.last_logs[-8:],
@@ -7867,540 +8217,420 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
 
 
 GLOBAL_SESSION: Optional[GameSession] = None
+_SESSION_LOCK = threading.Lock()
+
+
+def get_session() -> GameSession:
+    """Return the shared game session, creating it exactly once (thread-safe)."""
+    global GLOBAL_SESSION
+    with _SESSION_LOCK:
+        if GLOBAL_SESSION is None:
+            GLOBAL_SESSION = GameSession()
+        return GLOBAL_SESSION
+
+
+# ------------------------------------------------------------------------------
+# Action dispatch — pure Python, no HTTP, so the test-suite can drive it directly
+# ------------------------------------------------------------------------------
+
+class ActionError(Exception):
+    """A malformed request (bad or missing argument). Maps to HTTP 400."""
+
+
+# action -> (GameEngine method, ((json key, kind, default), ...), sound on success)
+EngineSpec = Tuple[str, Tuple[Tuple[str, str, Any], ...], Optional[str]]
+ENGINE_ACTIONS: Dict[str, EngineSpec] = {
+    "odd_jobs":          ("odd_jobs", (), "coin"),
+    "jettison_cargo":    ("jettison_cargo", (("good", "str", ""), ("qty", "int", 1)), None),
+    "faction_gift":      ("faction_gift", (("faction", "str", ""), ("amount", "int", GIFT_MIN)), "coin"),
+    "buy_commodity":     ("buy_commodity", (("good", "str", ""), ("qty", "int", 1)), "buy"),
+    "sell_commodity":    ("sell_commodity", (("good", "str", ""), ("qty", "int", 1)), "sell"),
+    "buy_fuel":          ("buy_fuel", (("amount", "int", 10),), "coin"),
+    "repair_hull":       ("repair_hull", (("hp", "int", 10),), "upgrade"),
+    "repair_subsystems": ("repair_subsystems", (), "upgrade"),
+    "buy_insurance":     ("buy_insurance", (), "coin"),
+    "buy_missiles":      ("buy_missiles", (("qty", "int", 1),), "coin"),
+    "buy_ship":          ("buy_ship", (("ship_id", "str", ""),), "upgrade"),
+    "buy_equipment":     ("buy_equipment", (("eq_id", "str", ""),), "upgrade"),
+    "sell_equipment":    ("sell_equipment", (("eq_id", "str", ""),), "sell"),
+    "hire_crew":         ("hire_crew", (("crew_id", "str", ""),), "coin"),
+    "dismiss_crew":      ("dismiss_crew", (("crew_id", "str", ""),), None),
+    "accept_mission":    ("accept_mission", (("mission_id", "str", ""),), "coin"),
+    "abandon_mission":   ("abandon_mission", (("mission_id", "str", ""),), None),
+    "bank_deposit":      ("deposit", (("amount", "int", 100),), "coin"),
+    "bank_withdraw":     ("withdraw", (("amount", "int", 100),), "coin"),
+    "bank_borrow":       ("borrow", (("amount", "int", 100),), "coin"),
+    "bank_repay":        ("repay", (("amount", "int", 100),), "coin"),
+    "buy_stock":         ("buy_stock", (("symbol", "str", ""), ("qty", "int", 1)), "coin"),
+    "sell_stock":        ("sell_stock", (("symbol", "str", ""), ("qty", "int", 1)), "sell"),
+}
+
+META_ACTIONS = ("new_game", "load_game", "save_game")
+COMBAT_ACTIONS = ("combat_action", "dismiss_combat")
+MAX_ID_LEN = 64
+
+CAREER_OVER_MSG = ("Your career has ended, Captain. "
+                   "Start a new commission or load a flight record.")
+IN_COMBAT_MSG = "Battle stations! Finish the engagement before doing anything else."
+ENCOUNTER_PENDING_MSG = "A sensor contact demands your decision first."
+
+
+def _arg(data: Dict[str, Any], key: str, kind: str, default: Any) -> Any:
+    """Extract one typed argument from an untrusted request body."""
+    raw = data.get(key, default)
+    if kind == "int":
+        try:
+            return to_int(raw)
+        except ValueError:
+            raise ActionError(f"{key} must be an integer.") from None
+    return str(raw)[:MAX_ID_LEN]
+
+
+def _resolve_encounter(engine: GameEngine, enc: Dict[str, Any],
+                       choice: bool) -> Tuple[List[str], str]:
+    """Apply the player's choice to a pending encounter -> (log lines, sound)."""
+    t = enc.get("type")
+    if t == "customs_scan":
+        # UI: choice=True is "Submit to Scan"; the engine wants bribe=True for
+        # the opposite option, hence the inversion.
+        return engine.resolve_customs(enc, bribe=not choice), ("alarm" if choice else "coin")
+    if t == "faction_patrol":
+        return engine.resolve_faction_patrol(enc, choice), ("coin" if choice else "alarm")
+    if t == "derelict":
+        return engine.resolve_derelict(enc, choice), ("upgrade" if choice else "click")
+    if t == "solar_flare":
+        return engine.resolve_solar_flare(enc), "shield_hit"
+    if t == "distress_beacon":
+        return engine.resolve_distress(enc, choice), ("coin" if choice else "click")
+    if t == "wandering_trader":
+        return engine.resolve_trader(enc, choice), ("buy" if choice else "click")
+    if t == "asteroid_field":
+        return engine.resolve_asteroid_field(enc, choice), ("shield_hit" if choice else "coin")
+    if t == "wormhole":
+        return engine.resolve_wormhole(enc, choice), ("wormhole" if choice else "click")
+    if t == "mining_opportunity":
+        return engine.resolve_mining(enc, choice), ("mine" if choice else "click")
+    if t == "comet_mining":
+        return engine.resolve_comet(enc, choice), ("mine" if choice else "click")
+    if t == "ghost_freighter":
+        return engine.resolve_ghost(enc, careful=choice), ("victory" if choice else "alarm")
+    if t == "derby":
+        return engine.resolve_derby(enc, bet=choice), "coin"
+    return [], "click"
+
+
+def handle_action(session: GameSession, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply one client action to the session and return the JSON response.
+
+    The caller must hold ``session.lock``. Raises ActionError on a malformed
+    request; every other outcome (including refusals) is a normal response.
+    """
+    engine = session.engine
+    action = str(data.get("action", ""))
+    success = False
+    message = ""
+    sound: Optional[str] = None
+    logs: List[str] = []
+
+    def refuse(text: str) -> None:
+        nonlocal success, message
+        success, message = False, text
+        logs.append(text)
+
+    # A finished career only allows meta actions (new game, load).
+    if engine.is_game_over and action not in META_ACTIONS:
+        refuse(CAREER_OVER_MSG)
+        session.revision += 1
+        return {"success": False, "message": message, "logs": [], "sound": None,
+                "state": serialize_game_state(session)}
+
+    combat = session.active_combat
+    if combat is not None and combat.is_finished and action not in COMBAT_ACTIONS + META_ACTIONS:
+        # The player moved on without pressing "continue" — close the fight.
+        session.active_combat = None
+        combat = None
+        engine.autosave()
+
+    if action in ("new_game", "load_game"):
+        pass   # these replace the whole session, so they bypass the gates
+    elif combat is not None and not combat.is_finished and action not in COMBAT_ACTIONS:
+        refuse(IN_COMBAT_MSG)
+    elif session.active_encounter and action != "resolve_encounter":
+        refuse(ENCOUNTER_PENDING_MSG)
+
+    if not message:   # no gate refusal above
+        if action == "new_game":
+            name = str(data.get("name", "Commander"))
+            diff = str(data.get("difficulty", "normal")).strip().lower()
+            engine.new_game(name, diff)
+            session.active_encounter = None
+            session.active_combat = None
+            session.last_logs = [f"New commission created for {engine.player.name} "
+                                 f"on {engine.difficulty.name.upper()} difficulty."]
+            success, message, sound = True, f"Welcome aboard, {engine.player.name}!", "warp"
+
+        elif action == "load_game":
+            success, message = engine.load_game(_arg(data, "slot", "str", "1"))
+            logs.append(message)
+            if success:
+                session.active_encounter = None
+                session.active_combat = None
+                sound = "warp"
+
+        elif action == "save_game":
+            success, message = engine.save_game(_arg(data, "slot", "str", "1"))
+            logs.append(message)
+
+        elif action == "travel":
+            success, message, enc = engine.execute_travel(_arg(data, "destination", "str", ""))
+            logs.append(message)
+            if success:
+                sound = "warp"
+                session.active_encounter = None
+                session.active_combat = None
+                if enc:
+                    if enc.get("type") in ("pirate_ambush", "bounty_combat"):
+                        session.active_combat = start_combat(engine, enc)
+                        sound = "alarm"
+                        logs.append(f"ALARM: Hostile vessel intercepted! "
+                                    f"{enc.get('title', 'Raider Attack')}")
+                    else:
+                        session.active_encounter = enc
+                        logs.append(f"Sector Sensor Contact: {enc.get('title', 'Anomaly Detected')}")
+
+        elif action == "resolve_encounter":
+            enc = session.active_encounter
+            if enc:
+                enc_logs, sound = _resolve_encounter(engine, enc, bool(data.get("choice", False)))
+                session.active_encounter = None
+                success = True
+                logs.extend(enc_logs)
+                message = enc_logs[-1] if enc_logs else "Encounter resolved."
+            else:
+                success, message = False, "No active encounter to resolve."
+
+        elif action == "combat_action":
+            c_act = _arg(data, "combat_action", "str", "fire")
+            if combat is None or combat.is_finished:
+                success, message = False, "No active combat engagement."
+            elif c_act not in CombatEncounter.ACTIONS:
+                success, message = False, "Unknown combat maneuver."
+            else:
+                c_logs = combat.player_action(c_act)
+                logs.extend(c_logs)
+                success = True
+                message = c_logs[-1] if c_logs else "Combat turn complete."
+                sound = {"fire": "laser", "target_engines": "laser", "target_weapons": "laser",
+                         "target_shields": "laser", "missile": "laser", "recharge": "upgrade",
+                         "evade": "warp", "board": "upgrade", "drones": "upgrade",
+                         "flee": "warp" if combat.player_escaped else "alarm"}.get(c_act)
+                if combat.is_finished:
+                    if combat.player_won:
+                        sound = "victory"
+                    elif combat.player_dead:
+                        sound = "death"
+
+        elif action == "dismiss_combat":
+            if combat is not None and combat.is_finished:
+                session.active_combat = None
+                success = True
+                if combat.player_dead:
+                    # Never persist a destroyed ship over the autosave — the
+                    # pre-combat snapshot is the recovery point.
+                    message = "Vessel lost. Recovery options available."
+                else:
+                    engine.autosave()
+                    message = "Disengaged from combat arena."
+            else:
+                success, message = False, "Combat is still in progress."
+
+        elif action in ENGINE_ACTIONS:
+            method, arg_specs, ok_sound = ENGINE_ACTIONS[action]
+            args = [_arg(data, key, kind, default) for key, kind, default in arg_specs]
+            success, message = getattr(engine, method)(*args)
+            logs.append(message)
+            if success:
+                sound = ok_sound
+
+        else:
+            success, message = False, f"Unknown action: {action}"
+
+    if logs:
+        session.last_logs.extend(logs)
+        session.last_logs = session.last_logs[-15:]
+
+    promo = engine.check_promotion()
+    if promo:
+        sound = "rank_up"
+        session.last_logs.append(f"PROMOTION: Promoted to rank of {promo.name}! {promo.perk}")
+
+    session.revision += 1
+    return {"success": success, "message": message, "logs": logs, "sound": sound,
+            "state": serialize_game_state(session)}
+
+
+# ------------------------------------------------------------------------------
+# HTTP layer
+# ------------------------------------------------------------------------------
+
+MAX_BODY_BYTES = 64 * 1024
+HTML_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; object-src 'none'; base-uri 'none'")
 
 
 class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
-    """Multi-threaded HTTP handler serving the browser game client and REST API."""
+    """Multi-threaded HTTP handler serving the browser game client and REST API.
+
+    The game is a local, single-player service. There is deliberately NO CORS
+    allowance, and state-changing requests must be same-origin JSON, so a random
+    web page open in your browser cannot drive or corrupt your game."""
+
+    server_version = "SpaceTraderOdyssey/2.1"
 
     def log_message(self, format: str, *args: Any) -> None:
         """Suppress noisy default HTTP access logs."""
         return
 
-    def _set_headers(self, content_type: str = "application/json", status: int = 200) -> None:
+    # -- response helpers -------------------------------------------------- #
+
+    def _send(self, body: bytes, content_type: str, status: int = 200) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if content_type.startswith("text/html"):
+            self.send_header("Content-Security-Policy", HTML_CSP)
         self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _json(self, payload: Dict[str, Any], status: int = 200) -> None:
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status)
+
+    def _fail(self, status: int, message: str) -> None:
+        self._json({"success": False, "error": message}, status)
+
+    # -- verbs ------------------------------------------------------------- #
 
     def do_OPTIONS(self) -> None:
-        self._set_headers()
+        # No CORS: a cross-origin preflight gets no permission headers.
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_HEAD(self) -> None:
+        self.do_GET()
 
     def do_GET(self) -> None:
-        global GLOBAL_SESSION
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
+        try:
+            self._handle_get()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            self._internal_error()
+
+    def do_POST(self) -> None:
+        try:
+            self._handle_post()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            self._internal_error()
+
+    def _internal_error(self) -> None:
+        traceback.print_exc(file=sys.stderr)
+        try:
+            self._fail(500, "Internal server error — the incident was logged to the console.")
+        except Exception:
+            pass
+
+    def _handle_get(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
 
         if path == "/favicon.ico":
             self.send_response(204)
+            self.send_header("Content-Length", "0")
             self.end_headers()
             return
-
         if path in ("/", "/index.html"):
-            self._set_headers(content_type="text/html; charset=utf-8")
-            self.wfile.write(HTML_PAGE.encode("utf-8"))
+            self._send(HTML_PAGE.encode("utf-8"), "text/html; charset=utf-8")
             return
-
         if path == "/api/health":
-            self._set_headers()
-            self.wfile.write(json.dumps({"status": "ok", "app": "Space Trader: Odyssey"}).encode("utf-8"))
+            self._json({"status": "ok", "app": "Space Trader: Odyssey"})
             return
 
-        if GLOBAL_SESSION is None:
-            GLOBAL_SESSION = GameSession()
-
-        if path == "/api/state":
-            with GLOBAL_SESSION.lock:
-                state = serialize_game_state(GLOBAL_SESSION)
-                sound = GLOBAL_SESSION.pop_sound()
-            self._set_headers()
-            self.wfile.write(json.dumps({"success": True, "state": state, "sound": sound}).encode("utf-8"))
+        if not path.startswith("/api/"):
+            self._fail(404, "File not found.")
             return
 
-        if path == "/api/routes":
-            with GLOBAL_SESSION.lock:
-                routes = GLOBAL_SESSION.engine.compute_best_trade_routes()
-            self._set_headers()
-            self.wfile.write(json.dumps({"success": True, "routes": routes[:12]}).encode("utf-8"))
-            return
-
-        if path == "/api/saves":
-            with GLOBAL_SESSION.lock:
+        session = get_session()
+        with session.lock:
+            if path == "/api/state":
+                self._json({"success": True, "state": serialize_game_state(session),
+                            "sound": session.pop_sound()})
+            elif path == "/api/routes":
+                self._json({"success": True,
+                            "routes": session.engine.compute_best_trade_routes()[:12]})
+            elif path == "/api/saves":
                 slots = []
                 for s in (AUTO_SLOT, PRECOMBAT_SLOT) + SAVE_SLOTS:
-                    info = GLOBAL_SESSION.engine.slot_info(s)
-                    slots.append({
-                        "slot": s,
-                        "exists": info is not None,
-                        "info": info
-                    })
-            self._set_headers()
-            self.wfile.write(json.dumps({"success": True, "slots": slots}).encode("utf-8"))
+                    info = session.engine.slot_info(s)
+                    slots.append({"slot": s, "exists": info is not None, "info": info})
+                self._json({"success": True, "slots": slots})
+            elif path == "/api/scores":
+                self._json({"success": True,
+                            "scores": session.engine.load_hall_of_fame()[:10]})
+            else:
+                self._fail(404, "Unknown endpoint.")
+
+    def _handle_post(self) -> None:
+        if urllib.parse.urlparse(self.path).path != "/api/action":
+            self._fail(404, "Unknown endpoint.")
             return
 
-        if path == "/api/scores":
-            with GLOBAL_SESSION.lock:
-                scores = GLOBAL_SESSION.engine.load_hall_of_fame()[:10]
-            self._set_headers()
-            self.wfile.write(json.dumps({"success": True, "scores": scores}).encode("utf-8"))
+        # Cross-site requests from other web pages are never legitimate.
+        if self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+            self._fail(403, "Cross-site requests are not allowed.")
             return
-
-        # Fallback 404
-        self.send_error(404, "File Not Found")
-
-    def do_POST(self) -> None:
-        global GLOBAL_SESSION
-        if GLOBAL_SESSION is None:
-            GLOBAL_SESSION = GameSession()
-
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path != "/api/action":
-            self.send_error(404, "Unknown endpoint")
+        # Browsers cannot send application/json cross-origin without a
+        # (refused) preflight, so this closes the simple-request CSRF hole.
+        if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+            self._fail(415, "Content-Type must be application/json.")
             return
 
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode("utf-8")
-            data = json.loads(body) if body else {}
-        except Exception as e:
-            self._set_headers(status=400)
-            self.wfile.write(json.dumps({"success": False, "error": f"Invalid JSON: {e}"}).encode("utf-8"))
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._fail(411, "A valid Content-Length header is required.")
+            return
+        if length < 0:
+            self._fail(400, "Invalid Content-Length.")
+            return
+        if length > MAX_BODY_BYTES:
+            self._fail(413, "Request body too large.")
             return
 
-        for numeric_key in ("qty", "amount", "hp"):
-            if numeric_key not in data:
-                continue
-            value = data[numeric_key]
-            if isinstance(value, bool):
-                self._set_headers(status=400)
-                self.wfile.write(json.dumps({
-                    "success": False,
-                    "error": f"{numeric_key} must be an integer.",
-                }).encode("utf-8"))
-                return
-            try:
-                data[numeric_key] = int(value)
-            except (TypeError, ValueError):
-                self._set_headers(status=400)
-                self.wfile.write(json.dumps({
-                    "success": False,
-                    "error": f"{numeric_key} must be an integer.",
-                }).encode("utf-8"))
-                return
+        try:
+            data = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError) as exc:
+            self._fail(400, f"Invalid JSON: {exc}")
+            return
+        if not isinstance(data, dict):
+            self._fail(400, "Request body must be a JSON object.")
+            return
 
-        action = data.get("action", "")
-        success = False
-        message = ""
-        sound: Optional[str] = None
-        logs: List[str] = []
+        session = get_session()
+        try:
+            with session.lock:
+                response = handle_action(session, data)
+        except ActionError as exc:
+            self._fail(400, str(exc))
+            return
+        self._json(response)
 
-        with GLOBAL_SESSION.lock:
-            engine = GLOBAL_SESSION.engine
-
-            # A finished career only allows meta actions (new game, load, save).
-            if engine.is_game_over and action not in (
-                "new_game", "load_game", "save_game",
-            ):
-                success = False
-                message = ("Your career has ended, Captain. "
-                           "Start a new commission or load a flight record.")
-                state = serialize_game_state(GLOBAL_SESSION)
-                self._set_headers()
-                self.wfile.write(json.dumps({
-                    "success": success,
-                    "message": message,
-                    "logs": [],
-                    "sound": None,
-                    "state": state,
-                }).encode("utf-8"))
-                return
-
-            if action == "new_game":
-                name = str(data.get("name", "Commander"))
-                diff = str(data.get("difficulty", "normal")).strip().lower()
-                engine.new_game(name, diff)
-                GLOBAL_SESSION.active_encounter = None
-                GLOBAL_SESSION.active_combat = None
-                GLOBAL_SESSION.last_logs = [f"New commission created for {engine.player.name} on {diff.upper()} difficulty."]
-                success = True
-                message = f"Welcome aboard, {engine.player.name}!"
-                sound = "warp"
-
-            elif action == "travel":
-                dest = str(data.get("destination", ""))
-                ok, msg, enc = engine.execute_travel(dest)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "warp"
-                    if enc:
-                        t = enc.get("type")
-                        if t in ("pirate_ambush", "bounty_combat"):
-                            GLOBAL_SESSION.active_combat = start_combat(engine, enc)
-                            GLOBAL_SESSION.active_encounter = None
-                            sound = "alarm"
-                            logs.append(f"ALARM: Hostile vessel intercepted! {enc.get('title', 'Raider Attack')}")
-                        else:
-                            GLOBAL_SESSION.active_encounter = enc
-                            logs.append(f"Sector Sensor Contact: {enc.get('title', 'Anomaly Detected')}")
-                    else:
-                        GLOBAL_SESSION.active_encounter = None
-                        GLOBAL_SESSION.active_combat = None
-
-            elif action == "resolve_encounter":
-                choice = bool(data.get("choice", False))
-                enc = GLOBAL_SESSION.active_encounter
-                if enc:
-                    t = enc.get("type")
-                    enc_logs: List[str] = []
-                    if t == "customs_scan":
-                        # UI semantics: opt1 (choice=True) = "Submit to Scan",
-                        # opt2 (choice=False) = "Attempt to Bribe" — the engine
-                        # expects bribe=True, hence the inversion here.
-                        enc_logs = engine.resolve_customs(enc, bribe=not choice)
-                        sound = "coin" if not choice else "alarm"
-                    elif t == "faction_patrol":
-                        enc_logs = engine.resolve_faction_patrol(enc, choice)
-                        sound = "coin" if choice else "alarm"
-                    elif t == "derelict":
-                        enc_logs = engine.resolve_derelict(enc, choice)
-                        sound = "upgrade" if choice else "click"
-                    elif t == "solar_flare":
-                        enc_logs = engine.resolve_solar_flare(enc)
-                        sound = "shield_hit"
-                    elif t == "distress_beacon":
-                        enc_logs = engine.resolve_distress(enc, choice)
-                        sound = "coin" if choice else "click"
-                    elif t == "wandering_trader":
-                        enc_logs = engine.resolve_trader(enc, choice)
-                        sound = "buy" if choice else "click"
-                    elif t == "asteroid_field":
-                        enc_logs = engine.resolve_asteroid_field(enc, choice)
-                        sound = "shield_hit" if choice else "coin"
-                    elif t == "wormhole":
-                        enc_logs = engine.resolve_wormhole(enc, choice)
-                        sound = "wormhole" if choice else "click"
-                    elif t == "mining_opportunity":
-                        enc_logs = engine.resolve_mining(enc, choice)
-                        sound = "mine" if choice else "click"
-                    elif t == "comet_mining":
-                        enc_logs = engine.resolve_comet(enc, choice)
-                        sound = "mine" if choice else "click"
-                    elif t == "ghost_freighter":
-                        enc_logs = engine.resolve_ghost(enc, careful=choice)
-                        sound = "victory" if choice else "alarm"
-                    elif t == "derby":
-                        enc_logs = engine.resolve_derby(enc, bet=choice)
-                        sound = "coin"
-
-                    GLOBAL_SESSION.active_encounter = None
-                    if enc.get("type") in ("pirate_ambush", "bounty_combat"):
-                        GLOBAL_SESSION.active_combat = start_combat(engine, enc)
-                        sound = "alarm"
-
-                    success = True
-                    logs.extend(enc_logs)
-                    message = enc_logs[-1] if enc_logs else "Encounter resolved."
-                else:
-                    success = False
-                    message = "No active encounter to resolve."
-
-            elif action == "combat_action":
-                c_act = str(data.get("combat_action", "fire"))
-                combat = GLOBAL_SESSION.active_combat
-                if combat and not combat.is_finished:
-                    c_logs = combat.player_action(c_act)
-                    logs.extend(c_logs)
-                    success = True
-                    message = c_logs[-1] if c_logs else "Combat turn complete."
-
-                    if c_act == "fire":
-                        sound = "laser"
-                    elif c_act == "missile":
-                        sound = "laser"
-                    elif c_act == "recharge":
-                        sound = "upgrade"
-                    elif c_act == "evade":
-                        sound = "warp"
-                    elif c_act == "flee":
-                        sound = "warp" if combat.player_escaped else "alarm"
-                    elif c_act == "board":
-                        sound = "upgrade"
-
-                    if combat.is_finished:
-                        if combat.player_won:
-                            sound = "victory"
-                        elif combat.player_dead:
-                            sound = "death"
-                else:
-                    success = False
-                    message = "No active combat engagement."
-
-            elif action == "dismiss_combat":
-                combat = GLOBAL_SESSION.active_combat
-                if combat and combat.is_finished:
-                    GLOBAL_SESSION.active_combat = None
-                    if combat.player_dead:
-                        # Never persist a destroyed ship over the autosave —
-                        # the pre-combat snapshot is the recovery point.
-                        success = True
-                        message = "Vessel lost. Recovery options available."
-                    else:
-                        engine.autosave()
-                        success = True
-                        message = "Disengaged from combat arena."
-                else:
-                    success = False
-                    message = "Combat is still in progress."
-
-            elif action == "odd_jobs":
-                ok, msg = engine.odd_jobs()
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "coin"
-
-            elif action == "jettison_cargo":
-                good = str(data.get("good", ""))
-                qty = int(data.get("qty", 1))
-                ok, msg = engine.jettison_cargo(good, qty)
-                success = ok
-                message = msg
-                logs.append(msg)
-
-            elif action == "faction_gift":
-                faction = str(data.get("faction", ""))
-                amount = int(data.get("amount", GIFT_MIN))
-                ok, msg = engine.faction_gift(faction, amount)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "coin"
-
-            elif action == "buy_commodity":
-                good = str(data.get("good", ""))
-                qty = int(data.get("qty", 1))
-                ok, msg = engine.buy_commodity(good, qty)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "buy"
-
-            elif action == "sell_commodity":
-                good = str(data.get("good", ""))
-                qty = int(data.get("qty", 1))
-                ok, msg = engine.sell_commodity(good, qty)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "sell"
-
-            elif action == "buy_fuel":
-                amount = int(data.get("amount", 10))
-                ok, msg = engine.buy_fuel(amount)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "coin"
-
-            elif action == "repair_hull":
-                hp = int(data.get("hp", 10))
-                ok, msg = engine.repair_hull(hp)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "upgrade"
-
-            elif action == "repair_subsystems":
-                ok, msg = engine.repair_subsystems()
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "upgrade"
-
-            elif action == "buy_insurance":
-                ok, msg = engine.buy_insurance()
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "coin"
-
-            elif action == "buy_missiles":
-                qty = int(data.get("qty", 1))
-                ok, msg = engine.buy_missiles(qty)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "coin"
-
-            elif action == "buy_ship":
-                ship_id = str(data.get("ship_id", ""))
-                ok, msg = engine.buy_ship(ship_id)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "upgrade"
-
-            elif action == "buy_equipment":
-                eq_id = str(data.get("eq_id", ""))
-                ok, msg = engine.buy_equipment(eq_id)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "upgrade"
-
-            elif action == "sell_equipment":
-                eq_id = str(data.get("eq_id", ""))
-                ok, msg = engine.sell_equipment(eq_id)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "sell"
-
-            elif action == "hire_crew":
-                crew_id = str(data.get("crew_id", ""))
-                ok, msg = engine.hire_crew(crew_id)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "coin"
-
-            elif action == "dismiss_crew":
-                crew_id = str(data.get("crew_id", ""))
-                ok, msg = engine.dismiss_crew(crew_id)
-                success = ok
-                message = msg
-                logs.append(msg)
-
-            elif action == "accept_mission":
-                m_id = str(data.get("mission_id", ""))
-                ok, msg = engine.accept_mission(m_id)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "coin"
-
-            elif action == "abandon_mission":
-                m_id = str(data.get("mission_id", ""))
-                ok, msg = engine.abandon_mission(m_id)
-                success = ok
-                message = msg
-                logs.append(msg)
-
-            elif action == "bank_deposit":
-                amount = int(data.get("amount", 100))
-                ok, msg = engine.deposit(amount)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "coin"
-
-            elif action == "bank_withdraw":
-                amount = int(data.get("amount", 100))
-                ok, msg = engine.withdraw(amount)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "coin"
-
-            elif action == "bank_borrow":
-                amount = int(data.get("amount", 100))
-                ok, msg = engine.borrow(amount)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "coin"
-
-            elif action == "bank_repay":
-                amount = int(data.get("amount", 100))
-                ok, msg = engine.repay(amount)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "coin"
-
-            elif action == "buy_stock":
-                sym = str(data.get("symbol", ""))
-                qty = int(data.get("qty", 1))
-                ok, msg = engine.buy_stock(sym, qty)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "coin"
-
-            elif action == "sell_stock":
-                sym = str(data.get("symbol", ""))
-                qty = int(data.get("qty", 1))
-                ok, msg = engine.sell_stock(sym, qty)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    sound = "coin"
-
-            elif action == "save_game":
-                slot = str(data.get("slot", "1"))
-                ok, msg = engine.save_game(slot)
-                success = ok
-                message = msg
-                logs.append(msg)
-
-            elif action == "load_game":
-                slot = str(data.get("slot", "1"))
-                ok, msg = engine.load_game(slot)
-                success = ok
-                message = msg
-                logs.append(msg)
-                if ok:
-                    GLOBAL_SESSION.active_encounter = None
-                    GLOBAL_SESSION.active_combat = None
-                    sound = "warp"
-
-            else:
-                success = False
-                message = f"Unknown action: {action}"
-
-            if logs:
-                GLOBAL_SESSION.last_logs.extend(logs)
-                GLOBAL_SESSION.last_logs = GLOBAL_SESSION.last_logs[-15:]
-
-            promo = engine.check_promotion()
-            if promo:
-                sound = "rank_up"
-                GLOBAL_SESSION.last_logs.append(f"PROMOTION: Promoted to rank of {promo.name}! {promo.perk}")
-
-            state = serialize_game_state(GLOBAL_SESSION)
-
-        self._set_headers()
-        self.wfile.write(json.dumps({
-            "success": success,
-            "message": message,
-            "logs": logs,
-            "sound": sound,
-            "state": state,
-        }).encode("utf-8"))
 
 
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -8969,7 +9199,8 @@ def run_self_test() -> None:
         lost_val = sum(EQUIPMENT_ITEMS[w].cost for w in e_dg.player.equipped_weapons[2:])
         e_dg.buy_ship("orion")             # 2 weapon slots -> truncation
         expected_refund = int(lost_val * 0.75)
-        net_ship_cost = max(0, SHIP_TEMPLATES["orion"].cost - int(SHIP_TEMPLATES["valkyrie"].cost * 0.7))
+        # Signed: a cheaper hull pays you the trade-in difference.
+        net_ship_cost = SHIP_TEMPLATES["orion"].cost - int(SHIP_TEMPLATES["valkyrie"].cost * 0.7)
         expected_after = before_credits - net_ship_cost + expected_refund
         check("truncated equipment refunded at 75%",
               e_dg.player.credits == expected_after,
@@ -9253,7 +9484,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--mute", action="store_true", help="Legacy flag: server audio is always silent (browser handles sound).")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "3000")), help="HTTP server port")
-    parser.add_argument("--host", default="0.0.0.0", help="HTTP server bind host")
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0" if os.environ.get("PORT") else "127.0.0.1",
+        help="HTTP bind host (default: localhost only; 0.0.0.0 when $PORT is set by a host)",
+    )
 
     args = parser.parse_args()
 
@@ -9273,7 +9508,13 @@ def main() -> None:
     GLOBAL_SESSION = GameSession(difficulty=args.difficulty, player_name=args.player)
 
     server_address = (args.host, args.port)
-    httpd = ThreadedHTTPServer(server_address, SpaceTraderWebHandler)
+    try:
+        httpd = ThreadedHTTPServer(server_address, SpaceTraderWebHandler)
+    except OSError as exc:
+        print(f"Cannot listen on {args.host}:{args.port} — {exc}.\n"
+              f"Try another port:  python3 spacetrader.py --port {args.port + 1}",
+              file=sys.stderr)
+        sys.exit(1)
 
     print("=" * 76)
     print("🚀 SPACE TRADER: ODYSSEY — BROWSER EDITION")
