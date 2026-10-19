@@ -78,6 +78,9 @@ import threading
 # CONSTANTS & HELPERS
 # ==============================================================================
 
+APP_VERSION = "2.2.0"
+__version__ = APP_VERSION
+
 TARGET_NET_WORTH = 500_000
 STARTING_CREDITS = 2_500      # fallback default; difficulties override this
 STARTING_SHIP = "sparrow"
@@ -112,12 +115,12 @@ def sanitize_name(name: str) -> str:
 
 
 def to_int(value: Any, lo: int = -MAX_INT_INPUT, hi: int = MAX_INT_INPUT) -> int:
-    """Strictly coerce untrusted input to a bounded int.
+    """Parse a bounded integer without silently truncating fractional values.
 
-    Accepts ints, integral-looking floats and numeric strings. Rejects bools,
-    NaN, +/-inf, containers and gibberish with ValueError, so callers never hit
-    OverflowError/TypeError surprises (``int(float('inf'))`` raises
-    OverflowError, which a plain ``except ValueError`` would miss)."""
+    Booleans, non-finite numbers, containers, fractional floats, and numeric
+    strings such as ``"1.5"`` are rejected. Integral decimal/exponent strings
+    (for example ``"3.0"`` or ``"1e2"``) remain accepted for compatibility.
+    """
     if isinstance(value, bool) or value is None:
         raise ValueError("expected an integer")
     if isinstance(value, int):
@@ -125,9 +128,13 @@ def to_int(value: Any, lo: int = -MAX_INT_INPUT, hi: int = MAX_INT_INPUT) -> int
     elif isinstance(value, float):
         if not math.isfinite(value):
             raise ValueError("expected a finite number")
+        if not value.is_integer():
+            raise ValueError("expected an integer")
         number = int(value)
     elif isinstance(value, str):
         text = value.strip()
+        if not text:
+            raise ValueError("expected an integer")
         try:
             number = int(text)
         except ValueError:
@@ -137,6 +144,8 @@ def to_int(value: Any, lo: int = -MAX_INT_INPUT, hi: int = MAX_INT_INPUT) -> int
                 raise ValueError("expected an integer") from None
             if not math.isfinite(as_float):
                 raise ValueError("expected a finite number") from None
+            if not as_float.is_integer():
+                raise ValueError("expected an integer") from None
             number = int(as_float)
     else:
         raise ValueError("expected an integer")
@@ -6032,11 +6041,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let audioMuted = false;
 
     function initAudio() {
-      if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      }
-      if (audioCtx.state === 'suspended') {
-        audioCtx.resume();
+      try {
+        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextCtor) return false;
+        if (!audioCtx) audioCtx = new AudioContextCtor();
+        if (audioCtx.state === 'suspended') {
+          const resumeResult = audioCtx.resume();
+          if (resumeResult && typeof resumeResult.catch === 'function') {
+            resumeResult.catch(() => {}); // Browser autoplay policy may defer audio.
+          }
+        }
+        return true;
+      } catch (_) {
+        audioCtx = null;
+        return false;
       }
     }
 
@@ -6047,147 +6065,149 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     function playSound(type) {
-      if (audioMuted) return;
-      initAudio();
-      if (!audioCtx) return;
-      const now = audioCtx.currentTime;
+      if (audioMuted || !initAudio() || !audioCtx) return;
+      try {
+        const now = audioCtx.currentTime;
 
-      if (type === 'laser') {
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = 'sawtooth';
-        osc.frequency.setValueAtTime(880, now);
-        osc.frequency.exponentialRampToValueAtTime(110, now + 0.12);
-        gain.gain.setValueAtTime(0.2, now);
-        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.12);
-        osc.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start(now);
-        osc.stop(now + 0.12);
-      } else if (type === 'buy' || type === 'coin') {
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(987, now);
-        osc.frequency.setValueAtTime(1318, now + 0.08);
-        gain.gain.setValueAtTime(0.15, now);
-        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.2);
-        osc.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start(now);
-        osc.stop(now + 0.2);
-      } else if (type === 'sell') {
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = 'triangle';
-        osc.frequency.setValueAtTime(1046, now);
-        osc.frequency.setValueAtTime(1567, now + 0.08);
-        gain.gain.setValueAtTime(0.18, now);
-        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.22);
-        osc.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start(now);
-        osc.stop(now + 0.22);
-      } else if (type === 'warp') {
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(130, now);
-        osc.frequency.exponentialRampToValueAtTime(650, now + 0.4);
-        gain.gain.setValueAtTime(0.25, now);
-        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.45);
-        osc.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start(now);
-        osc.stop(now + 0.45);
-      } else if (type === 'alarm') {
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = 'square';
-        osc.frequency.setValueAtTime(600, now);
-        osc.frequency.setValueAtTime(400, now + 0.1);
-        gain.gain.setValueAtTime(0.15, now);
-        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
-        osc.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start(now);
-        osc.stop(now + 0.25);
-      } else if (type === 'shield_hit') {
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(330, now);
-        osc.frequency.exponentialRampToValueAtTime(180, now + 0.18);
-        gain.gain.setValueAtTime(0.16, now);
-        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.18);
-        osc.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start(now);
-        osc.stop(now + 0.18);
-      } else if (type === 'death') {
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = 'sawtooth';
-        osc.frequency.setValueAtTime(220, now);
-        osc.frequency.exponentialRampToValueAtTime(40, now + 0.9);
-        gain.gain.setValueAtTime(0.22, now);
-        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.9);
-        osc.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start(now);
-        osc.stop(now + 0.9);
-      } else if (type === 'mine') {
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = 'triangle';
-        osc.frequency.setValueAtTime(90, now);
-        osc.frequency.setValueAtTime(60, now + 0.15);
-        gain.gain.setValueAtTime(0.25, now);
-        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
-        osc.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start(now);
-        osc.stop(now + 0.3);
-      } else if (type === 'wormhole') {
-        const osc = audioCtx.createOscillator();
-        const osc2 = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = 'sine';
-        osc2.type = 'sine';
-        osc.frequency.setValueAtTime(200, now);
-        osc.frequency.exponentialRampToValueAtTime(900, now + 0.5);
-        osc2.frequency.setValueAtTime(205, now);
-        osc2.frequency.exponentialRampToValueAtTime(880, now + 0.5);
-        gain.gain.setValueAtTime(0.18, now);
-        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.55);
-        osc.connect(gain); osc2.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start(now); osc2.start(now);
-        osc.stop(now + 0.55); osc2.stop(now + 0.55);
-      } else if (type === 'click') {
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(660, now);
-        gain.gain.setValueAtTime(0.08, now);
-        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.06);
-        osc.connect(gain);
-        gain.connect(audioCtx.destination);
-        osc.start(now);
-        osc.stop(now + 0.06);
-      } else if (type === 'victory' || type === 'rank_up') {
-        [523.25, 659.25, 783.99, 1046.50].forEach((freq, i) => {
+        if (type === 'laser') {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sawtooth';
+          osc.frequency.setValueAtTime(880, now);
+          osc.frequency.exponentialRampToValueAtTime(110, now + 0.12);
+          gain.gain.setValueAtTime(0.2, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.12);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(now);
+          osc.stop(now + 0.12);
+        } else if (type === 'buy' || type === 'coin') {
           const osc = audioCtx.createOscillator();
           const gain = audioCtx.createGain();
           osc.type = 'sine';
-          osc.frequency.setValueAtTime(freq, now + i * 0.08);
-          gain.gain.setValueAtTime(0.15, now + i * 0.08);
-          gain.gain.exponentialRampToValueAtTime(0.01, now + i * 0.08 + 0.35);
+          osc.frequency.setValueAtTime(987, now);
+          osc.frequency.setValueAtTime(1318, now + 0.08);
+          gain.gain.setValueAtTime(0.15, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.2);
           osc.connect(gain);
           gain.connect(audioCtx.destination);
-          osc.start(now + i * 0.08);
-          osc.stop(now + i * 0.08 + 0.35);
-        });
+          osc.start(now);
+          osc.stop(now + 0.2);
+        } else if (type === 'sell') {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'triangle';
+          osc.frequency.setValueAtTime(1046, now);
+          osc.frequency.setValueAtTime(1567, now + 0.08);
+          gain.gain.setValueAtTime(0.18, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.22);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(now);
+          osc.stop(now + 0.22);
+        } else if (type === 'warp') {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(130, now);
+          osc.frequency.exponentialRampToValueAtTime(650, now + 0.4);
+          gain.gain.setValueAtTime(0.25, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.45);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(now);
+          osc.stop(now + 0.45);
+        } else if (type === 'alarm') {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'square';
+          osc.frequency.setValueAtTime(600, now);
+          osc.frequency.setValueAtTime(400, now + 0.1);
+          gain.gain.setValueAtTime(0.15, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(now);
+          osc.stop(now + 0.25);
+        } else if (type === 'shield_hit') {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(330, now);
+          osc.frequency.exponentialRampToValueAtTime(180, now + 0.18);
+          gain.gain.setValueAtTime(0.16, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.18);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(now);
+          osc.stop(now + 0.18);
+        } else if (type === 'death') {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sawtooth';
+          osc.frequency.setValueAtTime(220, now);
+          osc.frequency.exponentialRampToValueAtTime(40, now + 0.9);
+          gain.gain.setValueAtTime(0.22, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.9);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(now);
+          osc.stop(now + 0.9);
+        } else if (type === 'mine') {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'triangle';
+          osc.frequency.setValueAtTime(90, now);
+          osc.frequency.setValueAtTime(60, now + 0.15);
+          gain.gain.setValueAtTime(0.25, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(now);
+          osc.stop(now + 0.3);
+        } else if (type === 'wormhole') {
+          const osc = audioCtx.createOscillator();
+          const osc2 = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sine';
+          osc2.type = 'sine';
+          osc.frequency.setValueAtTime(200, now);
+          osc.frequency.exponentialRampToValueAtTime(900, now + 0.5);
+          osc2.frequency.setValueAtTime(205, now);
+          osc2.frequency.exponentialRampToValueAtTime(880, now + 0.5);
+          gain.gain.setValueAtTime(0.18, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.55);
+          osc.connect(gain); osc2.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(now); osc2.start(now);
+          osc.stop(now + 0.55); osc2.stop(now + 0.55);
+        } else if (type === 'click') {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(660, now);
+          gain.gain.setValueAtTime(0.08, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.06);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(now);
+          osc.stop(now + 0.06);
+        } else if (type === 'victory' || type === 'rank_up') {
+          [523.25, 659.25, 783.99, 1046.50].forEach((freq, i) => {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(freq, now + i * 0.08);
+            gain.gain.setValueAtTime(0.15, now + i * 0.08);
+            gain.gain.exponentialRampToValueAtTime(0.01, now + i * 0.08 + 0.35);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start(now + i * 0.08);
+            osc.stop(now + i * 0.08 + 0.35);
+          });
+        }
+      } catch (_) {
+        // Audio is an optional enhancement; keep gameplay working if playback fails.
       }
     }
 
@@ -8486,7 +8506,12 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
     allowance, and state-changing requests must be same-origin JSON, so a random
     web page open in your browser cannot drive or corrupt your game."""
 
-    server_version = "SpaceTraderOdyssey/2.1"
+    server_version = f"SpaceTraderOdyssey/{APP_VERSION.rsplit('.', 1)[0]}"
+    sys_version = ""
+
+    def version_string(self) -> str:
+        # Do not advertise the Python runtime version in the Server header.
+        return self.server_version
 
     def log_message(self, format: str, *args: Any) -> None:
         """Suppress noisy default HTTP access logs."""
@@ -8500,7 +8525,11 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         if content_type.startswith("text/html"):
             self.send_header("Content-Security-Policy", HTML_CSP)
         self.end_headers()
@@ -8527,7 +8556,7 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         try:
             self._handle_get()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
         except Exception:
             self._internal_error()
@@ -8535,7 +8564,7 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             self._handle_post()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
         except Exception:
             self._internal_error()
@@ -8559,7 +8588,7 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
             self._send(HTML_PAGE.encode("utf-8"), "text/html; charset=utf-8")
             return
         if path == "/api/health":
-            self._json({"status": "ok", "app": "Space Trader: Odyssey"})
+            self._json({"status": "ok", "app": "Space Trader: Odyssey", "version": APP_VERSION})
             return
 
         if not path.startswith("/api/"):
@@ -8595,18 +8624,45 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
         if self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
             self._fail(403, "Cross-site requests are not allowed.")
             return
-        # Browsers cannot send application/json cross-origin without a
-        # (refused) preflight, so this closes the simple-request CSRF hole.
-        if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+
+        # Browsers set Origin on fetch/XHR POSTs. When present, require the
+        # same HTTP origin as this listener. Clients without Origin remain
+        # supported for local CLI/API tooling; this server is not internet-safe.
+        origin = self.headers.get("Origin")
+        if origin:
+            parsed_origin = urllib.parse.urlsplit(origin)
+            request_host = self.headers.get("Host", "").strip().lower()
+            if (parsed_origin.scheme not in ("http", "https") or not parsed_origin.netloc
+                    or parsed_origin.netloc.lower() != request_host
+                    or parsed_origin.path not in ("",) or parsed_origin.query
+                    or parsed_origin.fragment or parsed_origin.username
+                    or parsed_origin.password):
+                self._fail(403, "Origin does not match this game server.")
+                return
+
+        # Reject transfer encodings and repeated Content-Length headers before
+        # reading a body, avoiding ambiguous framing and request-smuggling cases.
+        if self.headers.get("Transfer-Encoding") is not None:
+            self._fail(400, "Transfer-Encoding is not supported.")
+            return
+        content_lengths = self.headers.get_all("Content-Length", [])
+        if len(content_lengths) != 1:
+            self._fail(411, "Exactly one Content-Length header is required.")
+            return
+
+        content_type = self.headers.get("Content-Type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
             self._fail(415, "Content-Type must be application/json.")
             return
 
-        try:
-            length = int(self.headers.get("Content-Length", ""))
-        except ValueError:
-            self._fail(411, "A valid Content-Length header is required.")
+        raw_length = content_lengths[0].strip()
+        if not raw_length.isascii() or not raw_length.isdecimal():
+            self._fail(400, "Invalid Content-Length.")
             return
-        if length < 0:
+        try:
+            length = int(raw_length)
+        except ValueError:
             self._fail(400, "Invalid Content-Length.")
             return
         if length > MAX_BODY_BYTES:
@@ -8614,7 +8670,11 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
             return
 
         try:
-            data = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            raw_body = self.rfile.read(length)
+            if len(raw_body) != length:
+                self._fail(400, "Request body ended before Content-Length bytes were received.")
+                return
+            data = json.loads(raw_body.decode("utf-8") or "{}")
         except (ValueError, UnicodeDecodeError) as exc:
             self._fail(400, f"Invalid JSON: {exc}")
             return
@@ -8634,9 +8694,16 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
 
 
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    """Multi-threaded server to handle concurrent frontend requests seamlessly."""
+    """Threaded server with bounded client sockets for a small local game."""
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 32
+    client_socket_timeout = 10.0
+
+    def get_request(self):
+        request, client_address = super().get_request()
+        request.settimeout(self.client_socket_timeout)
+        return request, client_address
 
 # ==============================================================================
 # ENGINE SELF-TEST SUITE & RUNNER (21-suite headless verification)
@@ -8676,6 +8743,13 @@ def run_self_test() -> None:
         check("planet coordinates unique", len({(p.x, p.y) for p in e_init.planets.values()}) == len(e_init.planets))
         check("4 factions defined", len(FACTIONS) == 4)
         check("all planet factions are known factions", all(p.faction in FACTIONS for p in e_init.planets.values()))
+        check("integer parser preserves integral values", to_int("12.0") == 12 and to_int(7.0) == 7)
+        try:
+            to_int(1.5)
+            fractional_rejected = False
+        except ValueError:
+            fractional_rejected = True
+        check("integer parser rejects fractional values", fractional_rejected)
         check("faction stocks are valid symbols", all(s in DEFAULT_STOCKS for s in FACTION_STOCK_LINK.values()))
         check("6 ranks defined", len(RANKS) == 6)
         check("enemy damage table covers all ship classes", all(
@@ -9353,6 +9427,7 @@ def run_web_test() -> None:
     print("Running headless Web Server smoke test...")
     import urllib.request
     import tempfile
+    import socket
     scratch = tempfile.mkdtemp(prefix="st_webtest_")
     os.environ["ST_SAVE_DIR"] = scratch
 
@@ -9369,7 +9444,17 @@ def run_web_test() -> None:
             html = resp.read().decode("utf-8")
             assert "<!DOCTYPE html>" in html
             assert "Space Trader: Odyssey" in html
-            print("  [PASS] GET / (HTML frontend)")
+            assert resp.headers.get("X-Frame-Options") == "DENY"
+            assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+            assert resp.headers.get("Content-Security-Policy")
+            print("  [PASS] GET / (HTML frontend + security headers)")
+
+        # 1b. Health endpoint includes an explicit app version.
+        with urllib.request.urlopen(f"{base_url}/api/health") as resp:
+            health = json.loads(resp.read().decode("utf-8"))
+            assert health["status"] == "ok" and health["version"] == "2.2.0"
+            assert "Python/" not in resp.headers.get("Server", "")
+            print("  [PASS] GET /api/health (versioned, minimal server header)")
 
         # 2. Check state API
         with urllib.request.urlopen(f"{base_url}/api/state") as resp:
@@ -9392,7 +9477,7 @@ def run_web_test() -> None:
         req = urllib.request.Request(
             f"{base_url}/api/action",
             data=json.dumps({"action": "bank_deposit", "amount": 100}).encode("utf-8"),
-            headers={"Content-Type": "application/json"}
+            headers={"Content-Type": "application/json; charset=utf-8", "Origin": base_url}
         )
         with urllib.request.urlopen(req) as resp:
             assert resp.status == 200
@@ -9424,6 +9509,91 @@ def run_web_test() -> None:
         except urllib.error.HTTPError as exc:
             assert exc.code == 400
             print("  [PASS] malformed numeric action rejected")
+
+        fractional_req = urllib.request.Request(
+            f"{base_url}/api/action",
+            data=json.dumps({"action": "buy_commodity", "good": "water", "qty": 1.5}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            urllib.request.urlopen(fractional_req)
+            raise AssertionError("fractional quantity should be rejected")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400
+            print("  [PASS] fractional quantity rejected")
+
+        wrong_type_req = urllib.request.Request(
+            f"{base_url}/api/action", data=b"{}", headers={"Content-Type": "application/jsonp"}
+        )
+        try:
+            urllib.request.urlopen(wrong_type_req)
+            raise AssertionError("JSONP content type should be rejected")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 415
+            print("  [PASS] non-JSON media type rejected")
+
+        cross_origin_req = urllib.request.Request(
+            f"{base_url}/api/action", data=b'{"action":"odd_jobs"}',
+            headers={"Content-Type": "application/json", "Origin": "http://attacker.invalid"}
+        )
+        try:
+            urllib.request.urlopen(cross_origin_req)
+            raise AssertionError("cross-origin request should be rejected")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 403
+            print("  [PASS] mismatched Origin rejected")
+
+        oversized_req = urllib.request.Request(
+            f"{base_url}/api/action", data=b"x" * (MAX_BODY_BYTES + 1),
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            urllib.request.urlopen(oversized_req)
+            raise AssertionError("oversized request should be rejected")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 413
+            print("  [PASS] oversized request rejected before JSON parsing")
+
+        transfer_req = urllib.request.Request(
+            f"{base_url}/api/action", data=b'{"action":"odd_jobs"}',
+            headers={"Content-Type": "application/json", "Transfer-Encoding": "chunked"}
+        )
+        try:
+            urllib.request.urlopen(transfer_req)
+            raise AssertionError("Transfer-Encoding should be rejected")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400
+            print("  [PASS] ambiguous Transfer-Encoding rejected")
+
+        def raw_request(request_bytes: bytes) -> bytes:
+            with socket.create_connection(("127.0.0.1", port), timeout=3) as sock:
+                sock.settimeout(3)
+                sock.sendall(request_bytes)
+                chunks = []
+                while True:
+                    try:
+                        chunk = sock.recv(4096)
+                    except socket.timeout:
+                        break
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                return b"".join(chunks)
+
+        missing_length = raw_request(
+            b"POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:" + str(port).encode()
+            + b"\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}"
+        )
+        assert missing_length.startswith(b"HTTP/1.0 411") or missing_length.startswith(b"HTTP/1.1 411")
+        print("  [PASS] missing Content-Length rejected")
+
+        duplicate_length = raw_request(
+            b"POST /api/action HTTP/1.1\r\nHost: 127.0.0.1:" + str(port).encode()
+            + b"\r\nContent-Type: application/json\r\nContent-Length: 2\r\n"
+            + b"Content-Length: 2\r\nConnection: close\r\n\r\n{}"
+        )
+        assert duplicate_length.startswith(b"HTTP/1.0 411") or duplicate_length.startswith(b"HTTP/1.1 411")
+        print("  [PASS] duplicate Content-Length rejected")
 
         # 6. New endpoints: odd jobs + jettison + gifts
         req_jobs = urllib.request.Request(
@@ -9475,15 +9645,27 @@ def run_web_test() -> None:
 # MAIN ENTRY POINT
 # ==============================================================================
 
+def parse_port(value: str) -> int:
+    """Parse a valid TCP port for the command-line interface."""
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("port must be an integer between 1 and 65535") from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Space Trader: Odyssey — Nebula Edition (Browser HTML)")
+    parser.add_argument("--version", action="version", version=f"Space Trader: Odyssey {APP_VERSION}")
     parser.add_argument("--test", action="store_true", help="Run headless engine self-test suite and exit.")
     parser.add_argument("--web-test", action="store_true", help="Run headless web server smoke test and exit.")
     parser.add_argument("--difficulty", choices=list(DIFFICULTIES.keys()), default="normal")
     parser.add_argument("--player", default="Commander")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--mute", action="store_true", help="Legacy flag: server audio is always silent (browser handles sound).")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "3000")), help="HTTP server port")
+    parser.add_argument("--port", type=parse_port, default=os.environ.get("PORT", "3000"), help="HTTP server port (1-65535)")
     parser.add_argument(
         "--host",
         default="0.0.0.0" if os.environ.get("PORT") else "127.0.0.1",

@@ -1,0 +1,17 @@
+# Python bytecode and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Local game careers and Hall of Fame data
+st_odyssey_save_*.json
+st_odyssey_scores.json
+.st_tmp_*.json
+
+# Editor / operating-system metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
