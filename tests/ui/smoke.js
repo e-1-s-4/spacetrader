@@ -65,6 +65,99 @@ const errors = [];
     w.eval(`sendAction('travel',{destination:${JSON.stringify(dests[i % dests.length])}})`); await sleep(300);
   }
   console.log('encounter UIs exercised:', [...seen].join(', ') || '(none)');
+
+  // --- regression: a destroyed vessel must never trap the player ---
+  // The combat overlay used to sit above the game-over modal, and its only
+  // button fired an action the server refused once the career was over.
+  const zOf = (sel) => { const el = w.document.querySelector(sel); return el ? (parseInt(w.getComputedStyle(el).zIndex, 10) || 0) : 0; };
+  ok(zOf('#gameover-modal') > zOf('#combat-modal'), 'game-over modal stacks above the combat overlay');
+  const fakeCombat = {
+    is_finished: true, player_won: false, player_escaped: false, player_dead: true,
+    turn_count: 4, enemy_name: 'Reaper', enemy_ship_name: 'Galactic Behemoth',
+    personality: 'aggressive', personality_desc: 'fights head-on', threat_level: 'CRITICAL',
+    enemy_damage_lo: 20, enemy_damage_hi: 44, enemy_hull: 0, enemy_max_hull: 600,
+    enemy_shield: 0, enemy_max_shield: 300, player_missiles: 0, has_drone_bay: false,
+    drones_active: false, can_flee: true, can_board: false,
+    combat_log: ['CRITICAL FAILURE: Ship destroyed in combat!']
+  };
+  w.eval(`gameState = Object.assign({}, gameState, {
+      player: Object.assign({}, gameState.player, { is_game_over: true }),
+      active_combat: ${JSON.stringify(fakeCombat)}
+  }); renderAll();`);
+  ok(w.document.getElementById('combat-btn-dismiss').dataset.mode === 'recover',
+     'destroyed-vessel dismiss button switches to recovery mode');
+  w.eval('combatDismiss()');
+  ok(w.document.getElementById('gameover-modal').classList.contains('active'),
+     'recovery screen opens from the combat overlay');
+  w.document.getElementById('gameover-modal').classList.remove('active');
+  w.eval(`gameState.active_combat = null; gameState.player.is_game_over = false; renderAll();`);
+
+  // --- accessibility ---
+  const MODALS = ['trade-modal','combat-modal','encounter-modal','save-modal',
+                  'newgame-modal','manual-modal','gameover-modal','victory-modal',
+                  'amount-modal'];
+  const badModals = MODALS.filter(id => {
+    const el = w.document.getElementById(id);
+    return !el || el.getAttribute('role') !== 'dialog' || el.getAttribute('aria-modal') !== 'true';
+  });
+  ok(badModals.length === 0, `every overlay is a labelled dialog${badModals.length ? ': ' + badModals.join(', ') : ''}`);
+
+  const unlabelled = MODALS.filter(id => {
+    const el = w.document.getElementById(id);
+    if (!el) return true;
+    const by = el.getAttribute('aria-labelledby');
+    return !(by && w.document.getElementById(by)) && !el.getAttribute('aria-label');
+  });
+  ok(unlabelled.length === 0, `every dialog has an accessible name${unlabelled.length ? ': ' + unlabelled.join(', ') : ''}`);
+
+  // The tab strip must expose the ARIA tabs pattern.
+  const nav = w.document.getElementById('tab-nav');
+  const tabBtns = Array.from(w.document.querySelectorAll('.tab-btn'));
+  ok(nav.getAttribute('role') === 'tablist', 'tab strip is a tablist');
+  ok(tabBtns.every(b => b.getAttribute('role') === 'tab' && b.hasAttribute('aria-selected')),
+     'every tab button is a tab with aria-selected');
+
+  // Opening a dialog must move focus into it; Escape must close it again.
+  w.eval(`openManualModal()`);
+  const manual = w.document.getElementById('manual-modal');
+  ok(manual.classList.contains('active'), 'manual dialog opens');
+  ok(manual.contains(w.document.activeElement), 'focus moves into the opened dialog');
+  w.eval(`document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}))`);
+  ok(!manual.classList.contains('active'), 'Escape closes the dialog');
+
+  // The star map must be reachable without a mouse.
+  w.eval(`switchTab('map')`); await sleep(200);
+  const nodes = Array.from(w.document.querySelectorAll('.map-planet-node'));
+  ok(nodes.length > 0 && nodes.every(n => n.getAttribute('tabindex') === '0'
+       && n.getAttribute('role') === 'button' && n.getAttribute('aria-label')),
+     'every planet on the star map is a labelled, focusable control');
+
+  // Arrow keys must move between tabs.
+  w.eval(`switchTab('map')`);
+  w.document.getElementById('tabbtn-map').focus();
+  w.eval(`document.getElementById('tab-nav').dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowRight', bubbles: true}))`);
+  ok(w.document.getElementById('tabbtn-market').getAttribute('aria-selected') === 'true',
+     'arrow keys move between tabs');
+
+  // Combat hotkeys must reach the combat engine. Spy on the dispatcher so the
+  // check is about the keyboard wiring, not about a live server-side fight.
+  w.eval(`window.__combatKeys = [];
+          window.__origSendCombatAction = window.sendCombatAction;
+          window.sendCombatAction = (a) => { window.__combatKeys.push(a); };
+          gameState.active_combat = ${JSON.stringify(Object.assign({}, fakeCombat, {
+              is_finished: false, player_dead: false, player_won: false, turn_count: 0 }))};`);
+  w.eval(`document.body.dispatchEvent(new KeyboardEvent('keydown', {key: 'f', bubbles: true}))`);
+  ok(w.eval('window.__combatKeys[0]') === 'fire',
+     'the fire hotkey reaches the combat engine');
+  w.eval(`window.sendCombatAction = window.__origSendCombatAction;
+          window.__combatKeys = [];
+          gameState.active_combat = null; renderAll();`);
+
+  // Audio preference must survive a reload.
+  w.eval(`localStorage.setItem('st_odyssey_muted', '1'); loadAudioPreference();`);
+  ok(w.eval('audioMuted') === true, 'mute preference is restored from storage');
+  w.eval(`localStorage.removeItem('st_odyssey_muted'); loadAudioPreference();`);
+
   // refused action while encounter pending is surfaced, not silently dropped
   console.log(errors.length ? '\nERRORS:\n' + errors.join('\n') : '\nNO RUNTIME ERRORS');
   srv.kill(); process.exit(errors.length ? 1 : 0);
