@@ -1,12 +1,16 @@
 {
   "name": "space-trader-odyssey",
-  "version": "2.1.0",
+  "version": "2.3.0",
   "description": "Space Trader: Odyssey — Sci-Fi RPG and Trading Simulator (single-file Python, browser interface)",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "dev": "python3 spacetrader.py",
     "start": "python3 spacetrader.py",
-    "build": "python3 spacetrader.py --test",
-    "test": "python3 spacetrader.py --test && python3 spacetrader.py --web-test && python3 -m unittest discover -s tests",
+    "test": "npm run test:engine && npm run test:web && npm run test:regression && npm run test:ui",
     "test:engine": "python3 spacetrader.py --test",
     "test:web": "python3 spacetrader.py --web-test",
     "test:regression": "python3 -m unittest discover -s tests -v",

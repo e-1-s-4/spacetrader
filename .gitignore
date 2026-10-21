@@ -5,6 +5,9 @@ __pycache__/
 venv/
 .env
 
+# Node dev dependencies (jsdom is only needed for the browser UI smoke test)
+node_modules/
+
 # Local game careers and Hall of Fame data
 st_odyssey_save_*.json
 st_odyssey_scores.json

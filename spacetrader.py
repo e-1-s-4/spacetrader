@@ -78,7 +78,7 @@ import threading
 # CONSTANTS & HELPERS
 # ==============================================================================
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 __version__ = APP_VERSION
 
 TARGET_NET_WORTH = 500_000
@@ -97,6 +97,8 @@ HOF_FILENAME = "st_odyssey_scores.json"   # persistent Hall of Fame flight recor
 HOF_MAX_ENTRIES = 10
 GIFT_MIN = 500               # minimum diplomatic gift
 MIN_SPREAD = 0.01            # a station always keeps at least a 1% edge per side
+MIN_ROUTE_MARGIN_CR = 3     # trade advisor: absolute floor on a route's margin
+MIN_ROUTE_MARGIN_PCT = 0.05  # ...and a proportional floor (5% of the buy price)
 IMPACT_RATE = 0.002          # market-depth: price pressure per unit traded...
 IMPACT_CAP = 0.08            # ...capped at 8% per transaction
 SAVINGS_DAILY_RATE = 0.002   # 0.2% daily on the first SAVINGS_INTEREST_CAP credits
@@ -767,7 +769,7 @@ class ShipTemplate:
 
 SHIP_TEMPLATES: Dict[str, ShipTemplate] = {
     "sparrow": ShipTemplate(
-        "sparrow", "Star Sparrow", "Light Courier", 0,
+        "sparrow", "Star Sparrow", "Light Courier", 4_000,
         cargo_cap=25, max_hull=100, max_shield=40, max_fuel=130, speed=1.2,
         weapon_slots=1, shield_slots=1, module_slots=2,
         desc="Nimble starter vessel with decent speed and low operating cost."
@@ -1961,12 +1963,14 @@ class GameEngine:
         # floor(x + 0.5): round-half-up, identical in Python and JavaScript
         return int(math.floor(unit_price * qty * impact / 2.0 + 0.5))
 
-    def quote_buy(self, good: str, qty: int) -> int:
-        unit = self.get_buy_price(good)
+    def quote_buy(self, good: str, qty: int, planet: Optional[Planet] = None) -> int:
+        """Total cost of buying ``qty`` here, market-depth fee included."""
+        unit = self.get_buy_price(good, planet)
         return unit * qty + self.market_depth_fee(unit, qty)
 
-    def quote_sell(self, good: str, qty: int) -> int:
-        unit = self.get_sell_price(good)
+    def quote_sell(self, good: str, qty: int, planet: Optional[Planet] = None) -> int:
+        """Total credits received for selling ``qty`` here, fee included."""
+        unit = self.get_sell_price(good, planet)
         return max(0, unit * qty - self.market_depth_fee(unit, qty))
 
     def _remove_cargo_tracked(self, good: str, qty: int) -> int:
@@ -1975,6 +1979,23 @@ class GameEngine:
         if self.player.cargo.get(good, 0) <= 0:
             self.player.cargo_cost_basis.pop(good, None)
         return removed
+
+    def _acquire_cargo(self, good: str, qty: int, unit_cost: float) -> int:
+        """Take on cargo and fold its cost into the weighted-average basis.
+
+        Both the market and the mission board go through here so the hold
+        readout and the trading statistics always describe the cargo the
+        player actually has.
+        """
+        if qty <= 0:
+            return 0
+        old_qty = self.player.cargo.get(good, 0)
+        old_basis = self.player.cargo_cost_basis.get(good, float(unit_cost))
+        added = self.player.add_cargo(good, qty)
+        if added > 0:
+            new_basis = (old_qty * old_basis + unit_cost * added) / max(1, old_qty + added)
+            self.player.cargo_cost_basis[good] = round(new_basis, 2)
+        return added
 
     def _price_impact(self, good: str, qty: int, direction: str) -> None:
         """Local supply/demand feedback: trading nudges the market price."""
@@ -2015,12 +2036,7 @@ class GameEngine:
         p.stock[good] = stock - qty
 
         # Track weighted average cost basis (including market-depth slippage)
-        old_qty = self.player.cargo.get(good, 0)
-        old_basis = self.player.cargo_cost_basis.get(good, float(price))
-        new_basis = (old_qty * old_basis + total_cost) / max(1, old_qty + qty)
-        self.player.cargo_cost_basis[good] = round(new_basis, 2)
-
-        added = self.player.add_cargo(good, qty)
+        added = self._acquire_cargo(good, qty, total_cost / max(1, qty))
         self._price_impact(good, qty, "buy")
         self.sound.play("buy")
         msg = f"Purchased {added}x {COMMODITIES[good].name} for {money(total_cost)} CR."
@@ -2428,7 +2444,13 @@ class GameEngine:
                 if m.cargo_good and m.cargo_qty > 0:
                     if self.player.cargo_free() < m.cargo_qty:
                         return False, f"Need {m.cargo_qty} free cargo space to accept this contract."
-                    self.player.add_cargo(m.cargo_good, m.cargo_qty)
+                    # Contract goods are sealed, so they can never be sold for
+                    # profit — but the hold readout still shows a cost basis.
+                    # Seed it with the station price so the cargo describes
+                    # itself honestly instead of falling back to whatever the
+                    # market happens to be doing when the hold is opened.
+                    self._acquire_cargo(m.cargo_good, m.cargo_qty,
+                                        float(self.get_buy_price(m.cargo_good)))
 
                 self.available_missions.remove(m)
                 self.player.active_missions.append(m)
@@ -3128,14 +3150,22 @@ class GameEngine:
 
     def remote_top_deals(self, planet: Planet, limit: int = 5) -> List[Dict[str, Any]]:
         """Best goods to buy at a remote planet and sell where you are now.
-        Used by the Deep Space Scanner module for the star-map dossier."""
+        Used by the Deep Space Scanner module for the star-map dossier.
+
+        The margin shown is the real one: the station's market-depth fee is
+        already netted out, so the figure matches what the trade pays.
+        """
         deals: List[Dict[str, Any]] = []
         for gid, comm in COMMODITIES.items():
             buy_remote = self.get_buy_price(gid, planet)
             sell_local = self.get_sell_price(gid, self.current_planet)
-            margin = sell_local - buy_remote
             stock = planet.stock.get(gid, 0)
-            if stock > 0 and margin > 0:
+            if stock <= 0:
+                continue
+            # One unit is enough to price the spread honestly.
+            margin = self.quote_sell(gid, 1, self.current_planet) \
+                - self.quote_buy(gid, 1, planet)
+            if margin > 0:
                 deals.append({
                     "good": comm.name,
                     "good_id": gid,
@@ -3148,7 +3178,27 @@ class GameEngine:
         deals.sort(key=lambda d: d["margin"], reverse=True)
         return deals[:limit]
 
+    def fuel_credit_cost(self, units: int, planet: Optional[Planet] = None) -> int:
+        """Credits needed to fill ``units`` of fuel at ``planet``."""
+        p = planet or self.current_planet
+        unit_price = max(4, int(p.fuel_price * self.difficulty.fuel_mult))
+        return units * unit_price
+
     def compute_best_trade_routes(self, from_current_only: bool = False) -> List[Dict[str, Any]]:
+        """Best cargo routes, priced with the SAME maths the market uses.
+
+        An advisor that quotes optimistic numbers is worse than no advisor at
+        all, so every figure below is what the trade actually yields:
+
+        * the purchase price carries the market-depth fee,
+        * the sale is net of its own market-depth fee,
+        * fuel is charged for BOTH legs — the flight out to the source world
+          and the flight onward to the destination,
+        * profit-per-day divides by the days for both legs.
+
+        The one thing no advisor can know is how the market will drift while
+        you are in transit; prices are re-generated every day you fly.
+        """
         routes: List[Dict[str, Any]] = []
         planets_list = list(self.planets.values())
 
@@ -3164,20 +3214,42 @@ class GameEngine:
                         continue
                     sell_price = self.get_sell_price(gid, dst)
                     margin = sell_price - buy_price
-                    if margin <= 3:
-                        continue
 
-                    fuel_units, _days = self.calculate_travel_cost_between(src, dst)
-                    fuel_credit_estimate = fuel_units * max(
-                        4, int(src.fuel_price * self.difficulty.fuel_mult))
+                    # A fixed "3 CR" floor is meaningless across an 18-item
+                    # commodity list: 3 CR is 25% on water and 0.7% on AI
+                    # cores. Require a proportional margin as well.
+                    if margin < max(MIN_ROUTE_MARGIN_CR, buy_price * MIN_ROUTE_MARGIN_PCT):
+                        continue
 
                     potential_qty = min(self.player.cargo_cap, src.stock.get(gid, 0))
                     if potential_qty <= 0:
                         continue
 
-                    total_profit = margin * potential_qty
-                    net_profit = total_profit - fuel_credit_estimate
-                    days = _days
+                    # Price the trade exactly the way the market will.
+                    buy_cost = self.quote_buy(gid, potential_qty, src)
+                    sell_income = self.quote_sell(gid, potential_qty, dst)
+                    gross_profit = sell_income - buy_cost
+
+                    # Fuel for the flight onward...
+                    out_fuel, out_days = self.calculate_travel_cost_between(src, dst)
+                    out_fuel_cr = self.fuel_credit_cost(out_fuel, src)
+                    # ...and for the flight out to the source world.
+                    if src.name == self.player.location:
+                        in_fuel, in_days = 0, 0
+                    else:
+                        in_fuel, in_days = self.calculate_travel_cost_between(
+                            self.current_planet, src)
+                    in_fuel_cr = self.fuel_credit_cost(in_fuel, self.current_planet)
+
+                    fuel_cost = in_fuel_cr + out_fuel_cr
+                    days = in_days + out_days
+                    net_profit = gross_profit - fuel_cost
+
+                    if net_profit <= 0:
+                        # Advertising a route that loses money after the
+                        # station's cut is the fastest way to lose a captain's
+                        # trust. Only surface routes that actually pay.
+                        continue
 
                     risk_level = security_risk.get(dst.security, 1)
                     if comm.is_contraband:
@@ -3195,15 +3267,26 @@ class GameEngine:
                         "sell_price": sell_price,
                         "margin": margin,
                         "margin_pct": round((margin / max(1, buy_price)) * 100, 1),
-                        "fuel_cost": fuel_units,
+                        "fuel_cost": out_fuel,
                         "days": days,
                         "qty": potential_qty,
-                        "total_profit": total_profit,
+                        "total_profit": gross_profit,
                         "net_profit": net_profit,
                         "profit_per_day": int(net_profit / max(1, days)),
                         "is_contraband": comm.is_contraband,
                         "risk": risk_label,
                         "risk_level": risk_level,
+                        # Full cost breakdown so the UI never has to invent
+                        # numbers of its own.
+                        "buy_cost": buy_cost,
+                        "sell_income": sell_income,
+                        "depth_fee": self.market_depth_fee(buy_price, potential_qty)
+                                      + self.market_depth_fee(sell_price, potential_qty),
+                        "fuel_credits": fuel_cost,
+                        "inbound_fuel": in_fuel,
+                        "outbound_fuel": out_fuel,
+                        "inbound_days": in_days,
+                        "outbound_days": out_days,
                     })
 
         routes.sort(key=lambda r: r["net_profit"], reverse=True)
@@ -3328,6 +3411,18 @@ class GameEngine:
         self.player.insurance_active = False
         self.player.stats["insurance_claims"] += 1
         lost_cargo = self.player.cargo_used()
+
+        # The hold is about to be vaporised. Every contract that still owes
+        # the client a delivery can no longer be completed — its cargo went
+        # down with the ship — so void those contracts *now* and tell the
+        # captain. Leaving them on the mission log to expire silently would
+        # strand the contract and cost reputation for nothing.
+        voided: List[str] = []
+        for m in list(self.player.active_missions):
+            if m.cargo_good and m.cargo_qty > 0:
+                voided.append(m.title)
+                self.player.active_missions.remove(m)
+
         self.player.cargo = {}
         self.player.cargo_cost_basis = {}
         credit_loss = int(self.player.credits * 0.10)
@@ -3343,7 +3438,14 @@ class GameEngine:
         msgs.append("insurance underwriters have you covered.")
         msgs.append(f"Lost {lost_cargo} cargo units and {money(credit_loss)} CR in the incident.")
         msgs.append("A replacement hull (60% condition) has been dispatched to you.")
+        if voided:
+            msgs.append(
+                "Contracts voided by the loss (their cargo went down with you): "
+                + "; ".join(voided) + "."
+            )
         self.add_news("Insurance claim settled. You live to trade another day.")
+        if voided:
+            self.add_news(f"{len(voided)} contract(s) voided by the loss.")
         self.sound.play("victory")
         return msgs
 
@@ -3823,6 +3925,12 @@ ENEMY_PERSONALITIES: Dict[str, str] = {
     "coward": "runs the moment the battle turns sour",
 }
 
+# Shield behaviour for defensive pilots. The recharge rate has to stay low
+# enough that a serious gunload can punch through, and a defensive enemy
+# still returns fire (softly) while it charges.
+ENEMY_SHIELD_RECHARGE_RATE = 0.25
+DEFENSIVE_ATTACK_POWER = 0.7
+
 # Weapon payload class: bigger hulls genuinely hit harder.
 ENEMY_CLASS_DAMAGE: Dict[str, Tuple[int, int]] = {
     "Light Courier": (7, 15),
@@ -3873,6 +3981,7 @@ class CombatEncounter:
         self.enemy_shield = self.enemy_max_shield
         self.enemy_weapons_damaged = False
         self.enemy_engines_damaged = False
+        self.enemy_emitters_fried = False
 
         # Damage payload driven by ship class, then scaled by difficulty & wealth.
         dmg_lo, dmg_hi = ENEMY_CLASS_DAMAGE.get(
@@ -4070,7 +4179,14 @@ class CombatEncounter:
         if target_subsystem == "shields" and self.enemy_shield > 0:
             drained = self.enemy_shield
             self.enemy_shield = 0
-            return [f">> SHIELD EMITTERS FRIED: {drained} enemy shield HP vented into space!"]
+            # The emitter burst does more than vent the shield: the emitters
+            # themselves are wrecked, so the enemy can never cycle its shields
+            # back up. Without this, "target shields" against a defensive
+            # opponent was a trap — the player could hold the shield down
+            # forever but never land a hull hit, so the fight was unwinnable.
+            self.enemy_emitters_fried = True
+            return [f">> SHIELD EMITTERS FRIED: {drained} enemy shield HP vented into "
+                    f"space! Their emitters will not cycle back up."]
         if target_subsystem == "cargo":
             loot_good = random.choice(list(COMMODITIES.keys()))
             qty = random.randint(1, 4)
@@ -4273,7 +4389,8 @@ class CombatEncounter:
     # ------------------------------------------------------------------ #
     # Enemy AI
 
-    def _enemy_attack(self, overpowered: bool = False, target_player_subsystem: bool = False, torpedo: bool = False) -> List[str]:
+    def _enemy_attack(self, overpowered: bool = False, target_player_subsystem: bool = False,
+                      torpedo: bool = False, power: float = 1.0) -> List[str]:
         p = self._p()
         msgs: List[str]
 
@@ -4290,6 +4407,10 @@ class CombatEncounter:
             base_dmg = int(base_dmg * 1.2)
         if torpedo:
             base_dmg = int(base_dmg * 1.5)
+        if power != 1.0:
+            # A softened volley — used by defensive pilots who are busy with
+            # their shield emitters.
+            base_dmg = max(1, int(base_dmg * power))
 
         evasion = 0.05
         if p.has_module("thruster_booster"):
@@ -4370,7 +4491,10 @@ class CombatEncounter:
         return [f"The {self.enemy_name} tries to flee but your guns keep them pinned!"]
 
     def _enemy_charge(self) -> List[str]:
-        recharge = int(self.enemy_max_shield * 0.35)
+        """Divert power to the shield emitters."""
+        if self.enemy_emitters_fried:
+            return ["The enemy's shield emitters are wrecked — they cannot cycle back up!"]
+        recharge = int(self.enemy_max_shield * ENEMY_SHIELD_RECHARGE_RATE)
         before = self.enemy_shield
         self.enemy_shield = min(self.enemy_max_shield, self.enemy_shield + recharge)
         return [f"The enemy diverts power to shields (+{self.enemy_shield - before} HP)."]
@@ -4398,6 +4522,12 @@ class CombatEncounter:
 
         if self.personality == "defensive" and self.enemy_shield < self.enemy_max_shield * 0.30:
             msgs.extend(self._enemy_charge())
+            # A defensive pilot still shoots — it just shoots softer while it
+            # is busy with its emitters. Skipping the attack entirely used to
+            # hand the player a free turn, and the old 35% recharge rate
+            # rebuilt shields faster than any single weapon could strip them,
+            # turning a defensive enemy into an impassable shield wall.
+            msgs.extend(self._enemy_attack(overpowered, power=DEFENSIVE_ATTACK_POWER))
             return msgs
 
         if self.personality == "opportunist":
@@ -4766,6 +4896,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       filter: drop-shadow(0 0 10px var(--cyan));
       stroke-width: 2.5;
     }
+    /* Keyboard users need to see where focus is. */
+    .map-planet-node:focus { outline: none; }
+    .map-planet-node:focus circle.planet-body {
+      filter: drop-shadow(0 0 10px var(--cyan));
+      stroke: var(--cyan);
+      stroke-width: 3;
+    }
     .hyperlane {
       stroke: rgba(46, 72, 156, 0.4);
       stroke-dasharray: 4 4;
@@ -5045,6 +5182,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     .generic-modal.active { display: flex; }
 
+    /* The game-over screen must sit ABOVE the tactical overlay (#combat-modal
+       is z-index 300). Otherwise a destroyed ship leaves the player staring at
+       a combat bridge whose only button is unreachable, and the recovery
+       options in the game-over modal are covered. */
+    #gameover-modal { z-index: 350; }
+    #victory-modal { z-index: 340; }
+
     /* Toast Log Notification */
     #toast-container {
       position: fixed;
@@ -5158,7 +5302,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <div class="hud-actions">
-      <button class="hud-btn" id="btn-mute" onclick="toggleAudio()">🔊 Sound</button>
+      <button class="hud-btn" id="btn-mute" onclick="toggleAudio()" aria-pressed="false" aria-label="Toggle sound effects">🔊 Sound</button>
       <button class="hud-btn" onclick="openSaveModal()">💾 Save / Load</button>
       <button class="hud-btn" onclick="openManualModal()">❓ Codex</button>
       <button class="hud-btn" onclick="openNewGameModal()">🔄 New Game</button>
@@ -5215,26 +5359,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </section>
 
   <!-- DECK CONTROLS NAVIGATION TABS -->
-  <nav id="tab-nav">
-    <button class="tab-btn active" id="tabbtn-map" onclick="switchTab('map')">🌌 Star Map</button>
-    <button class="tab-btn" id="tabbtn-market" onclick="switchTab('market')">📈 Commodity Market</button>
-    <button class="tab-btn" id="tabbtn-advisor" onclick="switchTab('advisor')">🧭 Trade Advisor</button>
-    <button class="tab-btn" id="tabbtn-shipyard" onclick="switchTab('shipyard')">🚀 Shipyard & Outfitter</button>
-    <button class="tab-btn" id="tabbtn-services" onclick="switchTab('services')">🔧 Station Depot</button>
-    <button class="tab-btn" id="tabbtn-crew" onclick="switchTab('crew')">👥 Crew Lounge</button>
-    <button class="tab-btn" id="tabbtn-missions" onclick="switchTab('missions')">📜 Missions & Bounties</button>
-    <button class="tab-btn" id="tabbtn-bank" onclick="switchTab('bank')">🏦 Bank & Stocks</button>
-    <button class="tab-btn" id="tabbtn-log" onclick="switchTab('log')">🎖️ Career & Log</button>
+  <nav id="tab-nav" role="tablist" aria-label="Main views">
+    <button class="tab-btn active" id="tabbtn-map" role="tab" aria-selected="true" aria-controls="view-map" tabindex="0" onclick="switchTab('map')">🌌 Star Map</button>
+    <button class="tab-btn" id="tabbtn-market" role="tab" aria-selected="false" aria-controls="view-market" tabindex="-1" onclick="switchTab('market')">📈 Commodity Market</button>
+    <button class="tab-btn" id="tabbtn-advisor" role="tab" aria-selected="false" aria-controls="view-advisor" tabindex="-1" onclick="switchTab('advisor')">🧭 Trade Advisor</button>
+    <button class="tab-btn" id="tabbtn-shipyard" role="tab" aria-selected="false" aria-controls="view-shipyard" tabindex="-1" onclick="switchTab('shipyard')">🚀 Shipyard & Outfitter</button>
+    <button class="tab-btn" id="tabbtn-services" role="tab" aria-selected="false" aria-controls="view-services" tabindex="-1" onclick="switchTab('services')">🔧 Station Depot</button>
+    <button class="tab-btn" id="tabbtn-crew" role="tab" aria-selected="false" aria-controls="view-crew" tabindex="-1" onclick="switchTab('crew')">👥 Crew Lounge</button>
+    <button class="tab-btn" id="tabbtn-missions" role="tab" aria-selected="false" aria-controls="view-missions" tabindex="-1" onclick="switchTab('missions')">📜 Missions & Bounties</button>
+    <button class="tab-btn" id="tabbtn-bank" role="tab" aria-selected="false" aria-controls="view-bank" tabindex="-1" onclick="switchTab('bank')">🏦 Bank & Stocks</button>
+    <button class="tab-btn" id="tabbtn-log" role="tab" aria-selected="false" aria-controls="view-log" tabindex="-1" onclick="switchTab('log')">🎖️ Career & Log</button>
   </nav>
 
   <!-- MAIN APPLICATION BODY -->
   <main id="app-main">
 
     <!-- 1. STAR MAP VIEW -->
-    <div id="view-map" class="view-container active">
+    <div id="view-map" class="view-container active" role="tabpanel" aria-labelledby="tabbtn-map" tabindex="0">
       <div id="map-wrapper">
         <div id="map-svg-container">
-          <svg id="star-map-svg" width="100%" height="100%" viewBox="0 0 1000 650" style="display: block;"></svg>
+          <svg id="star-map-svg" width="100%" height="100%" viewBox="0 0 1000 650" role="group" aria-label="Sector star map" style="display: block;"></svg>
         </div>
 
         <div id="dossier-card">
@@ -5293,7 +5437,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <!-- 2. COMMODITY MARKET VIEW -->
-    <div id="view-market" class="view-container">
+    <div id="view-market" class="view-container" role="tabpanel" aria-labelledby="tabbtn-market" tabindex="0">
       <div class="panel-card">
         <div class="panel-card-header">
           <div>
@@ -5358,7 +5502,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <!-- 3. TRADE ADVISOR VIEW -->
-    <div id="view-advisor" class="view-container">
+    <div id="view-advisor" class="view-container" role="tabpanel" aria-labelledby="tabbtn-advisor" tabindex="0">
       <div class="panel-card">
         <div class="panel-card-header">
           <div>
@@ -5387,12 +5531,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <!-- Dynamically populated -->
             </tbody>
           </table>
+          <p style="font-size: 11px; color: var(--fg-dim); margin-top: 10px; line-height: 1.6;">
+            Estimates use the same station spread, market-depth fee and fuel prices the market
+            itself charges, and include both legs of the flight — out to the source world and on
+            to the destination. Prices are re-generated every day you are in transit, so treat
+            the figure as an estimate, not a guarantee.
+          </p>
         </div>
       </div>
     </div>
 
     <!-- 4. SHIPYARD & OUTFITTER VIEW -->
-    <div id="view-shipyard" class="view-container">
+    <div id="view-shipyard" class="view-container" role="tabpanel" aria-labelledby="tabbtn-shipyard" tabindex="0">
       <!-- Active Vessel Hardpoint Matrix -->
       <div class="panel-card" style="margin-bottom: 20px;">
         <div class="panel-card-header">
@@ -5436,7 +5586,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <!-- 5. STATION SERVICES VIEW -->
-    <div id="view-services" class="view-container">
+    <div id="view-services" class="view-container" role="tabpanel" aria-labelledby="tabbtn-services" tabindex="0">
       <div class="panel-card">
         <div class="panel-card-header">
           <div>
@@ -5532,7 +5682,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <!-- 6. CREW LOUNGE VIEW -->
-    <div id="view-crew" class="view-container">
+    <div id="view-crew" class="view-container" role="tabpanel" aria-labelledby="tabbtn-crew" tabindex="0">
       <div class="panel-card">
         <div class="panel-card-header">
           <div>
@@ -5551,7 +5701,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <!-- 7. MISSIONS VIEW -->
-    <div id="view-missions" class="view-container">
+    <div id="view-missions" class="view-container" role="tabpanel" aria-labelledby="tabbtn-missions" tabindex="0">
       <div class="grid-2">
         <div class="panel-card">
           <div class="panel-card-header">
@@ -5580,7 +5730,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <!-- 8. BANK & STOCKS VIEW -->
-    <div id="view-bank" class="view-container">
+    <div id="view-bank" class="view-container" role="tabpanel" aria-labelledby="tabbtn-bank" tabindex="0">
       <div class="grid-2">
         <!-- Banking -->
         <div class="panel-card">
@@ -5653,7 +5803,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <!-- 9. CAREER & LOG VIEW -->
-    <div id="view-log" class="view-container">
+    <div id="view-log" class="view-container" role="tabpanel" aria-labelledby="tabbtn-log" tabindex="0">
       <div class="grid-2">
         <!-- Ranks and Reputation -->
         <div class="panel-card">
@@ -5707,11 +5857,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </main>
 
   <!-- TRADE SLIDER MODAL -->
-  <div id="trade-modal">
+  <div id="trade-modal" role="dialog" aria-modal="true" aria-labelledby="trade-modal-title" data-esc-close="closeTradeModal">
     <div class="modal-box">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
         <h3 id="trade-modal-title" style="color: var(--cyan); font-size: 18px;">Trade Commodity</h3>
-        <button class="btn-action-sm" onclick="closeTradeModal()">✕</button>
+        <button class="btn-action-sm" onclick="closeTradeModal()" aria-label="Close dialog">✕</button>
       </div>
 
       <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; margin-bottom: 16px;">
@@ -5755,7 +5905,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <!-- TACTICAL COMBAT BRIDGE MODAL -->
-  <div id="combat-modal">
+  <div id="combat-modal" role="dialog" aria-modal="true" aria-label="Tactical Combat">
     <div class="combat-bridge">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; border-bottom: 1px solid var(--red); padding-bottom: 12px;">
         <div style="display: flex; align-items: center; gap: 10px;">
@@ -5862,13 +6012,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <!-- Combat Log Terminal -->
-      <div id="combat-terminal-log" style="background: var(--bg); border: 1px solid var(--panel-border); border-radius: 6px; padding: 12px; font-family: var(--font-mono); font-size: 11px; max-height: 140px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; color: var(--fg-dim);">
+      <div id="combat-terminal-log" role="log" aria-live="polite" aria-label="Combat log" style="background: var(--bg); border: 1px solid var(--panel-border); border-radius: 6px; padding: 12px; font-family: var(--font-mono); font-size: 11px; max-height: 140px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; color: var(--fg-dim);">
         <div>Sensors locked onto enemy vessel. Weapons armed.</div>
       </div>
 
       <!-- Victory / Defeat Dismissal -->
       <div id="combat-result-box" style="display: none; margin-top: 16px; text-align: center;">
-        <button class="dossier-btn-engage" id="combat-btn-dismiss" onclick="dismissCombat()">
+        <button class="dossier-btn-engage" id="combat-btn-dismiss" onclick="combatDismiss()">
           Disengage & Return to Helm
         </button>
       </div>
@@ -5876,7 +6026,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <!-- DYNAMIC TRAVEL ENCOUNTER MODAL -->
-  <div id="encounter-modal" class="generic-modal">
+  <div id="encounter-modal" class="generic-modal" role="dialog" aria-modal="true" aria-labelledby="enc-title">
     <div class="modal-box">
       <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px;">
         <span id="enc-icon" style="font-size: 24px;">📡</span>
@@ -5895,11 +6045,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <!-- SAVE / LOAD MODAL -->
-  <div id="save-modal" class="generic-modal">
+  <div id="save-modal" class="generic-modal" role="dialog" aria-modal="true" aria-labelledby="save-modal-title" data-esc-close="closeSaveModal">
     <div class="modal-box">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
-        <h3 style="color: var(--cyan); font-size: 18px;">💾 Save / Load Game Flight Records</h3>
-        <button class="btn-action-sm" onclick="closeSaveModal()">✕</button>
+        <h3 id="save-modal-title" style="color: var(--cyan); font-size: 18px;">💾 Save / Load Game Flight Records</h3>
+        <button class="btn-action-sm" onclick="closeSaveModal()" aria-label="Close dialog">✕</button>
       </div>
 
       <div id="save-slots-list" style="display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px;">
@@ -5909,11 +6059,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <!-- NEW GAME MODAL -->
-  <div id="newgame-modal" class="generic-modal">
+  <div id="newgame-modal" class="generic-modal" role="dialog" aria-modal="true" aria-labelledby="newgame-modal-title" data-esc-close="closeNewGameModal">
     <div class="modal-box">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
-        <h3 style="color: var(--cyan); font-size: 18px;">🔄 New Captain Commission</h3>
-        <button class="btn-action-sm" onclick="closeNewGameModal()">✕</button>
+        <h3 id="newgame-modal-title" style="color: var(--cyan); font-size: 18px;">🔄 New Captain Commission</h3>
+        <button class="btn-action-sm" onclick="closeNewGameModal()" aria-label="Close dialog">✕</button>
       </div>
 
       <div style="margin-bottom: 14px;">
@@ -5936,11 +6086,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <!-- CODEX & MANUAL MODAL -->
-  <div id="manual-modal" class="generic-modal">
+  <div id="manual-modal" class="generic-modal" role="dialog" aria-modal="true" aria-labelledby="manual-modal-title" data-esc-close="closeManualModal">
     <div class="modal-box" style="max-width: 680px; max-height: 80vh; overflow-y: auto;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; position: sticky; top: 0; background: var(--panel); padding-bottom: 8px;">
-        <h3 style="color: var(--cyan); font-size: 18px;">📖 Space Trader: Odyssey — Field Manual</h3>
-        <button class="btn-action-sm" onclick="closeManualModal()">✕</button>
+        <h3 id="manual-modal-title" style="color: var(--cyan); font-size: 18px;">📖 Space Trader: Odyssey — Field Manual</h3>
+        <button class="btn-action-sm" onclick="closeManualModal()" aria-label="Close dialog">✕</button>
       </div>
 
       <div style="font-size: 13px; color: var(--fg); line-height: 1.6; display: flex; flex-direction: column; gap: 14px;">
@@ -5952,11 +6102,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div>
           <h4 style="color: var(--cyan); margin-bottom: 4px;">📈 Interstellar Commerce</h4>
           <p>Planets produce commodities according to their planetary traits: agricultural worlds export cheap food and grain; mining stations flood the market with titanium and gems; high-tech arcologies demand raw minerals and export quantum processors. Buy low, consult the <strong>Trade Advisor</strong> (now with route risk ratings) for optimal routes, and sell high! Net trading profit feeds your Renown.</p>
+          <p>The Trade Advisor quotes what the trade will really pay: the station's spread <em>and</em> its market-depth fee, plus fuel for both legs of the flight. Treat it as an estimate — prices are re-generated every day you are in transit.</p>
         </div>
 
         <div>
           <h4 style="color: var(--red); margin-bottom: 4px;">⚡ Tactical Starship Combat</h4>
           <p>Out in the lawless black, Free Corsairs and deserter dreadnoughts raid commercial shipping — and bigger hulls now punch proportionally harder (check the THREAT rating). Upgrade your hardpoints with Pulse Lasers, Heavy Barrier Shields, and Seeker Torpedoes. Fire <strong>Evasive Maneuvers</strong> to scatter the next enemy volley, cripple their thrusters to prevent escape, or breach the hull and launch a <strong>Boarding Action</strong> to seize their cargo and ransom their crew!</p>
+          <p><strong>Target their shields</strong> to vent the emitter bank — a burst that wrecks the emitters themselves, so a defensive raider can never cycle its shields back up. It is the surest way to break a stubborn opponent that keeps out-shielding you.</p>
         </div>
 
         <div>
@@ -5971,17 +6123,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
         <div>
           <h4 style="color: var(--fg-dim); margin-bottom: 4px;">⌨️ Hotkeys & New Kit</h4>
-          <p><strong>1–9</strong> switch tabs · <strong>F</strong> fire · <strong>M</strong> torpedo · <strong>R</strong> recharge · <strong>E</strong> evade · <strong>D</strong> drones · <strong>B</strong> board · <strong>Esc</strong> closes dialogs. New equipment worth saving for: the <em>Bussard Ram-Scoop</em> (free fuel daily) and the <em>Heavy Extraction Rig</em> (double mining yields).</p>
+          <p><strong>1–9</strong> switch tabs · <strong>←/→</strong> move between tabs · <strong>F</strong> fire · <strong>M</strong> torpedo · <strong>R</strong> recharge · <strong>E</strong> evade · <strong>D</strong> drones · <strong>B</strong> board · <strong>Esc</strong> closes dialogs. Every dialog traps keyboard focus and hands it back when it closes, and the star map can be flown entirely from the keyboard. New equipment worth saving for: the <em>Bussard Ram-Scoop</em> (free fuel daily) and the <em>Heavy Extraction Rig</em> (double mining yields).</p>
         </div>
       </div>
     </div>
   </div>
 
   <!-- GAME OVER MODAL -->
-  <div id="gameover-modal" class="generic-modal">
+  <div id="gameover-modal" class="generic-modal" role="dialog" aria-modal="true" aria-labelledby="gameover-modal-title">
     <div class="modal-box" style="text-align: center; border-color: var(--red);">
       <div style="font-size: 48px; margin-bottom: 10px;">💀</div>
-      <h3 style="color: var(--red); font-size: 22px; margin-bottom: 8px;">VESSEL DESTROYED</h3>
+      <h3 id="gameover-modal-title" style="color: var(--red); font-size: 22px; margin-bottom: 8px;">VESSEL DESTROYED</h3>
       <p style="font-size: 13px; color: var(--fg-dim); margin-bottom: 20px; line-height: 1.6;">
         Your ship broke apart in the void. The sector remembers your final transmission.<br>
         Recovery options are available from your flight recorder archives.
@@ -5995,10 +6147,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <!-- VICTORY MODAL -->
-  <div id="victory-modal" class="generic-modal">
+  <div id="victory-modal" class="generic-modal" role="dialog" aria-modal="true" aria-labelledby="victory-modal-title" data-esc-close="dismissVictory">
     <div class="modal-box" style="text-align: center; border-color: var(--gold); box-shadow: 0 0 60px rgba(255, 183, 3, 0.3);">
       <div style="font-size: 48px; margin-bottom: 10px;">🏆</div>
-      <h3 style="color: var(--gold); font-size: 22px; margin-bottom: 8px;">GALACTIC MOGUL ACHIEVED</h3>
+      <h3 id="victory-modal-title" style="color: var(--gold); font-size: 22px; margin-bottom: 8px;">GALACTIC MOGUL ACHIEVED</h3>
       <p style="font-size: 13px; color: var(--fg-dim); margin-bottom: 20px; line-height: 1.6;">
         Net worth has surpassed <strong style="color: var(--green);">500,000 CR</strong>!<br>
         The sector bows to your commercial empire, <strong id="victory-captain-name" style="color: var(--cyan);">Commander</strong>.
@@ -6011,11 +6163,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <!-- AMOUNT INPUT MODAL (bank / stocks) -->
-  <div id="amount-modal" class="generic-modal">
+  <div id="amount-modal" class="generic-modal" role="dialog" aria-modal="true" aria-labelledby="amount-modal-title" data-esc-close="closeAmountModal">
     <div class="modal-box">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
         <h3 id="amount-modal-title" style="color: var(--cyan); font-size: 18px;">Enter Amount</h3>
-        <button class="btn-action-sm" onclick="closeAmountModal()">✕</button>
+        <button class="btn-action-sm" onclick="closeAmountModal()" aria-label="Close dialog">✕</button>
       </div>
       <p id="amount-modal-hint" style="font-size: 12px; color: var(--fg-dim); margin-bottom: 10px;"></p>
       <input type="number" id="amount-modal-input" class="search-input" style="width: 100%; font-size: 16px; padding: 10px;" min="1" value="500">
@@ -6040,6 +6192,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
     let audioCtx = null;
     let audioMuted = false;
 
+    // The mute preference is a real setting — remember it so a reload does
+    // not blare the player back into a game they had silenced.
+    const AUDIO_PREF_KEY = 'st_odyssey_muted';
+
+    function loadAudioPreference() {
+      try {
+        const stored = window.localStorage.getItem(AUDIO_PREF_KEY);
+        if (stored === '1' || stored === '0') audioMuted = (stored === '1');
+      } catch (_) {
+        audioMuted = false;   // storage unavailable (private mode): default on
+      }
+      const btn = document.getElementById('btn-mute');
+      if (btn) btn.textContent = audioMuted ? '🔇 Muted' : '🔊 Sound';
+    }
+
+    function saveAudioPreference() {
+      try {
+        window.localStorage.setItem(AUDIO_PREF_KEY, audioMuted ? '1' : '0');
+      } catch (_) { /* storage unavailable: the setting just will not persist */ }
+    }
+
     function initAudio() {
       try {
         const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
@@ -6061,6 +6234,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function toggleAudio() {
       audioMuted = !audioMuted;
       document.getElementById('btn-mute').textContent = audioMuted ? '🔇 Muted' : '🔊 Sound';
+      document.getElementById('btn-mute').setAttribute('aria-pressed', audioMuted ? 'true' : 'false');
+      saveAudioPreference();
       showToast(audioMuted ? 'Audio muted' : 'Audio enabled');
     }
 
@@ -6255,6 +6430,106 @@ HTML_PAGE = r"""<!DOCTYPE html>
         .replace(/"/g, '&quot;');
     }
 
+    // ------------------------------------------------------------------
+    // Modal manager — every overlay is a real dialog for keyboard and
+    // screen-reader users: it takes focus, keeps focus inside itself while
+    // it is open, and hands focus back when it closes.
+    // ------------------------------------------------------------------
+    const MODAL_IDS = [
+      'trade-modal', 'combat-modal', 'encounter-modal', 'save-modal',
+      'newgame-modal', 'manual-modal', 'gameover-modal', 'victory-modal',
+      'amount-modal'
+    ];
+    let modalReturnFocus = null;
+
+    function activeModals() {
+      return MODAL_IDS
+        .map(id => document.getElementById(id))
+        .filter(el => el && el.classList.contains('active'));
+    }
+
+    function focusableIn(el) {
+      if (!el) return [];
+      return Array.from(el.querySelectorAll(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), ' +
+        'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )).filter(node => {
+        if (node.hidden) return false;
+        if (node.style && node.style.display === 'none') return false;
+        // getClientRects() is the accurate test in a real browser, but a
+        // headless DOM performs no layout and always reports zero rects — so
+        // only trust it when the document actually has a layout viewport.
+        const doc = node.ownerDocument;
+        if (doc && doc.documentElement && doc.documentElement.clientHeight > 0) {
+          return node.getClientRects().length > 0;
+        }
+        return true;
+      });
+    }
+
+    function showModal(id) {
+      const el = document.getElementById(id);
+      if (!el) return null;
+      const wasActive = el.classList.contains('active');
+      if (wasActive) return el;          // already open: do not steal focus
+      if (!activeModals().length) modalReturnFocus = document.activeElement;
+      el.classList.add('active');
+      const focusables = focusableIn(el);
+      if (focusables.length) {
+        try { focusables[0].focus(); } catch (e) { /* older browsers */ }
+      }
+      return el;
+    }
+
+    function hideModal(id) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const wasActive = el.classList.contains('active');
+      el.classList.remove('active');
+      if (wasActive && !activeModals().length && modalReturnFocus) {
+        const back = modalReturnFocus;
+        modalReturnFocus = null;
+        if (back && back.focus) {
+          try { back.focus(); } catch (e) { /* element gone */ }
+        }
+      }
+    }
+
+    // Escape closes the topmost dismissable overlay; Tab is trapped inside
+    // the topmost overlay so keyboard focus can never wander behind it.
+    document.addEventListener('keydown', (e) => {
+      const stack = activeModals();
+      if (!stack.length) return;
+      const top = stack[stack.length - 1];
+
+      if (e.key === 'Escape') {
+        const closer = top.getAttribute('data-esc-close');
+        if (closer && typeof window[closer] === 'function') {
+          e.preventDefault();
+          window[closer]();
+        }
+        return;
+      }
+
+      if (e.key === 'Tab') {
+        const focusables = focusableIn(top);
+        if (!focusables.length) { e.preventDefault(); return; }
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const current = document.activeElement;
+        if (!top.contains(current)) {
+          e.preventDefault();
+          first.focus();
+        } else if (e.shiftKey && current === first) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && current === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    });
+
     // Look up a commodity's display name from the current market payload.
     function commodityName(goodId) {
       if (!gameState || !gameState.current_planet || !gameState.current_planet.market) return goodId;
@@ -6264,17 +6539,36 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function switchTab(tabId) {
       currentTab = tabId;
-      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(b => {
+        const on = (b.id === 'tabbtn-' + tabId);
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', on ? 'true' : 'false');
+        b.tabIndex = on ? 0 : -1;      // roving tabindex, as the ARIA tabs pattern expects
+      });
       document.querySelectorAll('.view-container').forEach(v => v.classList.remove('active'));
 
-      const btn = document.getElementById('tabbtn-' + tabId);
-      if (btn) btn.classList.add('active');
       const view = document.getElementById('view-' + tabId);
       if (view) view.classList.add('active');
 
       if (tabId === 'advisor') fetchTradeRoutes();
       if (tabId === 'map') renderStarMap();
     }
+
+    // Arrow-key navigation between tabs, per the ARIA authoring practices.
+    document.getElementById('tab-nav').addEventListener('keydown', (e) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+      const tabs = Array.from(document.querySelectorAll('.tab-btn'));
+      const idx = tabs.indexOf(document.activeElement);
+      if (idx < 0) return;
+      e.preventDefault();
+      let next = idx;
+      if (e.key === 'ArrowRight') next = (idx + 1) % tabs.length;
+      else if (e.key === 'ArrowLeft') next = (idx - 1 + tabs.length) % tabs.length;
+      else if (e.key === 'Home') next = 0;
+      else if (e.key === 'End') next = tabs.length - 1;
+      switchTab(tabs[next].id.replace('tabbtn-', ''));
+      tabs[next].focus();
+    });
 
     // --- API Interactions ---
     let lastRevision = -1;
@@ -6493,7 +6787,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const hasMissions = p.active_missions && p.active_missions.length > 0;
 
         html += `
-          <g class="map-planet-node" onclick="selectPlanet('${escJs(p.name)}')">
+          <g class="map-planet-node" role="button" tabindex="0"
+             aria-label="${escHtml(p.name)} — ${escHtml(p.subtitle)}${isCurrent ? ', current position' : ''}${hasMissions ? ', contracts available' : ''}"
+             onclick="selectPlanet('${escJs(p.name)}')"
+             onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectPlanet('${escJs(p.name)}'); }">
             <circle cx="${px}" cy="${py}" r="${nodeRadius + 4}" fill="${p.color}" opacity="0.15" />
             <circle class="planet-body" cx="${px}" cy="${py}" r="${nodeRadius}" fill="${p.color}" stroke="${strokeColor}" stroke-width="${strokeWidth}" />
             <text x="${px}" y="${py + 22}" text-anchor="middle" fill="${isSelected ? 'var(--cyan)' : 'var(--fg)'}" font-size="12" font-weight="${isSelected ? 'bold' : 'normal'}" font-family="system-ui">
@@ -6677,7 +6974,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         `;
       });
 
-      tbody.innerHTML = html;
+      tbody.innerHTML = html || '<tr><td colspan="9" style="text-align: center; color: var(--fg-dim); padding: 18px;">'
+        + 'No commodities match this filter. Clear the search box or pick a different category.'
+        + '</td></tr>';
     }
 
     // --- Trade Slider Modal ---
@@ -6722,11 +7021,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       slider.value = 1;
       onTradeSliderChange(1);
 
-      document.getElementById('trade-modal').classList.add('active');
+      showModal('trade-modal');
     }
 
     function closeTradeModal() {
-      document.getElementById('trade-modal').classList.remove('active');
+      hideModal('trade-modal');
     }
 
     function onTradeSliderChange(val) {
@@ -6821,16 +7120,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
           let html = '';
           json.routes.forEach(r => {
             const riskColor = RISK_COLORS[r.risk] || 'var(--fg-dim)';
+            const cr = (n) => Number(n).toLocaleString();
+            // Full cost breakdown: the player can see exactly where the
+            // advertised profit goes.
+            const breakdown =
+              `Buy ${r.qty}× @ ${r.buy_price} = ${cr(r.buy_cost)} CR`
+              + ` · sale ${cr(r.sell_income)} CR`
+              + ` · depth fee ${cr(r.depth_fee)} CR`
+              + ` · fuel ${cr(r.fuel_credits)} CR`
+              + ` (${r.inbound_fuel} out + ${r.outbound_fuel} on)`;
             html += `
               <tr>
-                <td><strong style="color: var(--cyan);">${escHtml(r.good)}${r.is_contraband ? ' <span class="pill pill-red" style="font-size:9px;">ILLEGAL</span>' : ''}</strong></td>
+                <td><strong style="color: var(--cyan);">${escHtml(r.good)}${r.is_contraband ? ' <span class="pill pill-red" style="font-size:9px;">ILLEGAL</span>' : ''}</strong>
+                  <div style="font-size: 10px; color: var(--fg-dim); margin-top: 4px; line-height: 1.5;">${escHtml(breakdown)}</div>
+                </td>
                 <td>${escHtml(r.src)}</td>
                 <td><strong style="color: var(--gold);">${escHtml(r.dst)}</strong></td>
                 <td>${r.buy_price} / ${r.sell_price} CR</td>
                 <td><span class="pill pill-green">+${r.margin} CR (${r.margin_pct}%)</span></td>
-                <td><strong style="color: var(--gold); font-family: var(--font-mono);">${r.net_profit.toLocaleString()} CR</strong></td>
+                <td><strong style="color: var(--gold); font-family: var(--font-mono);">${cr(r.net_profit)} CR</strong>
+                  <div style="font-size: 10px; color: var(--fg-dim);">${cr(r.profit_per_day)} CR/day</div>
+                </td>
                 <td>${r.days} Days</td>
-                <td><strong style="color: ${riskColor};">${r.risk || '—'}</strong></td>
+                <td><strong style="color: ${riskColor};">${escHtml(r.risk || '—')}</strong></td>
                 <td>
                   <button class="btn-action-sm btn-buy" onclick="selectPlanet('${escJs(r.dst)}'); switchTab('map');">Plot Course</button>
                 </td>
@@ -7264,7 +7576,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // --- Dynamic Encounters ---
     function checkEncounter() {
       if (!gameState || !gameState.active_encounter) {
-        document.getElementById('encounter-modal').classList.remove('active');
+        hideModal('encounter-modal');
         return;
       }
       const enc = gameState.active_encounter;
@@ -7289,7 +7601,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         // Unavoidable radiation event — single acknowledge button.
         opt1.textContent = 'Brace for Impact';
         opt2.style.display = 'none';
-        modal.classList.add('active');
+        showModal('encounter-modal');
         return;
       }
       opt2.style.display = '';
@@ -7333,7 +7645,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         opt2.textContent = 'Dismiss';
       }
 
-      modal.classList.add('active');
+      showModal('encounter-modal');
     }
 
     function resolveEncounter(choice) {
@@ -7343,12 +7655,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // --- Tactical Combat ---
     function checkCombat() {
       const c = gameState ? gameState.active_combat : null;
-      const modal = document.getElementById('combat-modal');
       if (!c) {
-        modal.classList.remove('active');
+        hideModal('combat-modal');
         return;
       }
-      modal.classList.add('active');
+      showModal('combat-modal');
 
       document.getElementById('combat-enemy-name').textContent = c.enemy_name;
       document.getElementById('combat-enemy-ship').textContent = `Class: ${c.enemy_ship_name} · Behavior: ${c.personality.toUpperCase()} — ${c.personality_desc || ''}`;
@@ -7410,10 +7721,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const dBtn = document.getElementById('combat-btn-dismiss');
         if (c.player_won) {
           dBtn.textContent = '🏆 Enemy Defeated — Salvage & Disengage';
+          dBtn.dataset.mode = 'disengage';
         } else if (c.player_escaped) {
           dBtn.textContent = '🏃 Warp Drive Engaged — Disengage';
+          dBtn.dataset.mode = 'disengage';
         } else if (c.player_dead) {
-          dBtn.textContent = '💀 Vessel Destroyed — Reconstruct from Insurance / Autosave';
+          // The career is over: the server refuses a plain dismissal, so send
+          // the captain straight to the recovery screen instead.
+          dBtn.textContent = '💀 Vessel Destroyed — Open Recovery Options';
+          dBtn.dataset.mode = 'recover';
+        } else {
+          dBtn.dataset.mode = 'disengage';
         }
       } else {
         actBar.style.display = 'grid';
@@ -7499,6 +7817,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
       sendAction('dismiss_combat');
     }
 
+    // The combat overlay's primary button. A destroyed vessel cannot be
+    // "dismissed" (the career is over), so that case opens the recovery
+    // screen instead of firing an action the server would refuse.
+    function combatDismiss() {
+      const btn = document.getElementById('combat-btn-dismiss');
+      if (btn && btn.dataset.mode === 'recover') {
+        showModal('gameover-modal');
+        return;
+      }
+      sendAction('dismiss_combat');
+    }
+
     // --- Save / Load Dialog ---
     async function openSaveModal() {
       try {
@@ -7525,7 +7855,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             `;
           });
           list.innerHTML = html;
-          document.getElementById('save-modal').classList.add('active');
+          showModal('save-modal');
         }
       } catch (e) {
         showToast("Error loading saves: " + e);
@@ -7533,7 +7863,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     function closeSaveModal() {
-      document.getElementById('save-modal').classList.remove('active');
+      hideModal('save-modal');
     }
 
     function saveGame(slot) {
@@ -7548,10 +7878,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     // --- New Game Dialog ---
     function openNewGameModal() {
-      document.getElementById('newgame-modal').classList.add('active');
+      showModal('newgame-modal');
     }
     function closeNewGameModal() {
-      document.getElementById('newgame-modal').classList.remove('active');
+      hideModal('newgame-modal');
     }
     function confirmNewGame() {
       const name = document.getElementById('newgame-name').value;
@@ -7562,46 +7892,44 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     // --- Manual Modal ---
     function openManualModal() {
-      document.getElementById('manual-modal').classList.add('active');
+      showModal('manual-modal');
     }
     function closeManualModal() {
-      document.getElementById('manual-modal').classList.remove('active');
+      hideModal('manual-modal');
     }
 
     // --- Game Over / Victory ---
     function checkGameOver() {
-      const modal = document.getElementById('gameover-modal');
       if (gameState && gameState.player.is_game_over) {
-        if (!modal.classList.contains('active')) {
-          modal.classList.add('active');
+        if (!document.getElementById('gameover-modal').classList.contains('active')) {
+          showModal('gameover-modal');
           playSound('death');
         }
       } else {
-        modal.classList.remove('active');
+        hideModal('gameover-modal');
       }
     }
 
     function recoverSave(slot) {
-      document.getElementById('gameover-modal').classList.remove('active');
+      hideModal('gameover-modal');
       sendAction('load_game', { slot });
     }
 
     function checkVictory() {
-      const modal = document.getElementById('victory-modal');
       if (gameState && gameState.player.victory && !victoryShown) {
         victoryShown = true;
         document.getElementById('victory-captain-name').textContent = gameState.player.name;
-        modal.classList.add('active');
+        showModal('victory-modal');
         playSound('victory');
       }
       if (!gameState || !gameState.player.victory) {
         victoryShown = false;
-        modal.classList.remove('active');
+        hideModal('victory-modal');
       }
     }
 
     function dismissVictory() {
-      document.getElementById('victory-modal').classList.remove('active');
+      hideModal('victory-modal');
     }
 
     // --- Amount Input Modal (bank / stocks) ---
@@ -7616,12 +7944,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('amount-modal-confirm').textContent = confirmLabel;
       const input = document.getElementById('amount-modal-input');
       input.value = defaultValue;
-      document.getElementById('amount-modal').classList.add('active');
+      showModal('amount-modal');
       setTimeout(() => input.focus(), 50);
     }
 
     function closeAmountModal() {
-      document.getElementById('amount-modal').classList.remove('active');
+      hideModal('amount-modal');
       amountModalAction = null;
       amountModalPayload = {};
     }
@@ -7694,21 +8022,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       // Ignore browser shortcuts (Ctrl+R reload, Ctrl+F find...) and held keys.
       if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
-      if (e.key === '1') switchTab('map');
-      if (e.key === '2') switchTab('market');
-      if (e.key === '3') switchTab('advisor');
-      if (e.key === '4') switchTab('shipyard');
-      if (e.key === '5') switchTab('services');
-      if (e.key === '6') switchTab('crew');
-      if (e.key === '7') switchTab('missions');
-      if (e.key === '8') switchTab('bank');
-      if (e.key === '9') switchTab('log');
-      if (e.key === 'Escape') {
-        closeAmountModal();
-        closeTradeModal();
-        closeSaveModal();
-        closeNewGameModal();
-        closeManualModal();
+
+      // While a dialog is open it owns the keyboard: Escape and Tab belong to
+      // the modal manager, and the tab shortcuts must not switch the view
+      // behind the dialog. Combat hotkeys still work — the tactical overlay
+      // is a dialog too.
+      const dialogOpen = activeModals().length > 0;
+      if (!dialogOpen) {
+        if (e.key === '1') switchTab('map');
+        if (e.key === '2') switchTab('market');
+        if (e.key === '3') switchTab('advisor');
+        if (e.key === '4') switchTab('shipyard');
+        if (e.key === '5') switchTab('services');
+        if (e.key === '6') switchTab('crew');
+        if (e.key === '7') switchTab('missions');
+        if (e.key === '8') switchTab('bank');
+        if (e.key === '9') switchTab('log');
       }
       // Combat hotkeys (only while a battle is in progress)
       const combat = gameState && gameState.active_combat;
@@ -7726,6 +8055,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     // --- Initial Boot ---
     window.addEventListener('DOMContentLoaded', () => {
+      loadAudioPreference();
       fetchState();
       setInterval(fetchState, 3000); // Polling for telemetry & auto-sync
     });
@@ -8357,8 +8687,11 @@ def handle_action(session: GameSession, data: Dict[str, Any]) -> Dict[str, Any]:
         success, message = False, text
         logs.append(text)
 
-    # A finished career only allows meta actions (new game, load).
-    if engine.is_game_over and action not in META_ACTIONS:
+    # A finished career only allows meta actions (new game, load) — plus the
+    # combat dismissal, which must ALWAYS stay reachable. The tactical overlay
+    # is painted above the game-over modal, so refusing "dismiss_combat" here
+    # used to trap the player on the death screen with no way to recover.
+    if engine.is_game_over and action not in META_ACTIONS + COMBAT_ACTIONS:
         refuse(CAREER_OVER_MSG)
         session.revision += 1
         return {"success": False, "message": message, "logs": [], "sound": None,
@@ -8756,6 +9089,11 @@ def run_self_test() -> None:
             st.ship_class in ENEMY_CLASS_DAMAGE for st in SHIP_TEMPLATES.values()))
         costs = [s.cost for s in SHIP_TEMPLATES.values()]
         check("ship costs strictly ascending", costs == sorted(costs))
+        check("starter hull has a real listed price",
+              SHIP_TEMPLATES[STARTING_SHIP].cost > 0,
+              "the ship you start with must be worth something")
+        check("starter hull has a trade-in value",
+              int(SHIP_TEMPLATES[STARTING_SHIP].cost * 0.7) > 0)
         check("all equipment slot types valid", all(eq.slot_type in ("weapon", "shield", "module") for eq in EQUIPMENT_ITEMS.values()))
         check("crew roster resolves", len(AVAILABLE_CREW) >= 6)
 
@@ -8889,6 +9227,44 @@ def run_self_test() -> None:
         check("routes found", len(routes) > 0)
         check("routes sorted by net profit", len(routes) == 1 or routes[0]["net_profit"] >= routes[1]["net_profit"])
 
+        # The advisor must quote what the trade actually pays: the same
+        # market-depth fee, both legs of fuel, and both legs of travel time.
+        # It used to quote margin * qty with no fees and one leg of fuel,
+        # over-stating profit by ~10% and profit-per-day by up to 3.7x.
+        advisor_ok = True
+        advisor_detail = ""
+        for r in routes[:6]:
+            src = e_trd.planets[r["src"]]
+            dst = e_trd.planets[r["dst"]]
+            gid, qty = r["good_id"], r["qty"]
+            unit_buy = e_trd.get_buy_price(gid, src)
+            unit_sell = e_trd.get_sell_price(gid, dst)
+            fee_buy = e_trd.market_depth_fee(unit_buy, qty)
+            fee_sell = e_trd.market_depth_fee(unit_sell, qty)
+            in_fuel, in_days = e_trd.calculate_travel_cost_between(
+                e_trd.current_planet, src)
+            if src.name == e_trd.player.location:
+                in_fuel, in_days = 0, 0
+            out_fuel, out_days = e_trd.calculate_travel_cost_between(src, dst)
+            fuel_cr = (e_trd.fuel_credit_cost(in_fuel, e_trd.current_planet)
+                       + e_trd.fuel_credit_cost(out_fuel, src))
+            expected_net = (unit_sell * qty - fee_sell) - (unit_buy * qty + fee_buy) - fuel_cr
+            if expected_net != r["net_profit"] or r["days"] != in_days + out_days:
+                advisor_ok = False
+                advisor_detail = f"{r['good']} {r['src']}->{r['dst']}"
+                break
+        check("advisor net profit equals the real trade cost", advisor_ok, advisor_detail)
+        check("advisor charges both legs of fuel", all(
+            r["fuel_credits"] > 0 and r["days"] >= r["outbound_days"]
+            for r in routes))
+        check("advisor never advertises a losing route", all(
+            r["net_profit"] > 0 for r in routes))
+        check("advisor breakdown adds up", all(
+            r["net_profit"] == r["sell_income"] - r["buy_cost"] - r["fuel_credits"]
+            and r["days"] == r["inbound_days"] + r["outbound_days"]
+            and r["profit_per_day"] == int(r["net_profit"] / max(1, r["days"]))
+            for r in routes))
+
         # --- 5. Services, fleet & crew ---
         print("\n--- 5. Services, fleet & crew ---")
         e_srv = GameEngine(muted=True)
@@ -9020,6 +9396,42 @@ def run_self_test() -> None:
 
         check("overwhelming firepower wins", combat.player_won or combat.enemy_fled)
         check("pirates_defeated counted", e_cmb.player.stats.get("pirates_defeated", 0) >= 1 or True)
+
+        # A defensive pilot must still return fire while it recharges. It used
+        # to skip the attack entirely, handing the player a free turn.
+        e_def = GameEngine(muted=True)
+        e_def.new_game("Bunker", "normal")
+        e_def.player.hull = e_def.player.max_hull
+        e_def.player.shield = e_def.player.max_shield
+        c_def = CombatEncounter(e_def, "Bunker", "orion")
+        c_def.personality = "defensive"
+        c_def.enemy_shield = 1          # deep inside the charge band
+        hull_before = e_def.player.hull
+        shield_before = e_def.player.shield
+        random.seed(4242)
+        c_def.player_action("fire")
+        check("defensive enemy still returns fire while charging",
+              e_def.player.hull < hull_before or e_def.player.shield < shield_before)
+        check("shield recharge rate is breakable",
+              int(c_def.enemy_max_shield * ENEMY_SHIELD_RECHARGE_RATE) <= 100,
+              f"recharge {int(c_def.enemy_max_shield * ENEMY_SHIELD_RECHARGE_RATE)} is too high")
+
+        # Venting the emitters must stop the shield cycle for good — without
+        # this, "target shields" against a defensive enemy was unwinnable.
+        e_fr = GameEngine(muted=True)
+        e_fr.new_game("Fryer", "normal")
+        c_fr = CombatEncounter(e_fr, "Bunker", "orion")
+        c_fr.personality = "defensive"
+        c_fr.enemy_hull = 500
+        c_fr.enemy_shield = 200
+        random.seed(99)
+        for _ in range(4):
+            if c_fr.is_finished:
+                break
+            c_fr.player_action("target_shields")
+        check("frying the emitters disables the shield cycle",
+              c_fr.enemy_emitters_fried and c_fr.enemy_shield == 0)
+        check("a defensive enemy can be worn down", c_fr.enemy_hull < 500)
 
         # --- 10. Bank & stocks ---
         print("\n--- 10. Bank & stocks ---")
@@ -9203,8 +9615,13 @@ def run_self_test() -> None:
               ok_revive and not e_dth.is_game_over and e_dth.player.hull > 0)
 
         e_dth.player.equipped_modules = ["deep_scanner"]
-        deals = e_dth.remote_top_deals(e_dth.current_planet)
+        # A *remote* world: scanning your own station finds nothing, which
+        # used to make this assertion pass vacuously.
+        remote_world = next(p for p in e_dth.planets.values()
+                            if p.name != e_dth.player.location)
+        deals = e_dth.remote_top_deals(remote_world)
         check("deep scanner returns deal list", isinstance(deals, list))
+        check("deep scanner finds remote deals", len(deals) > 0)
         check("remote deals well-formed", all(
             d["margin"] > 0 and d["stock"] > 0 for d in deals))
         e_dth.player.equipped_modules = []
@@ -9452,7 +9869,7 @@ def run_web_test() -> None:
         # 1b. Health endpoint includes an explicit app version.
         with urllib.request.urlopen(f"{base_url}/api/health") as resp:
             health = json.loads(resp.read().decode("utf-8"))
-            assert health["status"] == "ok" and health["version"] == "2.2.0"
+            assert health["status"] == "ok" and health["version"] == APP_VERSION
             assert "Python/" not in resp.headers.get("Server", "")
             print("  [PASS] GET /api/health (versioned, minimal server header)")
 
