@@ -85,7 +85,15 @@ class TestInputValidation(GameTestCase):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 st.to_int(bad)
         self.assertEqual(st.to_int("12"), 12)
-        self.assertEqual(st.to_int(7.9), 7)
+        # Fractional values are rejected outright rather than silently
+        # truncated — an API that accepts 7.9 units of cargo and charges for 7
+        # is a bug waiting to happen. Integral strings and floats are fine.
+        for fractional in (7.9, 0.5, -3.25, "1.5", "2.7"):
+            with self.assertRaises(ValueError, msg=repr(fractional)):
+                st.to_int(fractional)
+        self.assertEqual(st.to_int(7.0), 7)
+        self.assertEqual(st.to_int("3.0"), 3)
+        self.assertEqual(st.to_int("1e2"), 100)
         self.assertEqual(st.to_int(10 ** 30), st.MAX_INT_INPUT)
 
 
@@ -144,6 +152,92 @@ class TestEconomy(GameTestCase):
         c0 = self.e.player.credits
         self.e.buy_stock(sym, 3)           # 17.97 -> 18, not 17
         self.assertEqual(c0 - self.e.player.credits, 18)
+
+
+class TestTradeAdvisor(GameTestCase):
+    """The advisor must quote what the trade actually pays.
+
+    It used to advertise margin * qty with no market-depth fee, charged only
+    one leg of fuel, and divided by one leg's travel days — over-stating
+    profit by around 10% and profit-per-day by up to 3.7x.
+    """
+
+    def _prepared_engine(self):
+        e = self.new_engine()
+        e.player.credits = 10 ** 8
+        e.player.ship_id = "orion"
+        e.recalculate_ship_stats()
+        e.player.cargo_cap = 60
+        return e
+
+    def test_advisor_net_profit_matches_the_realised_trade(self):
+        e = self._prepared_engine()
+        routes = e.compute_best_trade_routes()
+        self.assertGreater(len(routes), 0)
+        for r in routes:
+            src = e.planets[r["src"]]
+            dst = e.planets[r["dst"]]
+            gid, qty = r["good_id"], r["qty"]
+
+            # Re-price the route exactly as the advisor must.
+            unit_buy = e.get_buy_price(gid, src)
+            unit_sell = e.get_sell_price(gid, dst)
+            fee_buy = e.market_depth_fee(unit_buy, qty)
+            fee_sell = e.market_depth_fee(unit_sell, qty)
+            if src.name == e.player.location:
+                in_fuel, in_days = 0, 0
+            else:
+                in_fuel, in_days = e.calculate_travel_cost_between(e.current_planet, src)
+            out_fuel, out_days = e.calculate_travel_cost_between(src, dst)
+            fuel_cr = (e.fuel_credit_cost(in_fuel, e.current_planet)
+                       + e.fuel_credit_cost(out_fuel, src))
+            expected = ((unit_sell * qty - fee_sell)
+                        - (unit_buy * qty + fee_buy) - fuel_cr)
+            self.assertEqual(r["net_profit"], expected,
+                             f"{r['good']} {r['src']}->{r['dst']}")
+            self.assertEqual(r["days"], in_days + out_days)
+            self.assertEqual(r["profit_per_day"], int(expected / max(1, r["days"])))
+
+    def test_advisor_only_advertises_routes_that_pay(self):
+        e = self._prepared_engine()
+        for r in e.compute_best_trade_routes():
+            self.assertGreater(r["net_profit"], 0, f"{r['good']} {r['src']}->{r['dst']}")
+
+    def test_advisor_breakdown_is_internally_consistent(self):
+        e = self._prepared_engine()
+        for r in e.compute_best_trade_routes():
+            self.assertEqual(r["net_profit"],
+                             r["sell_income"] - r["buy_cost"] - r["fuel_credits"])
+            self.assertEqual(r["days"], r["inbound_days"] + r["outbound_days"])
+            self.assertGreater(r["fuel_credits"], 0)
+
+    def test_advisor_charges_the_flight_out_to_the_source_world(self):
+        """A route is two legs of fuel, not one."""
+        e = self._prepared_engine()
+        routes = e.compute_best_trade_routes()
+        multi_leg = [r for r in routes if r["inbound_fuel"] > 0]
+        self.assertGreater(len(multi_leg), 0)
+        for r in multi_leg:
+            self.assertGreater(r["fuel_credits"], r["outbound_fuel"] * 4,
+                               "the inbound leg was not charged")
+
+    def test_advisor_margin_filter_is_proportional(self):
+        """A 3 CR margin is 25% of water but 0.7% of AI cores."""
+        e = self._prepared_engine()
+        for r in e.compute_best_trade_routes():
+            self.assertGreaterEqual(
+                r["margin"],
+                max(st.MIN_ROUTE_MARGIN_CR, r["buy_price"] * st.MIN_ROUTE_MARGIN_PCT) - 1)
+
+    def test_remote_scanner_deals_are_fee_aware(self):
+        e = self._prepared_engine()
+        remote = next(p for p in e.planets.values() if p.name != e.player.location)
+        deals = e.remote_top_deals(remote)
+        self.assertGreater(len(deals), 0)
+        for d in deals:
+            expected = (e.quote_sell(d["good_id"], 1, e.current_planet)
+                        - e.quote_buy(d["good_id"], 1, remote))
+            self.assertEqual(d["margin"], expected, d["good"])
 
 
 class TestContracts(GameTestCase):
@@ -276,6 +370,160 @@ class TestCombat(GameTestCase):
         self.assertTrue(e.is_game_over)
         self.assertEqual(len(e.load_hall_of_fame()), 1)
 
+    def test_defensive_enemy_still_returns_fire_while_charging(self):
+        """A defensive pilot used to skip its attack entirely when it
+        recharged, handing the player a free turn every third round."""
+        e = self.e
+        e.player.hull = e.player.max_hull
+        e.player.shield = e.player.max_shield
+        c = st.CombatEncounter(e, "Bunker", "orion")
+        c.personality = "defensive"
+        c.enemy_shield = 1                     # deep into the charge band
+        hull_before = e.player.hull
+        shield_before = e.player.shield
+        random.seed(11)
+        c.player_action("fire")
+        took_damage = (e.player.hull < hull_before) or (e.player.shield < shield_before)
+        self.assertTrue(took_damage, "the defensive enemy skipped its attack")
+
+    def test_fried_emitters_stop_the_shield_cycle(self):
+        """Targeting the emitters is the counter-play to a defensive enemy.
+
+        It used to be a trap: the player could hold the shield down forever
+        but never land a hull hit, so the fight could not be won at all.
+        """
+        e = self.e
+        e.player.hull = e.player.max_hull
+        e.player.shield = e.player.max_shield
+        e.player.equipped_weapons = ["laser_2"]
+        c = st.CombatEncounter(e, "Bunker", "orion")
+        c.personality = "defensive"
+        c.enemy_hull = 500
+        c.enemy_shield = 200
+        random.seed(3)
+        for _ in range(4):
+            if c.is_finished:
+                break
+            c.player_action("target_shields")
+        self.assertTrue(c.enemy_emitters_fried)
+        # With the emitters wrecked the shield can never come back up.
+        self.assertEqual(c.enemy_shield, 0)
+        # ...and the hull must actually be taking damage now.
+        self.assertLess(c.enemy_hull, 500,
+                        "the player still cannot damage a defensive enemy")
+
+    def test_defensive_enemy_can_be_actually_beaten(self):
+        """A top-tier player must be able to win a defensive engagement."""
+        e = self.e
+        e.player.credits = 10 ** 7
+        e.player.ship_id = "sovereign"
+        e.player.equipped_weapons = ["railgun_1"]
+        e.recalculate_ship_stats()
+        e.player.hull = e.player.max_hull
+        e.player.shield = e.player.max_shield
+        wins = 0
+        for seed in range(8):
+            random.seed(900 + seed)
+            e.player.hull = e.player.max_hull
+            e.player.shield = e.player.max_shield
+            c = st.CombatEncounter(e, "Bunker", "behemoth")
+            c.personality = "defensive"
+            c.enemy_max_hull = c.enemy_hull = 400
+            c.enemy_max_shield = c.enemy_shield = 200
+            for _ in range(80):
+                if c.is_finished:
+                    break
+                c.player_action("target_shields" if seed % 2 else "fire")
+            if c.is_finished and c.player_won:
+                wins += 1
+        self.assertGreaterEqual(wins, 6, f"only {wins}/8 defensive fights were winnable")
+
+
+class TestInsuranceAndContracts(GameTestCase):
+    """Insurance used to vaporise contract cargo and leave the contract
+    alive, so it could never be delivered and quietly expired later."""
+
+    def _cargo_contract(self):
+        e = self.e
+        e.available_missions = st.generate_mission_board(
+            e.current_planet, list(e.planets.values()), e.player.day, career_tier=2)
+        m = next((m for m in e.available_missions if m.cargo_good and m.cargo_qty > 0), None)
+        if m is None:
+            self.skipTest("no cargo contract generated for this seed")
+        self.assertTrue(e.accept_mission(m.id)[0])
+        return m
+
+    def test_insurance_voids_contracts_whose_cargo_was_destroyed(self):
+        e = self.e
+        m = self._cargo_contract()
+        e.player.insurance_active = True
+        msgs = e.insurance_respawn()
+        self.assertEqual(e.player.cargo, {})
+        # The contract must not linger on the log with cargo that no longer
+        # exists.
+        self.assertNotIn(m.id, [x.id for x in e.player.active_missions])
+        self.assertTrue(any("voided" in msg.lower() for msg in msgs),
+                        f"the captain was not told: {msgs}")
+
+    def test_insurance_keeps_contracts_whose_cargo_survives(self):
+        """A passenger run has no cargo in the hold, so it survives the loss."""
+        e = self.e
+        dest = next(p.name for p in e.planets.values() if p.name != e.player.location)
+        passenger = st.Mission(
+            id="mis_pass_test", title="Passenger Run", m_type="passenger",
+            origin=e.player.location, destination=dest,
+            cargo_good=None, cargo_qty=0, bounty_target_name=None,
+            bounty_target_ship=None, reward_credits=1_000, days_left=9,
+            desc="VIP transport")
+        e.player.active_missions.append(passenger)
+        e.player.insurance_active = True
+        e.insurance_respawn()
+        self.assertIn(passenger.id, [x.id for x in e.player.active_missions])
+
+    def test_contract_cargo_has_a_cost_basis(self):
+        """The hold readout used to fall back to the live market price."""
+        e = self.e
+        m = self._cargo_contract()
+        self.assertIn(m.cargo_good, e.player.cargo_cost_basis)
+        basis = e.player.cargo_cost_basis[m.cargo_good]
+        self.assertGreater(basis, 0)
+        self.assertLess(abs(basis - e.get_buy_price(m.cargo_good)), 2)
+
+    def test_bought_cargo_cost_basis_blends_correctly(self):
+        """The weighted-average basis must fold each purchase in properly."""
+        e = self.e
+        e.player.credits = 10 ** 6
+        e.player.cargo = {}
+        e.player.cargo_cost_basis = {}
+        e.player.cargo_cap = 500
+        e._acquire_cargo("water", 10, 20.0)
+        self.assertEqual(e.player.cargo_cost_basis["water"], 20.0)
+        # A second lot at a different price re-averages the two.
+        e._acquire_cargo("water", 30, 40.0)
+        self.assertAlmostEqual(e.player.cargo_cost_basis["water"], 35.0, places=2)
+        self.assertEqual(e.player.cargo["water"], 40)
+
+    def test_cargo_basis_only_counts_what_actually_fitted(self):
+        """A lot bigger than the hold blends only the units that boarded."""
+        e = self.e
+        e.player.credits = 10 ** 6
+        e.player.cargo = {}
+        e.player.cargo_cost_basis = {}
+        e.player.cargo_cap = 15
+        e._acquire_cargo("water", 30, 40.0)
+        self.assertEqual(e.player.cargo["water"], 15)
+        self.assertEqual(e.player.cargo_cost_basis["water"], 40.0)
+
+    def test_bought_cargo_records_a_real_cost_basis(self):
+        e = self.e
+        e.player.credits = 10 ** 6
+        self.assertTrue(e.buy_commodity("water", 10)[0])
+        basis = e.player.cargo_cost_basis["water"]
+        self.assertGreater(basis, 0)
+        # The basis includes the market-depth fee, so it sits at or above the
+        # station's list price.
+        self.assertGreaterEqual(basis, e.get_buy_price("water") - 1)
+
 
 class TestPersistence(GameTestCase):
     def test_roundtrip(self):
@@ -387,6 +635,63 @@ class TestDispatcher(GameTestCase):
         self.assertFalse(self.s.engine.is_game_over)
         self.assertNotIn("<", self.s.engine.player.name)
 
+    def _force_death(self):
+        """Drive the session into a finished, fatal battle."""
+        engine = self.s.engine
+        engine.player.credits = 10 ** 7
+        engine.player.equipped_weapons = ["laser_1"]
+        engine.recalculate_ship_stats()
+        combat = st.start_combat(
+            engine, {"type": "pirate_ambush", "enemy_name": "Reaper", "enemy_ship": "behemoth"})
+        self.s.active_combat = combat
+        engine.player.hull = 1
+        engine.player.shield = 0
+        for _ in range(40):
+            if combat.is_finished:
+                break
+            combat.player_action("fire")
+        self.assertTrue(combat.player_dead)
+        self.assertTrue(engine.is_game_over)
+        return combat
+
+    def test_dead_captain_can_still_dismiss_the_battle(self):
+        """Regression: a destroyed ship used to leave the combat overlay stuck.
+
+        The career-over gate refused "dismiss_combat", so the session kept the
+        finished encounter forever and the browser trapped the player behind an
+        opaque overlay with no reachable recovery buttons.
+        """
+        combat = self._force_death()
+        r = self.act(action="dismiss_combat")
+        self.assertTrue(r["success"], r["message"])
+        self.assertIsNone(self.s.active_combat)
+        self.assertIn("Recovery", r["message"])
+
+    def test_dead_captain_cannot_take_further_combat_actions(self):
+        """Dismissing is allowed; taking a *new* combat action is not."""
+        self._force_death()
+        turns = self.s.active_combat.turn_count
+        r = self.act(action="combat_action", combat_action="fire")
+        self.assertFalse(r["success"])
+        # The finished encounter is still there for the client to render the
+        # death log, but it cannot be played any further.
+        self.assertIsNotNone(self.s.active_combat)
+        self.assertEqual(self.s.active_combat.turn_count, turns)
+
+    def test_dead_captain_still_cannot_trade_or_travel(self):
+        self._force_death()
+        for act in ({"action": "odd_jobs"},
+                    {"action": "buy_fuel", "amount": 10},
+                    {"action": "travel", "destination": "Mars"}):
+            self.assertEqual(self.act(**act)["message"], st.CAREER_OVER_MSG)
+
+    def test_recovery_paths_stay_reachable_after_death(self):
+        """load_game / new_game must still revive a dead career."""
+        self._force_death()
+        self.assertTrue(self.act(action="new_game", name="Reborn", difficulty="normal")["success"])
+        self.assertFalse(self.s.engine.is_game_over)
+        self.assertIsNone(self.s.active_combat)
+
     def test_unknown_combat_maneuver_rejected(self):
         self.s.active_combat = st.CombatEncounter(self.s.engine, "Raider", "viper")
         self.assertFalse(self.act(action="combat_action", combat_action="self_destruct")["success"])
@@ -489,6 +794,44 @@ class TestHttp(GameTestCase):
         [t.start() for t in ts]
         [t.join() for t in ts]
         self.assertEqual(len({id(x) for x in seen}), 1)
+
+    def test_death_leaves_the_player_able_to_recover_over_http(self):
+        """Regression: a destroyed ship used to trap the player behind the
+        combat overlay. The overlay's only button fired "dismiss_combat",
+        which the career-over gate refused, and the recovery modal sat behind
+        the overlay. Every exit must now work over the real API."""
+        s = st.get_session()
+        engine = s.engine
+        engine.player.credits = 10 ** 7
+        engine.player.equipped_weapons = ["laser_1"]
+        engine.recalculate_ship_stats()
+        combat = st.start_combat(
+            engine, {"type": "pirate_ambush", "enemy_name": "Reaper", "enemy_ship": "behemoth"})
+        s.active_combat = combat
+        engine.player.hull = 1
+        engine.player.shield = 0
+        for _ in range(40):
+            if combat.is_finished:
+                break
+            combat.player_action("fire")
+        self.assertTrue(combat.player_dead)
+
+        # The client must be able to read the death off the state payload.
+        code, body = self.post({"action": "combat_action", "combat_action": "fire"})
+        self.assertEqual(code, 200)
+        self.assertTrue(body["state"]["player"]["is_game_over"])
+
+        # And the overlay must be dismissable.
+        code, body = self.post({"action": "dismiss_combat"})
+        self.assertEqual(code, 200)
+        self.assertTrue(body["success"], body["message"])
+        self.assertIsNone(s.active_combat)
+
+        # Recovery via a flight record still works.
+        code, body = self.post({"action": "new_game", "name": "Reborn", "difficulty": "easy"})
+        self.assertEqual(code, 200)
+        self.assertTrue(body["success"])
+        self.assertFalse(body["state"]["player"]["is_game_over"])
 
 
 class TestFuzzInvariants(GameTestCase):
