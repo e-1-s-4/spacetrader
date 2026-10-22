@@ -4,6 +4,105 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 semantic versioning.
 
+## 2.4.0 — The audit release: 30+ fixes, a new frontier encounter, and CI
+
+### Fixed
+
+- **Critical — client crash on every mission-destination render.** The star-map
+  dossier read `m.reward_credits` while the serializer emitted `reward`, so
+  selecting (or arriving at) any planet with an active contract threw a
+  `TypeError` inside `renderAll`, aborted every later renderer, and surfaced as
+  a bogus "Communication error" toast with a stuck red connection banner. The
+  serializer now emits both keys, and `renderAll()` is fault-isolated per
+  renderer so one bad panel can never again take the whole UI down.
+- **Market inventories drifted ~1.9× above design targets.** The stock
+  mean-reversion smoother's weights summed to 1.4 (every sibling sums to 1.0),
+  so station stockpiles inflated forever and the trade advisor overestimated
+  available supply. Weights now sum to 1.0 and inventories relax onto target.
+- **Encounter loot reported negative trading profit.** Derelict salvage,
+  nomad-trader crates, asteroid ore, mining and comet yields, ghost-freighter
+  AI cores, cargo-breach and boarding loot all entered the hold without a cost
+  basis, so selling them showed "Profit: −N CR", drained renown, and blocked the
+  Trade Baron achievement. All of it is now recorded at its true (usually zero)
+  basis, and the trader's paid crates at their real price.
+- **One corrupt Hall of Fame entry bricked all future recordings.** Loading
+  validated key presence but not types; a single bad `net_worth` poisoned the
+  sort inside the write path, the `TypeError` was swallowed, and the file was
+  never rewritten again. Entries are now type-validated on load, the sort key
+  is type-safe, and de-duplication includes the difficulty.
+- **Concurrent requests could 500.** POST responses were serialized (and GET
+  state dumps transmitted) while iterating live engine containers; a second
+  tab mutating cargo or price history mid-dump raised "dictionary changed size
+  during iteration". Snapshots are now deep-copied out of the session lock, and
+  transmission happens outside the lock so a stalled client can't block other
+  requests.
+- **"Start New Career" was unreachable from the death screen.** The new-game
+  modal stacked *under* the vessel-loss modal, whose focus trap kept yanking
+  keyboard focus back. It now stacks above.
+- **Contract deadlines lost their final day.** Missions failed at
+  `days_left <= 0` before arrival deliveries were checked, so "within N days"
+  really granted N−1, and landing on deadline day repossessed the cargo.
+  Deadlines are now inclusive (and covered by a new regression test).
+- **Smuggling at reputation ≥ 15 was risk-free and even paid a stipend.** High
+  standing now lowers patrol detection odds (never below 30%) instead of
+  granting diplomatic immunity; the smuggler perk also helps.
+- **The derby could stake the captain's entire balance.** A wager above the
+  advertised buy-in is now refused instead of silently clamping upward.
+- **Pirates and hull breaches could steal sealed contract cargo**, making the
+  contract undeliverable through no fault of the player. Transponder-locked
+  goods are now off-limits; only unsealed cargo changes hands.
+- **Inapplicable combat maneuvers burned the turn.** Firing a torpedo with no
+  rack, evading on dead thrusters, boarding too early, or fleeing with damaged
+  warp drives consumed the turn AND provoked a full enemy volley (hotkeys
+  bypassed the disabled buttons). They are now free refusals, identical to the
+  buttons.
+- **Trade-in exploit.** Selling a battered ship back paid 70% of list price
+  regardless of condition, making a downgrade → upgrade cycle a cheap full
+  repair plus free refuel. Trade-in value is now prorated by hull condition.
+- **Fuel estimates for senior officers were wrong.** `fuel_credit_cost` ignored
+  the rank service discount and used a different floor than `buy_fuel`, so the
+  advisor and GUI overstated fuel prices from Captain rank up. Both paths now
+  share the same math.
+- **Mission IDs could collide** (same board, same day, 4-digit suffix),
+  corrupting abandon/delivery lookups. IDs now carry a unique token.
+- **A new enemy raid used to fire twice** — fixed in 2.3.0 — **and stock
+  histories double-appended on Market Wire shock days**, distorting the 30-day
+  window. Shock days now replace the day's sample.
+- **Save-version safety.** The `version` field was written but never checked;
+  a save from a newer build would mis-load field by field. Newer saves are now
+  refused with a clear message (older saves keep loading via defaults).
+- **Perk stacking.** Hiring two officers of the same perk type silently kept
+  only the first hire's value; the strongest perk now applies.
+- **Test-hygiene fixes:** vacuous `or True` self-test checks made real; the
+  web smoke test's temp dir no longer leaks every run; the engine suite cleans
+  up even when a mid-suite failure aborts; `dismiss_combat` with no combat no
+  longer claims a battle is raging.
+- **UI details:** the market table's empty-state `colspan` matched its real 8
+  columns; the previously-undefined `.dmg-red` class exists so combat damage
+  floats red; the HUD security pill and dossier readout colour by actual
+  threat level instead of hardcoded green; blank captain names are trimmed to
+  the default; the star-map ping animates via transform (works on engines that
+  can't animate SVG geometry); audio unlocks from a real user gesture (Safari's
+  strict autoplay policy could permanently mute the game); keyboard focus is
+  restored after re-renders that replace the focused element.
+
+### Added
+
+- **Uncharted Cache — a 14th deep-space encounter.** A shielded drop pod bolted
+  to a nameless rock: crack it open for bearer chips, contraband, AI cores, or
+  a fellow runner's courtesy stash — or eat a booby trap, trip a decoy
+  transponder, or find it already gutted. Odds shift with local crime level,
+  and a new **Cache Hunter** achievement rewards three clean finds.
+- **Logistics Director achievement** for completing 15 contracts (31 total),
+  and the Career tab's achievement counter is now live instead of hardcoded.
+- **Net Worth Trend chart** in the Career tab: a dependency-free SVG sparkline
+  of the last 30 days with start/today/peak callouts.
+- **GitHub Actions CI** (`.github/workflows/ci.yml`): compiles, version-checks,
+  runs both built-in suites, the 67-test regression suite, and the jsdom
+  browser smoke test on Python 3.8–3.13 × Node 20 — the pipeline the README
+  always promised.
+- Encounters now autosave on resolution, so quitting after a find keeps it.
+
 ## 2.3.0 — Correctness, honest numbers, and an accessible client
 
 ### Fixed

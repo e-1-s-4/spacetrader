@@ -6,7 +6,7 @@ interface all live in **`spacetrader.py`**. Runtime dependencies are limited to 
 standard library — no package installation, build step, external assets, or separate
 frontend is required.
 
-**Version 2.3.0** · MIT licensed · Python 3.8+
+**Version 2.4.0** · MIT licensed · Python 3.8+
 
 ---
 
@@ -93,9 +93,12 @@ or blocks playback, gameplay remains available without sound.
   an estimate.
 - Contract cargo is sealed. Abandon the contract to return its cargo; expired contracts
   repossess it.
-- A traded-in ship is valued at 70% of its listed price.
+- A traded-in ship is valued at 70% of its listed price, prorated by hull
+  condition — fly in with a battered hull and the yard adjusts the offer
+  accordingly. Equipment that does not fit the new hull is salvaged at 75%
+  and refunded, never destroyed.
 - Active encounters and battles must be resolved before regular travel, trading, or saving
-  can continue.
+  can continue. Resolved encounters are autosaved, so quitting afterwards keeps the outcome.
 - A **defensive** raider cycles its shields and still shoots while it charges. Venting its
   emitter bank wrecks the emitters for good — the surest way to break an opponent that
   keeps out-shielding you.
@@ -114,7 +117,7 @@ The client is fully operable without a mouse.
 | `E` | Evasive maneuvers |
 | `D` | Deploy drones |
 | `B` | Board the vessel |
-| `Esc` | Close the open dialog |
+| `Esc` | Close the open dialog (combat and vessel-loss screens are deliberate exceptions) |
 | `Enter` | Confirm the amount dialog |
 
 Every overlay is a labelled dialog that takes keyboard focus, traps it while open, and

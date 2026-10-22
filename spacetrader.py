@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
- SPACE TRADER: ODYSSEY — Nebula Edition v2.0 (Browser HTML)
+ SPACE TRADER: ODYSSEY — Nebula Edition v2.4 (Browser HTML)
 ================================================================================
 A complete sci-fi trading, exploration, and combat RPG with a modern browser
 interface served by a built-in threaded HTTP server. Pure Python stdlib —
@@ -34,9 +34,10 @@ WHAT'S INSIDE
 * Tactical turn-based combat with subsystem targeting, class-scaled enemy
   firepower, threat ratings, evasive maneuvers, torpedo volleys, missiles,
   drones, boarding actions and four AI personalities.
-* 13 deep-space encounter types — from customs sweeps and wormholes to
-  cometary ice fields, ghost freighters, and Oort Cloud derby wagers.
-* Ranks (Cadet → Admiral), faction reputation, 29 achievements, banking,
+* 14 deep-space encounter types — from customs sweeps and wormholes to
+  cometary ice fields, ghost freighters, Oort Cloud derby wagers, and
+  uncharted smuggler caches.
+* Ranks (Cadet → Admiral), faction reputation, 31 achievements, banking,
   stock exchange with market wire headlines, and a persistent Hall of Fame.
 * Survival safety net: dockside odd jobs guarantee a stranded captain can
   always earn fuel money — no more dead-end careers.
@@ -60,10 +61,12 @@ import os
 import platform
 import random
 import re
+import shutil
 import sys
 import tempfile
 import time
 import traceback
+import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple, Set
 
@@ -78,7 +81,7 @@ import threading
 # CONSTANTS & HELPERS
 # ==============================================================================
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 __version__ = APP_VERSION
 
 TARGET_NET_WORTH = 500_000
@@ -614,7 +617,9 @@ class Planet:
 
             tgt_stock = self._target_stock(comm)
             old_stock = self.stock.get(gid, tgt_stock)
-            drifted = int(old_stock * 0.55 + tgt_stock * random.uniform(0.55, 1.15))
+            # Weights must sum to 1.0 so inventories relax onto the target
+            # stock instead of inflating ~1.9x forever.
+            drifted = int(old_stock * 0.55 + tgt_stock * random.uniform(0.35, 0.55))
             self.stock[gid] = max(0, drifted)
 
         fuel_target = (
@@ -1077,7 +1082,10 @@ def generate_mission_board(
     tier_mult = 1.0 + 0.12 * clamp(career_tier, 0, 2)
 
     def new_id(prefix: str) -> str:
-        return f"mis_{prefix}_{day}_{random.randint(1000, 9999)}"
+        # Suffix with a unique token: two boards generated the same day could
+        # otherwise collide on (day, 4-digit) IDs and corrupt abandon/delivery
+        # lookups that match by ID.
+        return f"mis_{prefix}_{day}_{random.randint(1000, 9999)}_{uuid.uuid4().hex[:8]}"
 
     def pick_dst() -> Planet:
         return random.choice(dest_candidates)
@@ -1275,6 +1283,7 @@ DEFAULT_STATS: Dict[str, int] = {
     "derby_wins": 0,
     "loan_repaid": 0,
     "cargo_jettisoned": 0,
+    "caches_found": 0,
 }
 
 # ------------------------------------------------------------------ #
@@ -1403,11 +1412,13 @@ class Player:
         return crew_id in self.hired_crew
 
     def has_crew_perk(self, perk_type: str) -> Optional[float]:
-        for cid in self.hired_crew:
-            c = CREW_INDEX.get(cid)
-            if c and c.perk_type == perk_type:
-                return c.perk_val
-        return None
+        # Several officers can share a perk type — honour the strongest one
+        # instead of silently dropping everyone after the first hire.
+        values = [
+            c.perk_val for cid in self.hired_crew
+            if (c := CREW_INDEX.get(cid)) and c.perk_type == perk_type
+        ]
+        return max(values) if values else None
 
     def has_missile_rack(self) -> bool:
         return "missile_rack" in self.equipped_weapons
@@ -1469,6 +1480,8 @@ ACHIEVEMENTS: Dict[str, Tuple[str, str]] = {
     "debt_slayer": ("Debt Slayer", "Repay 50,000 CR of borrowed funds in total"),
     "void_gambler": ("Void Gambler", "Win an Oort Cloud derby wager"),
     "icy_prospector": ("Icy Prospector", "Harvest 5 cometary ice fields"),
+    "missions_15": ("Logistics Director", "Complete 15 contracts"),
+    "cache_hunter": ("Cache Hunter", "Crack 3 uncharted caches"),
 }
 
 
@@ -1766,6 +1779,10 @@ class GameEngine:
             unlock("wormhole_rider")
         if stats.get("comet_ops", 0) >= 5:
             unlock("icy_prospector")
+        if stats.get("missions_completed", 0) >= 15:
+            unlock("missions_15")
+        if stats.get("caches_found", 0) >= 3:
+            unlock("cache_hunter")
         if stats.get("derby_wins", 0) >= 1:
             unlock("void_gambler")
         if stats.get("trading_profit", 0) >= 250_000:
@@ -1858,7 +1875,12 @@ class GameEngine:
                 stk = self.stocks[sym]
                 shock = random.uniform(0.04, 0.12) * random.choice([1, -1])
                 stk.price = max(5.0, round(stk.price * (1 + shock), 2))
-                stk.history.append(stk.price)
+                # Replace today's existing sample instead of appending a second
+                # one so shock days do not distort the history window.
+                if stk.history:
+                    stk.history[-1] = stk.price
+                else:
+                    stk.history.append(stk.price)
                 if len(stk.history) > 30:
                     stk.history.pop(0)
                 direction = "soars" if shock > 0 else "tumbles"
@@ -1886,7 +1908,11 @@ class GameEngine:
             expired: List[Mission] = []
             for m in self.player.active_missions:
                 m.days_left -= 1
-                if m.days_left <= 0 and not m.completed:
+                # Fail only once the deadline has fully passed (days_left < 0).
+                # Using <= 0 silently stole the final day: a contract with N
+                # days really allowed only N-1, and arriving on deadline day
+                # repossessed the cargo before deliveries were checked.
+                if m.days_left < 0 and not m.completed:
                     m.failed = True
                     expired.append(m)
             for em in expired:
@@ -2222,7 +2248,11 @@ class GameEngine:
     # Ship / equipment / crew
 
     def ship_trade_in_value(self) -> int:
-        return int(SHIP_TEMPLATES[self.player.ship_id].cost * 0.7)
+        # 70% of the listed price, prorated by hull condition — otherwise a
+        # downgrade -> upgrade cycle is a cheap full repair plus free refuel.
+        tmpl = SHIP_TEMPLATES[self.player.ship_id]
+        hull_fraction = self.player.hull / max(1, tmpl.max_hull)
+        return int(tmpl.cost * 0.7 * clamp(hull_fraction, 0.05, 1.0))
 
     @requires_alive
     def buy_ship(self, template_id: str) -> Tuple[bool, str]:
@@ -2652,6 +2682,7 @@ class GameEngine:
             ("comet_mining", 9),
             ("ghost_freighter", 7),
             ("derby", 6),
+            ("smuggler_cache", 7),
         ]
         ev_types, weights = zip(*event_weights)
         chosen = random.choices(ev_types, weights=weights)[0]
@@ -2783,6 +2814,15 @@ class GameEngine:
                         f"{money(wager)} CR with a 2.2x payout if your pick holds the line.",
             }
 
+        if chosen == "smuggler_cache":
+            return {
+                "type": "smuggler_cache",
+                "title": "Uncharted Cache Detected",
+                "desc": "Short-range sensors resolve a shielded supply pod bolted to a "
+                        " nameless rock — the kind of stash a runner drops when a deal "
+                        "goes wrong. It could hold valuables, or hold a grudge.",
+            }
+
         return None
 
     # ----- encounter resolutions (engine-side, shared by GUI and tests) ----- #
@@ -2856,19 +2896,32 @@ class GameEngine:
                         f"damage. ({faction} standing -6)")
             return msgs
 
-        if illegal and rep < 15:
-            fine = max(400, int(self.player.credits * 0.18 * self.difficulty.fine_mult))
+        if illegal:
+            # A friendly patrol is lenient, never blind: reputation lowers the
+            # odds of a deep scan, and the smuggler's touch helps too, but a
+            # hold full of contraband always carries some risk. (Previously
+            # rep >= 15 made smuggling literally risk-free and even paid a
+            # stipend for it.)
             zoe_perk = self.player.has_crew_perk("smuggler") or 0.0
-            fine = int(fine * (1.0 - zoe_perk))
-            fine = min(self.player.credits, fine)
-            self.player.credits -= fine
-            for g in list(illegal.keys()):
-                self.player.remove_cargo(g, illegal[g])
-                self.player.cargo_cost_basis.pop(g, None)
-            self.adjust_reputation(faction, -10)
-            self.sound.play("alarm")
-            msgs.append(f"The inspection turns up your contraband! Fined {money(fine)} CR and "
-                        f"cargo seized. ({faction} standing -10)")
+            detection = 0.85 if rep < 15 else max(0.30, 0.85 - rep * 0.011)
+            detection *= max(0.25, 1.0 - zoe_perk)
+            if random.random() < detection:
+                fine = max(400, int(self.player.credits * 0.18 * self.difficulty.fine_mult))
+                fine = int(fine * (1.0 - zoe_perk))
+                fine = min(self.player.credits, fine)
+                self.player.credits -= fine
+                for g in list(illegal.keys()):
+                    self.player.remove_cargo(g, illegal[g])
+                    self.player.cargo_cost_basis.pop(g, None)
+                self.adjust_reputation(faction, -10)
+                self.sound.play("alarm")
+                msgs.append(f"The inspection turns up your contraband! Fined {money(fine)} CR and "
+                            f"cargo seized. ({faction} standing -10)")
+                return msgs
+            gain = self.adjust_reputation(faction, 1)
+            msgs.append("The patrol sweeps a scanner wand over a few crates, then waves "
+                        "you through — your papers and standing did the talking. "
+                        f"({faction} standing +{gain})")
             return msgs
 
         gain = self.adjust_reputation(faction, 4)
@@ -2891,7 +2944,7 @@ class GameEngine:
             salvage_cr = random.randint(600, 2_400)
             good = random.choice(list(COMMODITIES.keys()))
             qty = random.randint(2, 6)
-            added = self.player.add_cargo(good, qty)
+            added = self._acquire_cargo(good, qty, 0.0)
             self.player.credits += salvage_cr
             self.sound.play("victory")
             return [f"Salvage team recovered {money(salvage_cr)} CR and {added}x {COMMODITIES[good].name}!"]
@@ -2929,7 +2982,7 @@ class GameEngine:
         if self.player.cargo_free() < qty:
             return ["Not enough cargo space for the crate."]
         self.player.credits -= total
-        self.player.add_cargo(good, qty)
+        self._acquire_cargo(good, qty, total / max(1, qty))
         self.sound.play("buy")
         return [f"Deal accepted! Loaded {qty}x {COMMODITIES[good].name} for {money(total)} CR."]
 
@@ -2953,7 +3006,7 @@ class GameEngine:
             self.sound.play("alarm")
             return [f"A glancing boulder slams the plating for {dmg} hull damage!"]
         salvage = random.randint(2, 6)
-        added = self.player.add_cargo("ore", salvage)
+        added = self._acquire_cargo("ore", salvage, 0.0)
         self.sound.play("coin")
         if added:
             return [f"Close pass scrapes a rich seam loose — you scoop {added}x "
@@ -3004,7 +3057,7 @@ class GameEngine:
         qty = random.randint(3, 8)
         if self.player.has_module("mining_rig"):
             qty = int(qty * 1.8)
-        added = self.player.add_cargo(vein, qty)
+        added = self._acquire_cargo(vein, qty, 0.0)
         self.sound.play("mine")
         self.check_achievements()
         return [f"Mining drones strip the seam: recovered {added}x {COMMODITIES[vein].name} "
@@ -3025,12 +3078,12 @@ class GameEngine:
         qty = random.randint(4, 10)
         if self.player.has_module("mining_rig"):
             qty = int(qty * 1.8)
-        added = self.player.add_cargo("water", qty)
+        added = self._acquire_cargo("water", qty, 0.0)
         msgs = [f"Scoop nets flare wide: harvested {added}x Pure Water from the "
                 f"comet tails (−{fuel_cost} fuel)."]
         if random.random() < 0.30:
             cells = random.randint(2, 5)
-            got_cells = self.player.add_cargo("fuel_cells", cells)
+            got_cells = self._acquire_cargo("fuel_cells", cells, 0.0)
             if got_cells:
                 msgs.append(f"Sublimation vents also yield {got_cells}x Hyper-Fuel Cells!")
         self.sound.play("mine")
@@ -3050,7 +3103,7 @@ class GameEngine:
             if random.random() < 0.70:
                 cores = random.randint(2, 4)
                 salvage = random.randint(400, 1_200)
-                added = self.player.add_cargo("ai_cores", cores)
+                added = self._acquire_cargo("ai_cores", cores, 0.0)
                 self.player.credits += salvage
                 self.sound.play("victory")
                 msgs.append(f"The sealed vault yields {added}x Unshackled AI Core(s) "
@@ -3067,7 +3120,7 @@ class GameEngine:
             if random.random() < 0.45:
                 cores = random.randint(3, 8)
                 salvage = random.randint(800, 2_400)
-                added = self.player.add_cargo("ai_cores", cores)
+                added = self._acquire_cargo("ai_cores", cores, 0.0)
                 self.player.credits += salvage
                 self.sound.play("victory")
                 msgs.append(f"Jackpot — the tore-open vault spills {added}x Unshackled "
@@ -3078,8 +3131,13 @@ class GameEngine:
                 self.player.shield = 0
                 stolen_qty = 0
                 for good in list(self.player.cargo.keys()):
+                    # Sealed contract cargo is strapped to its client's
+                    # transponder — only unsealed goods vent into space.
+                    loose = self.player.sellable_cargo(good)
+                    if loose <= 0:
+                        continue
                     stolen_qty += self.player.remove_cargo(good, min(
-                        self.player.cargo[good], random.randint(1, 3)))
+                        loose, random.randint(1, 3)))
                 self.sound.play("alarm")
                 msgs.append(f"Catastrophe — the hull shears back and a security drone "
                             f"rakes your ship for {dmg} hull damage!")
@@ -3089,12 +3147,82 @@ class GameEngine:
         self.check_achievements()
         return msgs
 
+    def resolve_smuggler_cache(self, enc: Dict[str, Any], investigate: bool) -> List[str]:
+        """A shielded drop-pod stash bolted to a nameless rock.
+
+        High reward, real risk: runners protect their stashes. The odds tilt
+        with the local crime level — lawless space hides richer (and meaner)
+        caches. Loot is recorded at zero cost basis so selling it reports an
+        honest profit.
+        """
+        if not investigate:
+            return ["You log the cache coordinates for the cartographers and leave "
+                    "whoever dropped it to their secrets."]
+        if self.player.cargo_free() < 1 and random.random() < 0.75:
+            # Most outcomes want hold space; a full hold mostly finds nothing.
+            return ["Your hold is packed solid — there is nowhere to put anything "
+                    "the cache might yield, so you leave it sealed."]
+
+        crime = clamp(self.current_planet.crime, 0.0, 3.0)
+        stash_cr = random.randint(300, 1_200) + int(crime * 250)
+        roll = random.random()
+
+        if roll < 0.42:
+            # Clean score: untraceable credits and choice contraband.
+            good = random.choice(["narcotics", "weapons", "luxury"])
+            qty = random.randint(2, 5)
+            added = self._acquire_cargo(good, qty, 0.0)
+            self.player.credits += stash_cr
+            self.player.stats["caches_found"] += 1
+            self.sound.play("victory")
+            self.check_achievements()
+            return [f"The pod's mag-locks release! Inside: {money(stash_cr)} CR in "
+                    f"bearer chips and {added}x {COMMODITIES[good].name}. "
+                    "No questions asked, none answered."]
+        if roll < 0.62:
+            # Booby-trapped, but the prize survives the surprise.
+            good = random.choice(["ai_cores", "medicine", "electronics"])
+            qty = random.randint(1, 3)
+            dmg = random.randint(8, 15)
+            self.player.hull = max(1, self.player.hull - dmg)
+            added = self._acquire_cargo(good, qty, 0.0)
+            self.player.stats["caches_found"] += 1
+            self.sound.play("alarm")
+            self.check_achievements()
+            return [f"A cesium charge strapped inside blows as the seal breaks — "
+                    f"{dmg} hull damage! You still extract {added}x "
+                    f"{COMMODITIES[good].name} from the wreckage."]
+        if roll < 0.82:
+            # Decoy: a tracker squawk and a worthless shell.
+            self.adjust_reputation(self.current_planet.faction, -2)
+            self.sound.play("alarm")
+            return ["The pod is a decoy rigged with a fleet transponder ping — you "
+                    f"barely clear the cordon before {self.current_planet.faction} "
+                    "sensors sweep the belt. (-2 local standing, nothing gained)"]
+        if roll < 0.92:
+            # Runner's courtesy: fuel cells and spare torpedoes.
+            cells = random.randint(2, 4)
+            added = self._acquire_cargo("fuel_cells", cells, 0.0)
+            missiles_found = random.choice([0, 1, 1, 2])
+            self.player.missiles = min(PLAYER_MISSILE_CAP, self.player.missiles + missiles_found)
+            self.player.stats["caches_found"] += 1
+            self.sound.play("coin")
+            self.check_achievements()
+            extra = f" and {missiles_found} homing torpedo(es)" if missiles_found else ""
+            return [f"A fellow runner's courtesy stash: {added}x Hyper-Fuel Cells"
+                    f"{extra}. Marked with the hollow-ring sign — pay it forward."]
+        # Gutted cache: someone got here first.
+        self.sound.play("alarm")
+        return ["The cache hangs open, gutted to the bulkheads. Fresh cutter marks "
+                "glisten on the seal — you are days late and empty-handed."]
+
     def resolve_derby(self, enc: Dict[str, Any], bet: bool) -> List[str]:
         """Wager on the Oort Cloud sled races: 2.2x payout at ~42% odds."""
         if not bet:
             return ["You watch two heats from the comm channel and keep your wallet shut."]
         wager = int(enc.get("wager", 100))
-        wager = max(100, min(wager, self.player.credits))
+        # The advertised buy-in is the buy-in: never silently stake the
+        # captain's entire balance when they cannot cover it.
         if self.player.credits < wager:
             return [f"Cannot cover the {money(wager)} CR buy-in tonight."]
         self.player.credits -= wager
@@ -3142,6 +3270,8 @@ class GameEngine:
             return self.resolve_ghost(enc, careful=bool(arg))
         if t == "derby":
             return self.resolve_derby(enc, bet=bool(arg))
+        if t == "smuggler_cache":
+            return self.resolve_smuggler_cache(enc, investigate=bool(arg))
         return []
 
 
@@ -3179,9 +3309,15 @@ class GameEngine:
         return deals[:limit]
 
     def fuel_credit_cost(self, units: int, planet: Optional[Planet] = None) -> int:
-        """Credits needed to fill ``units`` of fuel at ``planet``."""
+        """Credits needed to fill ``units`` of fuel at ``planet``.
+
+        Mirrors :meth:`buy_fuel` exactly — rank service discount and floor —
+        so the trade advisor and GUI never overstate fuel costs for senior
+        officers.
+        """
         p = planet or self.current_planet
-        unit_price = max(4, int(p.fuel_price * self.difficulty.fuel_mult))
+        unit_price = max(1, int(p.fuel_price * self.difficulty.fuel_mult
+                                * (1.0 - RANK_SERVICE_DISCOUNT[self.rank_index()])))
         return units * unit_price
 
     def compute_best_trade_routes(self, from_current_only: bool = False) -> List[Dict[str, Any]]:
@@ -3567,15 +3703,21 @@ class GameEngine:
         }
         try:
             entries = self.load_hall_of_fame()
-            # De-duplicate identical outcomes (name + day + net worth).
+            # De-duplicate identical outcomes (name + day + net worth +
+            # difficulty) so two different careers that happen to share the
+            # first three values both survive.
             entries = [
                 e for e in entries
                 if not (e.get("name") == entry["name"]
                         and e.get("day") == entry["day"]
-                        and e.get("net_worth") == entry["net_worth"])
+                        and e.get("net_worth") == entry["net_worth"]
+                        and e.get("difficulty") == entry["difficulty"])
             ]
             entries.append(entry)
-            entries.sort(key=lambda e: e.get("net_worth", 0), reverse=True)
+            entries.sort(
+                key=lambda e: e["net_worth"] if isinstance(e.get("net_worth"), (int, float))
+                and not isinstance(e.get("net_worth"), bool) else 0,
+                reverse=True)
             atomic_write_json(self.hof_path(), entries[:HOF_MAX_ENTRIES * 3])
         except Exception:
             pass
@@ -3585,10 +3727,20 @@ class GameEngine:
             with open(self.hof_path(), "r", encoding="utf-8") as f:
                 entries = json.load(f)
             if isinstance(entries, list):
-                return [
-                    e for e in entries
-                    if isinstance(e, dict) and "net_worth" in e and "name" in e
-                ]
+                # Validate types, not just key presence: one hand-edited or
+                # corrupted entry used to poison the sort in
+                # record_hall_of_fame (TypeError, silently swallowed) and
+                # permanently brick all future score recordings.
+                valid = []
+                for e in entries:
+                    if not isinstance(e, dict):
+                        continue
+                    nw = e.get("net_worth")
+                    name = e.get("name")
+                    if isinstance(nw, (int, float)) and not isinstance(nw, bool) \
+                            and isinstance(name, str):
+                        valid.append(e)
+                return valid
         except Exception:
             pass
         return []
@@ -3726,6 +3878,16 @@ class GameEngine:
                 data = json.load(f)
             if not isinstance(data, dict) or not isinstance(data.get("player"), dict):
                 raise ValueError("not a flight record")
+            # Refuse saves written by a NEWER format instead of mis-loading
+            # them field by field. Older saves keep loading via defaults.
+            try:
+                save_ver = int(data.get("version", 1))
+            except (TypeError, ValueError):
+                save_ver = 0
+            if save_ver > SAVE_VERSION:
+                raise ValueError(
+                    f"save version {save_ver} is newer than this build "
+                    f"(max supported: {SAVE_VERSION})")
 
             p_data = data.get("player", {})
 
@@ -4054,11 +4216,43 @@ class CombatEncounter:
     # ------------------------------------------------------------------ #
     # Main dispatch
 
+    def _action_blocker(self, action: str) -> Optional[str]:
+        """Return a refusal message when ``action`` cannot apply right now.
+
+        The refusal does NOT consume the turn — mirrored from the individual
+        maneuver implementations so keyboard shortcuts match the disabled
+        on-screen buttons.
+        """
+        p = self._p()
+        if action == "missile":
+            if not p.has_missile_rack():
+                return "You have no missile launcher installed!"
+            if p.missiles <= 0:
+                return "Missile magazines are empty! Buy more at the shipyard."
+        elif action == "evade":
+            if p.engines_damaged:
+                return "Thrusters are too badly damaged for evasive work — hold the line!"
+        elif action == "board":
+            if not self.can_board():
+                return "Boarding requires the enemy hull to be at 25% integrity or less."
+        elif action == "flee":
+            if p.engines_damaged:
+                return "Warp drives are DAMAGED — escape is impossible! Fight or die."
+        return None
+
     def player_action(self, action: str, arg: Any = None) -> List[str]:
         if self.is_finished:
             return ["The battle is already over."]
         if action not in self.ACTIONS:
             return ["Unknown combat maneuver."]
+
+        # Inapplicable maneuvers (no launcher, damaged thrusters, boarding too
+        # early, ...) used to burn the turn AND provoke a full enemy volley —
+        # the on-screen buttons are disabled but the hotkeys bypassed them.
+        # Gate here so hotkeys behave exactly like the buttons.
+        blocker = self._action_blocker(action)
+        if blocker:
+            return [blocker]
 
         msgs: List[str] = []
         self.turn_count += 1
@@ -4190,7 +4384,7 @@ class CombatEncounter:
         if target_subsystem == "cargo":
             loot_good = random.choice(list(COMMODITIES.keys()))
             qty = random.randint(1, 4)
-            added = p.add_cargo(loot_good, qty)
+            added = self.engine._acquire_cargo(loot_good, qty, 0.0)
             if added > 0:
                 return [f">> CARGO BREACH: Salvaged {added}x {COMMODITIES[loot_good].name} from the breach!"]
             return [">> CARGO BREACH: Containers drifted away — your hold is full."]
@@ -4294,7 +4488,7 @@ class CombatEncounter:
             loot_cr = random.randint(size_lo, max(size_lo + 1, size_hi))
             loot_good = random.choice(list(COMMODITIES.keys()))
             loot_qty = random.randint(2, max(3, self.enemy_max_hull // 80))
-            added = p.add_cargo(loot_good, loot_qty)
+            added = self.engine._acquire_cargo(loot_good, loot_qty, 0.0)
             missiles_found = random.choice([0, 0, 1, 2])
             p.missiles = min(PLAYER_MISSILE_CAP, p.missiles + missiles_found)
             p.credits += loot_cr
@@ -4471,10 +4665,17 @@ class CombatEncounter:
 
     def _enemy_steal_cargo(self) -> List[str]:
         p = self._p()
-        if not p.cargo:
+        # Sealed contract cargo is transponder-locked to its client: pirates
+        # fence only what they can resell without a trace.
+        candidates = [
+            (g, min(q, p.sellable_cargo(g)))
+            for g, q in p.cargo.items()
+            if p.sellable_cargo(g) > 0
+        ]
+        if not candidates:
             return []
-        good = random.choice(list(p.cargo.keys()))
-        qty = min(p.cargo[good], random.randint(1, 3))
+        good, stealable = random.choice(candidates)
+        qty = min(stealable, random.randint(1, 3))
         removed = p.remove_cargo(good, qty)
         if p.cargo.get(good, 0) <= 0:
             p.cargo_cost_basis.pop(good, None)
@@ -4911,10 +5112,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
     .current-ping {
       animation: ping 2s infinite;
       transform-origin: center;
+      transform-box: fill-box;
     }
+    /* Scale-based pulse: animating the SVG geometry property `r` is not
+       supported by every engine (older Firefox renders it static). */
     @keyframes ping {
-      0% { r: 12px; opacity: 0.8; }
-      100% { r: 32px; opacity: 0; }
+      0% { transform: scale(1); opacity: 0.8; }
+      100% { transform: scale(2.2); opacity: 0; }
     }
 
     /* Planet Flight Dossier */
@@ -5126,6 +5330,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       animation: floatUpFade 1.4s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
       pointer-events: none;
     }
+    /* Damage callouts (used by combat floaters) — previously referenced but
+       never defined, so hit numbers rendered default-white. */
+    .dmg-red { color: var(--red); }
     @keyframes floatUpFade {
       0% { opacity: 1; transform: translateY(0) scale(1); }
       50% { transform: translateY(-22px) scale(1.1); }
@@ -5187,6 +5394,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
        a combat bridge whose only button is unreachable, and the recovery
        options in the game-over modal are covered. */
     #gameover-modal { z-index: 350; }
+    /* The new-career dialog opens FROM the vessel-loss screen — it must stack
+       above it, or the death dialog buries it (and its focus trap keeps
+       yanking keyboard focus back, making "Start New Career" unreachable). */
+    #newgame-modal { z-index: 360; }
     #victory-modal { z-index: 340; }
 
     /* Toast Log Notification */
@@ -5829,7 +6040,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="panel-card">
           <div class="panel-card-header">
             <div>
-              <div class="panel-card-title">🏆 Career Achievements (29)</div>
+              <div class="panel-card-title">🏆 Career Achievements (<span id="ach-count">0</span>)</div>
               <div class="panel-card-subtitle" id="visited-sub">Major milestones unlocked across your voyages.</div>
             </div>
           </div>
@@ -5850,6 +6061,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <!-- Dynamically populated -->
             </div>
           </div>
+        </div>
+      </div>
+
+      <div class="panel-card" style="margin-top: 20px;">
+        <div class="panel-card-header">
+          <div>
+            <div class="panel-card-title">📈 Net Worth Trend</div>
+            <div class="panel-card-subtitle">Daily net worth across your recent career — the road to 500,000 CR.</div>
+          </div>
+        </div>
+        <div id="networth-sparkline" style="width: 100%;" aria-live="off">
+          <!-- Dynamically populated -->
         </div>
       </div>
     </div>
@@ -6123,7 +6346,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
         <div>
           <h4 style="color: var(--fg-dim); margin-bottom: 4px;">⌨️ Hotkeys & New Kit</h4>
-          <p><strong>1–9</strong> switch tabs · <strong>←/→</strong> move between tabs · <strong>F</strong> fire · <strong>M</strong> torpedo · <strong>R</strong> recharge · <strong>E</strong> evade · <strong>D</strong> drones · <strong>B</strong> board · <strong>Esc</strong> closes dialogs. Every dialog traps keyboard focus and hands it back when it closes, and the star map can be flown entirely from the keyboard. New equipment worth saving for: the <em>Bussard Ram-Scoop</em> (free fuel daily) and the <em>Heavy Extraction Rig</em> (double mining yields).</p>
+          <p><strong>1–9</strong> switch tabs · <strong>←/→</strong> move between tabs · <strong>F</strong> fire · <strong>M</strong> torpedo · <strong>R</strong> recharge · <strong>E</strong> evade · <strong>D</strong> drones · <strong>B</strong> board · <strong>Esc</strong> closes dialogs (except the combat and vessel-loss screens). Every dialog traps keyboard focus and hands it back when it closes, and the star map can be flown entirely from the keyboard. New equipment worth saving for: the <em>Bussard Ram-Scoop</em> (free fuel daily) and the <em>Heavy Extraction Rig</em> (double mining yields).</p>
         </div>
       </div>
     </div>
@@ -6646,21 +6869,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     function renderAll() {
       if (!gameState) return;
-      renderHUD();
-      renderVitals();
-      renderStarMap();
-      renderMarket();
-      renderCargoHold();
-      renderShipyard();
-      renderServices();
-      renderCrew();
-      renderMissions();
-      renderBank();
-      renderLog();
-      checkEncounter();
-      checkCombat();
-      checkGameOver();
-      checkVictory();
+      // One failing renderer must not abort the rest: previously a single
+      // render-time exception stopped every later renderer AND
+      // checkEncounter/checkCombat/checkGameOver, leaving stale panels and
+      // modals that never opened (and the failure surfaced only as a bogus
+      // "Communication error" toast).
+      const focusId = (document.activeElement && document.activeElement.id)
+        ? document.activeElement.id : null;
+      const renderers = [renderHUD, renderVitals, renderStarMap, renderMarket,
+        renderCargoHold, renderShipyard, renderServices, renderCrew,
+        renderMissions, renderBank, renderLog];
+      renderers.forEach(fn => {
+        try { fn(); } catch (err) { console.error('render error in ' + fn.name, err); }
+      });
+      try { checkEncounter(); } catch (err) { console.error(err); }
+      try { checkCombat(); } catch (err) { console.error(err); }
+      try { checkGameOver(); } catch (err) { console.error(err); }
+      try { checkVictory(); } catch (err) { console.error(err); }
+      // Re-renders replace the innerHTML of whole containers, which silently
+      // drops keyboard focus to <body>. Restore it when that happened.
+      if (focusId && document.activeElement === document.body) {
+        const el = document.getElementById(focusId);
+        if (el && typeof el.focus === 'function') {
+          try { el.focus({ preventScroll: true }); } catch (_) { el.focus(); }
+        }
+      }
     }
 
     function renderHUD() {
@@ -6673,7 +6906,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('hud-renown-next').textContent = p.renown_needed > 0 ? p.renown_needed.toLocaleString() : 'MAX';
 
       document.getElementById('hud-location').textContent = cp.name;
-      document.getElementById('hud-security').textContent = cp.security;
+      const secPill = document.getElementById('hud-security');
+      secPill.textContent = cp.security;
+      // Threat colouring: a High-security world is patrolled and safe, an
+      // anarchic one is a pirate haven. The pill used to be hardcoded green.
+      secPill.classList.remove('pill-green', 'pill-gold', 'pill-red');
+      secPill.classList.add(
+        cp.security === 'High' ? 'pill-green' :
+        cp.security === 'Medium' ? 'pill-gold' : 'pill-red');
       document.getElementById('hud-day').textContent = 'Day ' + p.day;
       document.getElementById('hud-credits').textContent = p.credits.toLocaleString() + ' CR';
       document.getElementById('hud-networth').textContent = p.net_worth.toLocaleString() + ' CR';
@@ -6820,6 +7060,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('dossier-fuel').textContent = planet.fuel_cost + ' LY';
       document.getElementById('dossier-days').textContent = planet.days_cost + ' Days';
       document.getElementById('dossier-security').textContent = planet.security;
+      document.getElementById('dossier-security').style.color =
+        planet.security === 'High' ? 'var(--green)' :
+        planet.security === 'Medium' ? 'var(--gold)' : 'var(--red)';
 
       const eventBox = document.getElementById('dossier-event-box');
       if (planet.active_event) {
@@ -6974,7 +7217,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         `;
       });
 
-      tbody.innerHTML = html || '<tr><td colspan="9" style="text-align: center; color: var(--fg-dim); padding: 18px;">'
+      tbody.innerHTML = html || '<tr><td colspan="8" style="text-align: center; color: var(--fg-dim); padding: 18px;">'
         + 'No commodities match this filter. Clear the search box or pick a different category.'
         + '</td></tr>';
     }
@@ -7571,6 +7814,43 @@ HTML_PAGE = r"""<!DOCTYPE html>
         });
         hofContainer.innerHTML = hHtml || '<div style="color: var(--fg-dim); font-size: 12px;">No legends recorded yet — finish a career to be enshrined.</div>';
       }
+
+      // Achievement counter (kept dynamic instead of hardcoded in the markup)
+      const achCount = document.getElementById('ach-count');
+      if (achCount) achCount.textContent = (p.achievements || []).length;
+
+      // Net Worth Trend sparkline (SVG, no libraries)
+      const nwBox = document.getElementById('networth-sparkline');
+      if (nwBox) {
+        const hist = p.net_worth_history || [];
+        if (hist.length >= 2) {
+          const W = 560, H = 96, PAD = 8;
+          const lo = Math.min(...hist, 0);
+          const hi = Math.max(...hist, 1);
+          const span = Math.max(1, hi - lo);
+          const pts = hist.map((v, i) => [
+            PAD + (i / (hist.length - 1)) * (W - 2 * PAD),
+            H - PAD - ((v - lo) / span) * (H - 2 * PAD),
+          ]);
+          const line = pts.map(pt => pt[0].toFixed(1) + ',' + pt[1].toFixed(1)).join(' ');
+          const area = PAD + ',' + (H - PAD) + ' ' + line + ' ' + (W - PAD) + ',' + (H - PAD);
+          const up = hist[hist.length - 1] >= hist[0];
+          const stroke = up ? 'var(--green)' : 'var(--red)';
+          const latest = hist[hist.length - 1] || 0;
+          nwBox.innerHTML =
+            '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width: 100%; height: 96px; display: block;" role="img" aria-label="Net worth trend for the last ' + hist.length + ' days">' +
+            '<polygon points="' + area + '" fill="' + stroke + '" opacity="0.12"></polygon>' +
+            '<polyline points="' + line + '" fill="none" stroke="' + stroke + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"></polyline>' +
+            '</svg>' +
+            '<div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--fg-dim); font-family: var(--font-mono); margin-top: 6px;">' +
+            '<span>Day 1: ' + (hist[0] || 0).toLocaleString() + ' CR</span>' +
+            '<span style="color: ' + stroke + '; font-weight: 700;">Today: ' + latest.toLocaleString() + ' CR</span>' +
+            '<span>Peak: ' + hi.toLocaleString() + ' CR</span>' +
+            '</div>';
+        } else {
+          nwBox.innerHTML = '<div style="font-size: 11px; color: var(--fg-dim);">Fly a few more days to chart your trajectory toward 500,000 CR.</div>';
+        }
+      }
     }
 
     // --- Dynamic Encounters ---
@@ -7593,7 +7873,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         solar_flare: '☀️', distress_beacon: '🆘', wandering_trader: '🧳',
         asteroid_field: '🪨', wormhole: '🌀', mining_opportunity: '⛏️',
         pirate_ambush: '☠️', bounty_combat: '🎯', comet_mining: '☄️',
-        ghost_freighter: '👻', derby: '🏁'
+        ghost_freighter: '👻', derby: '🏁', smuggler_cache: '📦'
       };
       document.getElementById('enc-icon').textContent = ENC_ICONS[t] || '📡';
 
@@ -7640,6 +7920,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       } else if (t === 'derby') {
         opt1.textContent = 'Place ' + ((enc.wager) || 100).toLocaleString() + ' CR Wager (2.2x)';
         opt2.textContent = 'Just Watch the Heats';
+      } else if (t === 'smuggler_cache') {
+        opt1.textContent = 'Crack the Cache Open';
+        opt2.textContent = 'Leave It Sealed';
       } else {
         opt1.textContent = 'Cooperate';
         opt2.textContent = 'Dismiss';
@@ -7884,8 +8167,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       hideModal('newgame-modal');
     }
     function confirmNewGame() {
-      const name = document.getElementById('newgame-name').value;
+      const raw = document.getElementById('newgame-name').value;
+      // Trim and fall back to the default — an all-whitespace name used to
+      // create a blank captain.
+      const name = raw.trim() || 'Commander';
       const difficulty = document.getElementById('newgame-diff').value;
+      document.getElementById('newgame-name').value = name;
       closeNewGameModal();
       sendAction('new_game', { name, difficulty });
     }
@@ -8059,6 +8346,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       fetchState();
       setInterval(fetchState, 3000); // Polling for telemetry & auto-sync
     });
+    // Unlock the Web Audio context from a real user gesture. initAudio() only
+    // ever ran inside async fetch callbacks, so strict autoplay browsers
+    // (Safari) could permanently refuse to start the audio graph.
+    document.addEventListener('pointerdown', function unlockAudio() {
+      initAudio();
+      document.removeEventListener('pointerdown', unlockAudio);
+    }, { once: true });
   </script>
 </body>
 </html>
@@ -8080,19 +8374,16 @@ class GameSession:
         self.active_encounter: Optional[Dict[str, Any]] = None
         self.active_combat: Optional[CombatEncounter] = None
         self.last_logs: List[str] = ["Welcome to Space Trader: Odyssey. Engines online, all systems nominal."]
-        self.sound_event: Optional[str] = None
         self.lock = threading.Lock()
         # Bumped on every processed action. The browser uses it to discard stale
         # poll responses and to skip redundant re-renders.
         self.revision = 0
 
-    def set_sound(self, name: str) -> None:
-        self.sound_event = name
-
     def pop_sound(self) -> Optional[str]:
-        s = self.sound_event
-        self.sound_event = None
-        return s
+        # The browser client renders its own Web Audio effects; the legacy
+        # server-side sound queue this once drained was dead code (set_sound
+        # had no callers). Kept as a stub so old subclasses/clients keep working.
+        return None
 
 
 RANK_TIER_COLORS = ["#94a3b8", "#38bdf8", "#34d399", "#a855f7", "#fbbf24", "#f43f5e"]
@@ -8170,7 +8461,9 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
         dist = engine.calculate_distance(current_p, p)
         fuel_cost, days_cost = engine.calculate_travel_cost(p)
         active_missions_here = [
-            {"id": m.id, "title": m.title, "type": m.m_type, "reward": m.reward_credits, "days_left": m.days_left}
+            {"id": m.id, "title": m.title, "type": m.m_type,
+             "reward": m.reward_credits, "reward_credits": m.reward_credits,
+             "days_left": m.days_left}
             for m in player.active_missions if m.destination == p.name
         ]
         all_planets.append({
@@ -8394,7 +8687,7 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
 
     net_worth = engine.calculate_net_worth()
 
-    return {
+    _state = {
         "player": {
             "name": player.name,
             "credits": player.credits,
@@ -8564,6 +8857,13 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
         "active_combat": combat_data,
         "last_logs": session.last_logs[-8:],
     }
+    # Deep-copy the snapshot: the payload used to hold live references to
+    # engine containers (cargo, price histories, equipped lists, stats...).
+    # json.dumps() outside the session lock could then iterate a container a
+    # concurrent action was mutating -> "dictionary changed size during
+    # iteration" 500s and torn JSON. The copy makes every snapshot safely
+    # detached from live engine state.
+    return copy.deepcopy(_state)
 
 
 GLOBAL_SESSION: Optional[GameSession] = None
@@ -8666,6 +8966,9 @@ def _resolve_encounter(engine: GameEngine, enc: Dict[str, Any],
         return engine.resolve_ghost(enc, careful=choice), ("victory" if choice else "alarm")
     if t == "derby":
         return engine.resolve_derby(enc, bet=choice), "coin"
+    if t == "smuggler_cache":
+        return engine.resolve_smuggler_cache(enc, investigate=choice), \
+            ("victory" if choice else "click")
     return [], "click"
 
 
@@ -8759,6 +9062,10 @@ def handle_action(session: GameSession, data: Dict[str, Any]) -> Dict[str, Any]:
                 success = True
                 logs.extend(enc_logs)
                 message = enc_logs[-1] if enc_logs else "Encounter resolved."
+                # Persist the outcome: quitting right after resolving used to
+                # roll the encounter result back to the pre-encounter state.
+                if not engine.is_game_over:
+                    engine.autosave()
             else:
                 success, message = False, "No active encounter to resolve."
 
@@ -8795,7 +9102,10 @@ def handle_action(session: GameSession, data: Dict[str, Any]) -> Dict[str, Any]:
                     engine.autosave()
                     message = "Disengaged from combat arena."
             else:
-                success, message = False, "Combat is still in progress."
+                if combat is None:
+                    success, message = False, "No combat engagement to dismiss."
+                else:
+                    success, message = False, "Combat is still in progress."
 
         elif action in ENGINE_ACTIONS:
             method, arg_specs, ok_sound = ENGINE_ACTIONS[action]
@@ -8884,6 +9194,8 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_HEAD(self) -> None:
+        # _send() already omits the body when self.command == "HEAD", and the
+        # vestigial server-side sound queue this verb used to disturb is gone.
         self.do_GET()
 
     def do_GET(self) -> None:
@@ -8929,24 +9241,30 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
             return
 
         session = get_session()
-        with session.lock:
-            if path == "/api/state":
-                self._json({"success": True, "state": serialize_game_state(session),
-                            "sound": session.pop_sound()})
-            elif path == "/api/routes":
-                self._json({"success": True,
-                            "routes": session.engine.compute_best_trade_routes()[:12]})
-            elif path == "/api/saves":
+        # Build payloads under the lock, but serialize + transmit outside it:
+        # a stalled client must never block other tabs' actions for up to the
+        # full socket timeout.
+        if path == "/api/state":
+            with session.lock:
+                payload = {"success": True, "state": serialize_game_state(session)}
+            self._json(payload)
+        elif path == "/api/routes":
+            with session.lock:
+                routes = session.engine.compute_best_trade_routes()[:12]
+            self._json({"success": True, "routes": routes})
+        elif path == "/api/saves":
+            with session.lock:
                 slots = []
                 for s in (AUTO_SLOT, PRECOMBAT_SLOT) + SAVE_SLOTS:
                     info = session.engine.slot_info(s)
                     slots.append({"slot": s, "exists": info is not None, "info": info})
-                self._json({"success": True, "slots": slots})
-            elif path == "/api/scores":
-                self._json({"success": True,
-                            "scores": session.engine.load_hall_of_fame()[:10]})
-            else:
-                self._fail(404, "Unknown endpoint.")
+            self._json({"success": True, "slots": slots})
+        elif path == "/api/scores":
+            with session.lock:
+                scores = session.engine.load_hall_of_fame()[:10]
+            self._json({"success": True, "scores": scores})
+        else:
+            self._fail(404, "Unknown endpoint.")
 
     def _handle_post(self) -> None:
         if urllib.parse.urlparse(self.path).path != "/api/action":
@@ -9056,8 +9374,6 @@ def run_self_test() -> None:
             print(f"[FAIL] {name}: {detail}")
             failed.append(f"{name}: {detail}")
 
-    import tempfile
-    import shutil
     scratch = tempfile.mkdtemp(prefix="st_test_")
     os.environ["ST_SAVE_DIR"] = scratch
 
@@ -9071,7 +9387,7 @@ def run_self_test() -> None:
         check("24 equipment items", len(EQUIPMENT_ITEMS) == 24)
         check("18 commodities", len(COMMODITIES) == 18)
         check("20 events reference valid goods", len(PLANET_EVENTS_POOL) == 20 and all(ev[1] in COMMODITIES for ev in PLANET_EVENTS_POOL))
-        check("29 achievements defined", len(ACHIEVEMENTS) == 29)
+        check("31 achievements defined", len(ACHIEVEMENTS) == 31)
         check("every achievement key is unique & mapped", all(aid in ACHIEVEMENTS for aid in ACHIEVEMENTS))
         check("planet coordinates unique", len({(p.x, p.y) for p in e_init.planets.values()}) == len(e_init.planets))
         check("4 factions defined", len(FACTIONS) == 4)
@@ -9370,7 +9686,7 @@ def run_self_test() -> None:
         # wormhole
         loc_b = e_enc.player.location
         e_enc.resolve_wormhole({"dest": "Tartarus"}, True)
-        check("wormhole relocates player", e_enc.player.location != loc_b or True)
+        check("wormhole relocates player", e_enc.player.location != loc_b)
         check("wormhole stat counts", e_enc.player.stats.get("wormholes", 0) >= 1)
         check("wormhole_rider achievement unlocked", "wormhole_rider" in e_enc.player.achievements)
 
@@ -9395,7 +9711,9 @@ def run_self_test() -> None:
             combat.player_action("fire")
 
         check("overwhelming firepower wins", combat.player_won or combat.enemy_fled)
-        check("pirates_defeated counted", e_cmb.player.stats.get("pirates_defeated", 0) >= 1 or True)
+        # If the enemy did NOT flee it must have been destroyed and counted.
+        check("pirates_defeated counted", combat.enemy_fled
+              or e_cmb.player.stats.get("pirates_defeated", 0) >= 1)
 
         # A defensive pilot must still return fire while it recharges. It used
         # to skip the attack entirely, handing the player a free turn.
@@ -9815,6 +10133,24 @@ def run_self_test() -> None:
             (r.get("risk_level", 0) >= 2) for r in routes_n if r["is_contraband"]))
         check("max jump range computed", e_n4.max_jump_range() > 0)
 
+        # smuggler_cache encounter
+        e_n5 = GameEngine(muted=True)
+        e_n5.new_game("Cacher", "normal")
+        out_leave = e_n5.resolve_smuggler_cache({"type": "smuggler_cache"}, False)
+        check("cache left alone is a no-op", len(out_leave) == 1
+              and e_n5.player.stats.get("caches_found", 0) == 0)
+        hull_before = e_n5.player.hull
+        out_cache = e_n5.resolve_smuggler_cache({"type": "smuggler_cache"}, True)
+        check("cache investigation resolves", len(out_cache) >= 1)
+        check("cache outcome stays sane", 1 <= e_n5.player.hull <= hull_before
+              and e_n5.player.credits >= 0)
+        e_n5.player.stats["caches_found"] = 3
+        e_n5.check_achievements()
+        check("cache_hunter achievement unlocks", "cache_hunter" in e_n5.player.achievements)
+        e_n5.player.stats["missions_completed"] = 15
+        e_n5.check_achievements()
+        check("missions_15 achievement unlocks", "missions_15" in e_n5.player.achievements)
+
         # --- 29. Cleanup ---
         print("\n--- 29. Cleanup ---")
         shutil.rmtree(scratch, ignore_errors=True)
@@ -9825,6 +10161,10 @@ def run_self_test() -> None:
         import traceback
         traceback.print_exc()
         failed.append(f"Exception: {exc}")
+    finally:
+        # Always remove the scratch dir — previously a mid-suite failure
+        # skipped cleanup and leaked st_test_* directories.
+        shutil.rmtree(scratch, ignore_errors=True)
 
     print("=" * 76)
     if failed:
@@ -10056,6 +10396,8 @@ def run_web_test() -> None:
     finally:
         server.shutdown()
         server.server_close()
+        # Always remove the scratch dir — it previously leaked every run.
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 # ==============================================================================
