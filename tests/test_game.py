@@ -267,9 +267,21 @@ class TestContracts(GameTestCase):
 
     def test_expired_contract_cargo_is_repossessed(self):
         m = self._accept_cargo_contract()
-        m.days_left = 1
+        # Deadline fully passed (days_left goes negative after the tick) —
+        # the cargo is repossessed and the contract voided.
+        m.days_left = 0
         self.e.advance_day()
         self.assertEqual(self.e.player.cargo.get(m.cargo_good, 0), 0)
+        self.assertNotIn(m, self.e.player.active_missions)
+
+    def test_deadline_day_delivery_still_counts(self):
+        # A contract with N days really grants N usable days: arriving on the
+        # deadline day itself (days_left == 0) completes instead of voiding.
+        m = self._accept_cargo_contract()
+        self.e.player.location = m.destination
+        m.days_left = 0
+        self.e.check_mission_deliveries()
+        self.assertTrue(m.completed)
         self.assertNotIn(m, self.e.player.active_missions)
 
     def test_abandon_clears_cargo_and_cost_basis(self):
