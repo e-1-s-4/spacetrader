@@ -4,6 +4,44 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 semantic versioning.
 
+## 2.5.0 — The hardening release: hostile-save safety, fuzzers, and a stale news feed
+
+### Fixed
+
+- **The news feed showed the OLDEST headlines.** `add_news()` keeps the feed
+  newest-first (insert at index 0, drop from the tail), but the state serializer
+  sent `news_feed[-15:]` — the 15 *oldest* of 40 entries. Once the feed filled
+  up, the Intel panel froze on stale stories and never showed new ones.
+  It now sends the newest 15.
+- **Stored XSS through the save/load dialog.** `slot_info()` returned the raw
+  `name` / `location` of a save file and the client interpolated them straight
+  into `innerHTML`. A shared or hand-edited save (`"name": "<img onerror=…>"`)
+  ran script the moment the dialog opened. The server now coerces every field to
+  a safe type (names pass through `sanitize_name`) and the client escapes them.
+- **Corrupt or tampered saves loaded "successfully" and crashed later.**
+  `load_game` only validated the top level. A wrong-typed `net_worth_history`,
+  `stats`, `reputation`, planet market, price history, stock record, event or
+  contract passed the load and then raised `TypeError` inside the state
+  serializer on *every* request — a permanently broken session (about 25% of
+  randomly mutated saves in the new fuzzer). Every nested structure is now
+  schema-checked and rebuilt; anything that cannot be repaired is refused and the
+  live game is left untouched. Share prices keep their built-in names and
+  blurbs, and contract text is stripped of markup characters on load.
+- Removed dead code (`pct`, `reputation_price_mult`, two unused locals).
+
+### Added
+
+- `tools/fuzz_engine.py` — random-play bot hammering every action through
+  `handle_action` with invariant checks (no negative balances, cargo within
+  capacity, sealed contract cargo intact, prices sane, JSON-serialisable state).
+- `tools/fuzz_saves.py` — mutates a real save thousands of ways and checks the
+  loader either refuses it cleanly or yields a playable game.
+- `tools/greedy_bot.py` — advisor-following trader used to sanity-check the
+  economy (reaches 500,000 CR on every difficulty).
+- `tests/ui/fuzz.js` — drives the real browser client (jsdom) through hundreds of
+  random actions across every tab and fails on any client error.
+- Six regression tests (`TestAuditV25`).
+
 ## 2.4.0 — The audit release: 30+ fixes, a new frontier encounter, and CI
 
 ### Fixed

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
- SPACE TRADER: ODYSSEY — Nebula Edition v2.4 (Browser HTML)
+ SPACE TRADER: ODYSSEY — Nebula Edition v2.5 (Browser HTML)
 ================================================================================
 A complete sci-fi trading, exploration, and combat RPG with a modern browser
 interface served by a built-in threaded HTTP server. Pure Python stdlib —
@@ -81,7 +81,7 @@ import threading
 # CONSTANTS & HELPERS
 # ==============================================================================
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 __version__ = APP_VERSION
 
 TARGET_NET_WORTH = 500_000
@@ -117,6 +117,29 @@ def sanitize_name(name: str) -> str:
     clean = clean.replace("<", "").replace(">", "").replace('"', "'")
     clean = " ".join(clean.split())
     return clean[:24] or "Commander"
+
+
+def _is_num(v: Any) -> bool:
+    """A finite JSON number (bool is deliberately NOT a number here)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _as_dict(v: Any) -> Dict[str, Any]:
+    return v if isinstance(v, dict) else {}
+
+
+def _as_list(v: Any) -> List[Any]:
+    return v if isinstance(v, list) else []
+
+
+def _str_list(v: Any, allowed: Any = None) -> List[str]:
+    """Strings only (optionally restricted to ``allowed``) -> never raises."""
+    return [x for x in _as_list(v)
+            if isinstance(x, str) and (allowed is None or x in allowed)]
+
+
+def _num_list(v: Any, limit: int) -> List[float]:
+    return [x for x in _as_list(v) if _is_num(x)][-limit:]
 
 
 def to_int(value: Any, lo: int = -MAX_INT_INPUT, hi: int = MAX_INT_INPUT) -> int:
@@ -192,10 +215,6 @@ def clamp(value: float, low: float, high: float) -> float:
 
 def money(value: float) -> str:
     return f"{int(round(value)):,}"
-
-
-def pct(value: float) -> str:
-    return f"{value * 100:.0f}%"
 
 
 def save_dir() -> str:
@@ -1715,12 +1734,6 @@ class GameEngine:
         self.player.reputation[faction] = after
         return after - before
 
-    def reputation_price_mult(self, faction: str) -> float:
-        """Good standing nudges prices in your favor; poor standing hurts you.
-        Returns a multiplier close to 1.0 (e.g. 0.97 .. 1.03)."""
-        rep = self.player.rep(faction)
-        return 1.0 - clamp(rep / 100.0, -1.0, 1.0) * 0.05
-
     def check_achievements(self) -> List[str]:
         unlocked: List[str] = []
         nw = self.calculate_net_worth()
@@ -2045,7 +2058,6 @@ class GameEngine:
             return False, "Quantity must be positive."
 
         p = self.current_planet
-        price = self.get_buy_price(good)
         stock = p.stock.get(good, 0)
         free_space = self.player.cargo_free()
 
@@ -3842,15 +3854,18 @@ class GameEngine:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            pd = data.get("player", {})
+            pd = _as_dict(data.get("player"))
+            # Save files are user-editable (and shared between players), so
+            # every field is coerced to a safe type before it reaches the UI.
+            diff = data.get("difficulty_id")
             return {
                 "slot": slot,
-                "saved_at": data.get("saved_at", "?"),
-                "name": pd.get("name", "?"),
-                "day": pd.get("day", "?"),
-                "location": pd.get("location", "?"),
-                "credits": pd.get("credits", 0),
-                "difficulty": data.get("difficulty_id", "?"),
+                "saved_at": str(data.get("saved_at", "?"))[:32],
+                "name": sanitize_name(pd.get("name", "?")),
+                "day": int(pd["day"]) if _is_num(pd.get("day")) else "?",
+                "location": str(pd.get("location"))[:32] if isinstance(pd.get("location"), str) else "?",
+                "credits": int(pd["credits"]) if _is_num(pd.get("credits")) else 0,
+                "difficulty": diff if isinstance(diff, str) and diff in DIFFICULTIES else "?",
             }
         except Exception:
             return {"slot": slot, "saved_at": "corrupt", "name": "?", "day": "?",
@@ -3923,70 +3938,60 @@ class GameEngine:
             self.player.shields_damaged = bool(p_data.get("shields_damaged", False))
             self.player.highest_rank_index = int(p_data.get("highest_rank_index", 0))
             self.player.cargo = {
-                g: int(q) for g, q in dict(p_data.get("cargo", {})).items()
-                if g in COMMODITIES
+                g: int(q) for g, q in _as_dict(p_data.get("cargo")).items()
+                if g in COMMODITIES and _is_num(q)
             }
             self.player.cargo_cost_basis = {
-                g: float(b) for g, b in dict(p_data.get("cargo_cost_basis", {})).items()
-                if g in COMMODITIES
+                g: float(b) for g, b in _as_dict(p_data.get("cargo_cost_basis")).items()
+                if g in COMMODITIES and _is_num(b)
             }
-            self.player.equipped_weapons = list(p_data.get("equipped_weapons", ["laser_1"]))
-            self.player.equipped_shields = list(p_data.get("equipped_shields", ["shield_1"]))
-            self.player.equipped_modules = list(p_data.get("equipped_modules", []))
-            self.player.hired_crew = list(p_data.get("hired_crew", []))
-            self.player.stocks_owned = dict(p_data.get("stocks_owned", {}))
-            self.player.achievements = set(p_data.get("achievements", []))
+            self.player.equipped_weapons = (
+                _str_list(p_data["equipped_weapons"]) if "equipped_weapons" in p_data
+                else ["laser_1"])
+            self.player.equipped_shields = (
+                _str_list(p_data["equipped_shields"]) if "equipped_shields" in p_data
+                else ["shield_1"])
+            self.player.equipped_modules = _str_list(p_data.get("equipped_modules"))
+            self.player.hired_crew = _str_list(p_data.get("hired_crew"))
+            self.player.stocks_owned = {
+                k: int(q) for k, q in _as_dict(p_data.get("stocks_owned")).items()
+                if isinstance(k, str) and _is_num(q)
+            }
+            self.player.achievements = set(_str_list(p_data.get("achievements")))
             saved_stats = dict(DEFAULT_STATS)
-            saved_stats.update(p_data.get("stats", {}))
+            for k, v in _as_dict(p_data.get("stats")).items():
+                if isinstance(k, str) and _is_num(v):
+                    saved_stats[k] = max(0, int(v)) if k != "trading_profit" else int(v)
             self.player.stats = saved_stats
-            self.player.net_worth_history = list(
-                p_data.get("net_worth_history", [self.player.credits])
-            )
+            self.player.net_worth_history = [
+                int(x) for x in _num_list(p_data.get("net_worth_history"), 60)
+            ] or [self.player.credits]
             saved_rep = default_reputation()
-            saved_rep.update(p_data.get("reputation", {}))
+            for f_name, v in _as_dict(p_data.get("reputation")).items():
+                if f_name in saved_rep and _is_num(v):
+                    saved_rep[f_name] = int(v)
             self.player.reputation = saved_rep
             self.player.visited = {
-                v for v in p_data.get("visited", [])
+                v for v in _as_list(p_data.get("visited"))
                 if isinstance(v, str) and v in self.planets
             } or {self.player.location}
             self._hof_recorded = False
 
             loaded_missions: List[Mission] = []
-            for m_dict in p_data.get("active_missions", []):
-                if not isinstance(m_dict, dict):
-                    continue
-                clean = {k: v for k, v in m_dict.items() if k in Mission.__dataclass_fields__}
-                try:
-                    loaded_missions.append(Mission(**clean))
-                except TypeError:
-                    continue   # skip malformed contract entries
+            for m_dict in _as_list(p_data.get("active_missions")):
+                m_obj = self._load_mission(m_dict)
+                if m_obj is not None:
+                    loaded_missions.append(m_obj)
             self.player.active_missions = loaded_missions
 
-            planets_data = data.get("planets", {})
-            for p_name, p_info in planets_data.items():
-                if p_name in self.planets:
-                    p = self.planets[p_name]
-                    p.market = dict(p_info.get("market", {}))
-                    p.stock = dict(p_info.get("stock", {}))
-                    p.price_history = dict(p_info.get("price_history", {}))
-                    p.fuel_price = int(p_info.get("fuel_price", BASE_FUEL_PRICE))
-                    p.repair_cost = int(p_info.get("repair_cost", BASE_REPAIR_COST))
-                    ev_dict = p_info.get("active_event")
-                    if isinstance(ev_dict, dict):
-                        ev_clean = {k: v for k, v in ev_dict.items()
-                                    if k in PlanetEvent.__dataclass_fields__}
-                        p.active_event = PlanetEvent(**ev_clean)
-                    else:
-                        p.active_event = None
-
-            stocks_data = data.get("stocks", {})
-            for sym, s_info in stocks_data.items():
+            for p_name, p_info in _as_dict(data.get("planets")).items():
+                if p_name in self.planets and isinstance(p_info, dict):
+                    self._load_planet(self.planets[p_name], p_info)
+            for sym, s_info in _as_dict(data.get("stocks")).items():
                 if sym in self.stocks and isinstance(s_info, dict):
-                    s_clean = {k: v for k, v in s_info.items()
-                               if k in StockData.__dataclass_fields__}
-                    self.stocks[sym] = StockData(**s_clean)
-
-            self.news_feed = list(data.get("news_feed", []))
+                    self._load_stock(self.stocks[sym], s_info)
+            self.news_feed = [str(n)[:240] for n in _as_list(data.get("news_feed"))
+                              if isinstance(n, str)][:40]
 
             # Sanitize crew / equipment / achievement references.
             self.player.hired_crew = [
@@ -4024,6 +4029,96 @@ class GameEngine:
              self.available_missions, self.difficulty_id,
              self.is_game_over, self._hof_recorded) = backup
             return False, f"Failed to load save: {e}"
+
+    @staticmethod
+    def _load_mission(m: Any) -> Optional[Mission]:
+        """Rebuild one saved contract, or None if it is malformed."""
+        if not isinstance(m, dict):
+            return None
+        try:
+            def plain(v: str) -> str:
+                # These strings are rendered into the page: no markup, ever.
+                return re.sub(r"[<>\"`\\]", "", v)[:240]
+
+            def text(key: str) -> str:
+                v = m[key]
+                if not isinstance(v, str):
+                    raise ValueError(key)
+                return plain(v)
+
+            def opt_text(key: str) -> Optional[str]:
+                v = m.get(key)
+                return plain(v) if isinstance(v, str) else None
+
+            mid = re.sub(r"[^\w\-]", "", str(m.get("id", "")))[:MAX_ID_LEN]
+            if not mid:
+                return None
+
+            def whole(key: str, default: Optional[int] = None) -> int:
+                v = m.get(key, default)
+                if not _is_num(v):
+                    raise ValueError(key)
+                return int(v)
+
+            good = m.get("cargo_good")
+            if good is not None and good not in COMMODITIES:
+                return None
+            return Mission(
+                id=mid, title=text("title"), m_type=text("m_type"),
+                origin=text("origin"), destination=text("destination"),
+                cargo_good=good if isinstance(good, str) else None,
+                cargo_qty=max(0, whole("cargo_qty", 0)),
+                bounty_target_name=opt_text("bounty_target_name"),
+                bounty_target_ship=opt_text("bounty_target_ship"),
+                reward_credits=max(0, whole("reward_credits", 0)),
+                days_left=whole("days_left"),
+                desc=opt_text("desc") or "",
+                completed=bool(m.get("completed", False)),
+                failed=bool(m.get("failed", False)),
+            )
+        except (KeyError, ValueError, TypeError):
+            return None   # skip malformed contract entries
+
+    @staticmethod
+    def _load_planet(p: Planet, info: Dict[str, Any]) -> None:
+        """Restore one world's market from an untrusted save record."""
+        p.market = {g: max(2, int(v)) for g, v in _as_dict(info.get("market")).items()
+                    if g in COMMODITIES and _is_num(v)}
+        p.stock = {g: max(0, int(v)) for g, v in _as_dict(info.get("stock")).items()
+                   if g in COMMODITIES and _is_num(v)}
+        p.price_history = {
+            g: [int(x) for x in _num_list(h, PRICE_HISTORY_LEN)]
+            for g, h in _as_dict(info.get("price_history")).items()
+            if g in COMMODITIES
+        }
+        fuel = info.get("fuel_price", BASE_FUEL_PRICE)
+        rep = info.get("repair_cost", BASE_REPAIR_COST)
+        p.fuel_price = max(1, int(fuel)) if _is_num(fuel) else BASE_FUEL_PRICE
+        p.repair_cost = max(1, int(rep)) if _is_num(rep) else BASE_REPAIR_COST
+        ev = info.get("active_event")
+        p.active_event = None
+        if isinstance(ev, dict):
+            if (isinstance(ev.get("name"), str) and ev.get("good") in COMMODITIES
+                    and _is_num(ev.get("mult")) and ev["mult"] > 0
+                    and _is_num(ev.get("duration"))):
+                p.active_event = PlanetEvent(
+                    name=ev["name"][:60], good=ev["good"], mult=float(ev["mult"]),
+                    duration=int(ev["duration"]),
+                    desc=str(ev.get("desc", ""))[:240],
+                    fresh=bool(ev.get("fresh", False)),
+                )
+
+    @staticmethod
+    def _load_stock(stk: StockData, info: Dict[str, Any]) -> None:
+        """Restore a share price from an untrusted save record. Names and
+        blurbs always come from the built-in definition."""
+        if _is_num(info.get("price")):
+            stk.price = max(5.0, float(info["price"]))
+        hist = [max(5.0, float(x)) for x in _num_list(info.get("history"), 30)]
+        stk.history = hist or [stk.price]
+        vol = info.get("volatility")
+        if _is_num(vol) and 0.0 < vol <= 0.5:
+            stk.volatility = float(vol)
 
     def _sanitize_player(self) -> None:
         """Clamp a freshly-loaded career into the legal state space so a
@@ -4363,7 +4458,6 @@ class CombatEncounter:
         return msgs
 
     def _subsystem_strike_effect(self, target_subsystem: str) -> List[str]:
-        p = self._p()
         if target_subsystem == "engines" and not self.enemy_engines_damaged:
             self.enemy_engines_damaged = True
             return [">> TARGET SYSTEM DISABLED: Enemy propulsion crippled! They cannot flee."]
@@ -8127,7 +8221,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <div>
                   <div style="font-weight: 700; color: var(--cyan);">Slot ${s.slot.toUpperCase()}</div>
                   <div style="font-size: 11px; color: var(--fg-dim);">
-                    ${s.exists ? `${info.name} · Day ${info.day} · ${info.location} · ${info.credits.toLocaleString()} CR` : 'Empty Save Slot'}
+                    ${s.exists && info ? `${escHtml(info.name)} · Day ${escHtml(info.day)} · ${escHtml(info.location)} · ${Number(info.credits || 0).toLocaleString()} CR` : 'Empty Save Slot'}
                   </div>
                 </div>
                 <div style="display: flex; gap: 6px;">
@@ -8844,7 +8938,7 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             }
             for i, r in enumerate(RANKS)
         ],
-        "news_feed": engine.news_feed[-15:],
+        "news_feed": engine.news_feed[:15],   # newest first (see add_news)
         "revision": session.revision,
         "economy": {
             "impact_rate": IMPACT_RATE,

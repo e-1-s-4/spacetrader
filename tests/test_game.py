@@ -909,5 +909,122 @@ class TestFuzzInvariants(GameTestCase):
                 self.check(e, ctx)
 
 
+class TestAuditV25(GameTestCase):
+    """Defects found by the v2.5 audit (state fuzzing + hostile save files)."""
+
+    def _slot_file(self, slot="1"):
+        return st.slot_path(slot)
+
+    def test_news_feed_shows_newest_first(self):
+        # add_news() inserts at index 0; the serializer used to send the
+        # LAST 15 entries, i.e. the OLDEST ones, once the feed filled up.
+        s = st.GameSession()
+        for i in range(30):
+            s.engine.add_news(f"headline {i}")
+        feed = st.serialize_game_state(s)["news_feed"]
+        self.assertEqual(len(feed), 15)
+        self.assertIn("headline 29", feed[0])
+        self.assertIn("headline 15", feed[-1])
+
+    def test_slot_info_never_returns_raw_markup(self):
+        self.assertTrue(self.e.save_game("1")[0])
+        path = self._slot_file()
+        data = read_json(path)
+        data["player"]["name"] = "<img src=x onerror=alert(1)>Eve"
+        data["player"]["location"] = 42
+        data["player"]["credits"] = None
+        data["player"]["day"] = "soon"
+        write_json(path, data)
+        info = st.GameEngine.slot_info("1")
+        self.assertNotIn("<", info["name"])
+        self.assertEqual(info["location"], "?")
+        self.assertEqual(info["credits"], 0)
+        self.assertEqual(info["day"], "?")
+
+    def test_client_escapes_save_slot_fields(self):
+        self.assertIn("escHtml(info.name)", st.HTML_PAGE)
+        self.assertNotIn("${info.name}", st.HTML_PAGE)
+
+    def test_mission_markup_stripped_on_load(self):
+        e = self.e
+        e.player.credits = 10 ** 6
+        e.advance_day()
+        self.assertTrue(e.available_missions)
+        self.assertTrue(e.accept_mission(e.available_missions[0].id)[0])
+        self.assertTrue(e.save_game("1")[0])
+        data = read_json(self._slot_file())
+        data["player"]["active_missions"][0]["title"] = "<script>alert(1)</script>"
+        data["player"]["active_missions"][0]["id"] = "a'\"><b>"
+        write_json(self._slot_file(), data)
+        ok, _ = e.load_game("1")
+        self.assertTrue(ok)
+        for m in e.player.active_missions:
+            self.assertNotIn("<", m.title)
+            self.assertRegex(m.id, r"^[\w\-]+$")
+
+    def test_mission_round_trip_keeps_apostrophes_and_ampersands(self):
+        e = self.e
+        e.player.credits = 10 ** 6
+        m = st.Mission(id="m_1", title="Titan & Ceres", m_type="bounty", origin="Earth",
+                       destination="Mars", cargo_good=None, cargo_qty=0,
+                       bounty_target_name="Krag 'The Ripper'", bounty_target_ship="viper",
+                       reward_credits=900, days_left=7, desc="Hunt Krag 'The Ripper'.")
+        e.player.active_missions = [m]
+        self.assertTrue(e.save_game("1")[0])
+        self.assertTrue(e.load_game("1")[0])
+        got = e.player.active_missions[0]
+        self.assertEqual((got.title, got.bounty_target_name), ("Titan & Ceres", "Krag 'The Ripper'"))
+
+    def test_corrupt_saves_never_load_into_a_broken_game(self):
+        """Random mutations of a real save must either be refused (state
+        untouched) or load into a game that keeps working."""
+        e = self.e
+        for _ in range(25):
+            e.advance_day()
+        self.assertTrue(e.save_game("1")[0])
+        pristine = read_json(self._slot_file())
+        rnd = random.Random(99)
+        junk = [None, "x", -1, 10 ** 12, 1.5, [], {}, True, 0, -10 ** 9]
+
+        def paths(x, prefix=()):
+            yield prefix
+            if isinstance(x, dict):
+                for k, v in x.items():
+                    yield from paths(v, prefix + (k,))
+            elif isinstance(x, list):
+                for i, v in enumerate(x):
+                    yield from paths(v, prefix + (i,))
+
+        for n in range(250):
+            data = json.loads(json.dumps(pristine))
+            for _ in range(rnd.randint(1, 3)):
+                ps = [p for p in paths(data) if p]
+                path = rnd.choice(ps)
+                cur = data
+                for k in path[:-1]:
+                    cur = cur[k]
+                if rnd.random() < 0.15 and isinstance(cur, dict):
+                    del cur[path[-1]]
+                else:
+                    cur[path[-1]] = rnd.choice(junk)
+            write_json(self._slot_file(), data)
+            e2 = self.new_engine()
+            before = e2.calculate_net_worth()
+            ok, msg = e2.load_game("1")
+            if not ok:
+                self.assertEqual(e2.calculate_net_worth(), before, msg)
+                continue
+            s = st.GameSession()
+            s.engine = e2
+            for a in ({"action": "buy_commodity", "good": "water", "qty": 1},
+                      {"action": "travel", "destination": rnd.choice(list(e2.planets))},
+                      {"action": "sell_commodity", "good": "water", "qty": 1}):
+                try:
+                    st.handle_action(s, a)
+                except st.ActionError:
+                    pass
+            json.dumps(st.serialize_game_state(s))
+
+
 if __name__ == "__main__":
     unittest.main()
