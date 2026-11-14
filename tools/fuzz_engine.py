@@ -79,6 +79,7 @@ def run(seed, steps):
         elif sess.active_encounter:
             act({"action": "resolve_encounter", "choice": R() < .5})
         elif e.is_game_over:
+            LOADED[0] = True
             act({"action": "new_game", "name": "Bot", "difficulty": random.choice(["easy","normal","hard","nightmare"])})
         else:
             c = random.random()
@@ -99,9 +100,11 @@ def run(seed, steps):
             elif c < .70: act({"action": random.choice(["buy_equipment", "sell_equipment"]), "eq_id": random.choice(list(s.EQUIPMENT_ITEMS))})
             elif c < .72: act({"action": random.choice(["hire_crew", "dismiss_crew"]), "crew_id": random.choice(list(s.CREW_INDEX))})
             elif c < .78:
-                ms = [m for m in e.planets[p.location].missions] if hasattr(e.planets[p.location], "missions") else []
+                ms = [m for m in e.available_missions if m.origin == p.location and not m.completed and not m.failed]
                 am = p.active_missions
-                if ms and R() < .7: act({"action": "accept_mission", "mission_id": random.choice(ms).id})
+                bounties = [m for m in am if m.m_type == "bounty" and m.destination == p.location]
+                if bounties and R() < .5: act({"action": "engage_bounty", "mission_id": random.choice(bounties).id})
+                elif ms and R() < .7: act({"action": "accept_mission", "mission_id": random.choice(ms).id})
                 elif am: act({"action": "abandon_mission", "mission_id": random.choice(am).id})
                 else: act({"action": "accept_mission", "mission_id": "x"})
             elif c < .84: act({"action": random.choice(["bank_deposit","bank_withdraw","bank_borrow","bank_repay"]), "amount": random.choice([100, 1000, 50000, -5, 0, 10**9])})

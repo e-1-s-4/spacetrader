@@ -1026,5 +1026,104 @@ class TestAuditV25(GameTestCase):
             json.dumps(st.serialize_game_state(s))
 
 
+class TestEnhancementsAndFixes(GameTestCase):
+    """Regression tests for gameplay logic fixes, API additions, and UI accuracy."""
+
+    def test_contraband_confiscation_voids_sealed_contract(self):
+        e = self.e
+        e.player.credits = 10_000
+        e.player.cargo["narcotics"] = 4
+        m = st.Mission(
+            id="smug_1", title="Shadow Drop", m_type="smuggle",
+            origin="Earth", destination="Mars",
+            cargo_good="narcotics", cargo_qty=4,
+            bounty_target_name="", bounty_target_ship="",
+            reward_credits=2_500, days_left=8, desc="Deliver 4 narcotics.",
+        )
+        e.player.active_missions.append(m)
+        e.player.reputation["Sol Federation"] = 10
+        msgs = e._confiscate_contraband({"narcotics": 4})
+        self.assertEqual(e.player.cargo.get("narcotics", 0), 0)
+        self.assertEqual(e.player.reserved_cargo("narcotics"), 0)
+        self.assertEqual(len(e.player.active_missions), 0)
+        self.assertTrue(any("voided" in line.lower() for line in msgs))
+
+    def test_personal_and_contract_cargo_cost_basis_isolated(self):
+        e = self.e
+        e.player.credits = 50_000
+        m = st.Mission(
+            id="del_iso", title="Haul Food", m_type="delivery",
+            origin="Earth", destination="Mars",
+            cargo_good="food", cargo_qty=10,
+            bounty_target_name="", bounty_target_ship="",
+            reward_credits=800, days_left=8, desc="Deliver 10 food.",
+        )
+        e.available_missions.append(m)
+        ok, _ = e.accept_mission("del_iso")
+        self.assertTrue(ok)
+        # Buying 2 personal units should set cost basis strictly from personal purchase price
+        buy_p = e.get_buy_price("food")
+        self.assertTrue(e.buy_commodity("food", 2)[0])
+        self.assertAlmostEqual(e.player.cargo_cost_basis["food"], float(buy_p), delta=buy_p * 0.1)
+
+    def test_missile_only_ship_cannot_burn_turns_with_batteries(self):
+        e = self.e
+        e.player.equipped_weapons = ["missile_rack"]
+        e.player.missiles = 2
+        self.assertFalse(e.player.has_battery_weapons())
+        combat = st.CombatEncounter(e, "Corsair", "viper")
+        h0, s0, t0 = e.player.hull, e.player.shield, combat.turn_count
+        for act in ("fire", "target_weapons", "target_engines", "target_shields"):
+            msgs = combat.player_action(act)
+            self.assertEqual((e.player.hull, e.player.shield, combat.turn_count), (h0, s0, t0))
+            self.assertTrue(any("batteries" in m.lower() for m in msgs))
+
+    def test_load_game_resets_victory_flag_for_non_mogul_save(self):
+        e = self.e
+        self.assertTrue(e.save_game("1")[0])
+        e.victory_achieved = True
+        e.player.credits = 1_000_000
+        self.assertTrue(e.load_game("1")[0])
+        self.assertFalse(e.victory_achieved)
+
+    def test_engage_bounty_action_starts_bounty_combat_at_destination(self):
+        s = st.GameSession(difficulty="normal", player_name="Hunter")
+        e = s.engine
+        m = st.Mission(
+            id="bnt_1", title="Wanted: Red Claw", m_type="bounty",
+            origin="Mars", destination="Earth",
+            cargo_good=None, cargo_qty=0,
+            bounty_target_name="Red Claw", bounty_target_ship="viper",
+            reward_credits=3_500, days_left=10, desc="Eliminate Red Claw near Earth.",
+        )
+        e.player.active_missions.append(m)
+        resp = st.handle_action(s, {"action": "engage_bounty", "mission_id": "bnt_1"})
+        self.assertTrue(resp["success"])
+        self.assertIsNotNone(s.active_combat)
+        self.assertTrue(s.active_combat.is_bounty)
+        self.assertEqual(s.active_combat.enemy_name, "Red Claw")
+        self.assertEqual(s.active_combat.bounty_reward, 3_500)
+
+        # Missing or off-world bounty must be rejected cleanly
+        s.active_combat = None
+        m.destination = "Titan"
+        resp2 = st.handle_action(s, {"action": "engage_bounty", "mission_id": "bnt_1"})
+        self.assertFalse(resp2["success"])
+
+    def test_serialized_fields_and_html_accuracy(self):
+        s = st.GameSession(difficulty="normal", player_name="Tester")
+        s.active_combat = st.CombatEncounter(s.engine, "Raider", "viper")
+        snap = st.serialize_game_state(s)
+        self.assertIn("enemy_emitters_fried", snap["active_combat"])
+        self.assertIn("evasive_active", snap["active_combat"])
+        self.assertIn("has_battery_weapons", snap["active_combat"])
+        self.assertIn("player_evasion_pct", snap["active_combat"])
+        self.assertIn("stock_portfolio_value", snap["player"])
+        self.assertNotIn("Acc: ${w.accuracy}%", st.HTML_PAGE)
+        self.assertNotIn("0.8% compound interest", st.HTML_PAGE)
+        self.assertIn("openTradeModal('${escJs(c.id)}', 'sell', true)", st.HTML_PAGE)
+
+
 if __name__ == "__main__":
     unittest.main()
+

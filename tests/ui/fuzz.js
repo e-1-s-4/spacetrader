@@ -1,9 +1,9 @@
 const { JSDOM, VirtualConsole } = require('jsdom');
 const { spawn } = require('child_process');
 const ids = JSON.parse(require('child_process').execFileSync('python3', ['-c', "import json,sys,os;sys.path.insert(0,os.path.join(sys.argv[1],'..'));import spacetrader as s;print(json.dumps({'goods':list(s.COMMODITIES),'ships':list(s.SHIP_TEMPLATES),'eq':list(s.EQUIPMENT_ITEMS),'crew':list(s.CREW_INDEX),'stocks':list(s.DEFAULT_STOCKS),'factions':list(s.FACTIONS)}))", __dirname]).toString());
-const PORT = 3931;
+const PORT = Number(process.env.ST_FUZZ_PORT) || 3931;
 const srv = spawn('python3', [require('path').join(__dirname, '..', '..', 'spacetrader.py'), '--port', String(PORT), '--seed', process.env.SEED || '3'],
-  { env: { ...process.env, ST_SAVE_DIR: require('fs').mkdtempSync('/tmp/stuif_') } });
+  { env: { ...process.env, PORT: '', ST_SAVE_DIR: require('fs').mkdtempSync('/tmp/stuif_') } });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const errors = new Map();
 const note = (k) => errors.set(k, (errors.get(k) || 0) + 1);

@@ -1,8 +1,10 @@
 const { JSDOM, VirtualConsole } = require('jsdom');
 const { spawn } = require('child_process');
-const PORT = Number(process.env.PORT) || 3917;
+const PORT = Number(process.env.SMOKE_PORT) || 3917;
+const srvEnv = { ...process.env, ST_SAVE_DIR: require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'stui_')) };
+delete srvEnv.PORT;
 const srv = spawn('python3', [require('path').join(__dirname, '..', '..', 'spacetrader.py'), '--port', String(PORT), '--seed', '7'],
-  { env: { ...process.env, ST_SAVE_DIR: require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'stui_')) } });
+  { env: srvEnv });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const errors = [];
 (async () => {

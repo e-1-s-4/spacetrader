@@ -62,6 +62,7 @@ import platform
 import random
 import re
 import shutil
+import socket
 import sys
 import tempfile
 import time
@@ -1181,8 +1182,9 @@ def generate_mission_board(
         bounty_target_ship=b_ship,
         reward_credits=b_reward,
         days_left=b_days,
-        desc=f"Locate and eliminate pirate warlord {target_name} piloting a "
-             f"{SHIP_TEMPLATES[b_ship].name} near {dst_bounty.name}."
+        desc=(f"Locate and eliminate pirate warlord {target_name} piloting "
+              f"{'an' if SHIP_TEMPLATES[b_ship].name[0].upper() in 'AEIOU' else 'a'} "
+              f"{SHIP_TEMPLATES[b_ship].name} near {dst_bounty.name}.")
     ))
 
     # 4. Medical relief
@@ -1441,6 +1443,24 @@ class Player:
 
     def has_missile_rack(self) -> bool:
         return "missile_rack" in self.equipped_weapons
+
+    def has_battery_weapons(self) -> bool:
+        return any(
+            (eq := EQUIPMENT_ITEMS.get(wid)) is not None and eq.damage > 0
+            for wid in self.equipped_weapons
+        )
+
+    def evasion_chance(self) -> float:
+        evasion = 0.05
+        if self.has_module("thruster_booster"):
+            evasion += 0.15
+        if self.has_module("cloaking_field"):
+            evasion += 0.10
+        if self.has_crew_perk("nav"):
+            evasion += 0.10
+        if self.engines_damaged:
+            evasion -= 0.10
+        return max(0.0, evasion)
 
     def has_drone_bay(self) -> bool:
         return self.has_module("drone_bay")
@@ -2019,21 +2039,30 @@ class GameEngine:
             self.player.cargo_cost_basis.pop(good, None)
         return removed
 
-    def _acquire_cargo(self, good: str, qty: int, unit_cost: float) -> int:
+    def _acquire_cargo(self, good: str, qty: int, unit_cost: float, is_contract: bool = False) -> int:
         """Take on cargo and fold its cost into the weighted-average basis.
 
-        Both the market and the mission board go through here so the hold
-        readout and the trading statistics always describe the cargo the
-        player actually has.
+        Personal cargo tracks its own cost basis separately from sealed
+        contract freight so hauling a contract for a commodity never skews the
+        profit/loss figures on your own units.
         """
         if qty <= 0:
             return 0
         old_qty = self.player.cargo.get(good, 0)
+        old_own = self.player.sellable_cargo(good)
         old_basis = self.player.cargo_cost_basis.get(good, float(unit_cost))
         added = self.player.add_cargo(good, qty)
         if added > 0:
-            new_basis = (old_qty * old_basis + unit_cost * added) / max(1, old_qty + added)
-            self.player.cargo_cost_basis[good] = round(new_basis, 2)
+            if is_contract:
+                if old_own <= 0:
+                    new_basis = (old_qty * old_basis + unit_cost * added) / max(1, old_qty + added)
+                    self.player.cargo_cost_basis[good] = round(new_basis, 2)
+            else:
+                if old_own <= 0:
+                    self.player.cargo_cost_basis[good] = round(float(unit_cost), 2)
+                else:
+                    new_basis = (old_own * old_basis + unit_cost * added) / max(1, old_own + added)
+                    self.player.cargo_cost_basis[good] = round(new_basis, 2)
         return added
 
     def _price_impact(self, good: str, qty: int, direction: str) -> None:
@@ -2492,7 +2521,8 @@ class GameEngine:
                     # itself honestly instead of falling back to whatever the
                     # market happens to be doing when the hold is opened.
                     self._acquire_cargo(m.cargo_good, m.cargo_qty,
-                                        float(self.get_buy_price(m.cargo_good)))
+                                        float(self.get_buy_price(m.cargo_good)),
+                                        is_contract=True)
 
                 self.available_missions.remove(m)
                 self.player.active_missions.append(m)
@@ -2713,7 +2743,6 @@ class GameEngine:
                 "title": "Warning: Raider Ambush!",
                 "enemy_name": f"Corsair {random.choice(['Scavenger', 'Marauder', 'Cutthroat', 'Dread Ship'])}",
                 "enemy_ship": p_ship,
-                "demand_credits": min(self.player.credits, max(200, int(self.player.credits * 0.20))),
             }
 
         if chosen == "customs_inspection":
@@ -2839,6 +2868,29 @@ class GameEngine:
 
     # ----- encounter resolutions (engine-side, shared by GUI and tests) ----- #
 
+    def _confiscate_contraband(self, illegal: Dict[str, int]) -> List[str]:
+        """Remove all confiscated contraband and void any active contracts that relied on it."""
+        for g in list(illegal.keys()):
+            self.player.remove_cargo(g, illegal[g])
+            self.player.cargo_cost_basis.pop(g, None)
+
+        voided: List[str] = []
+        for m in list(self.player.active_missions):
+            if (not m.completed and not m.failed
+                    and m.cargo_good in illegal and m.cargo_qty > 0
+                    and self.player.cargo.get(m.cargo_good, 0) < m.cargo_qty):
+                m.failed = True
+                self.player.active_missions.remove(m)
+                voided.append(m.title)
+                dest_p = self.planets.get(m.destination)
+                if dest_p:
+                    self.adjust_reputation(dest_p.faction, -3)
+
+        if not voided:
+            return []
+        self.add_news(f"Confiscation voided {len(voided)} sealed contract(s): {'; '.join(voided)}.")
+        return ["Sealed contract(s) voided after cargo seizure: " + "; ".join(voided) + "."]
+
     def resolve_customs(self, enc: Dict[str, Any], bribe: bool) -> List[str]:
         msgs: List[str] = []
         faction = self.current_planet.faction
@@ -2873,13 +2925,12 @@ class GameEngine:
         fine = int(fine * (1.0 - zoe_perk))
         fine = min(self.player.credits, fine)
         self.player.credits -= fine
-        for g in list(illegal.keys()):
-            self.player.remove_cargo(g, illegal[g])
-            self.player.cargo_cost_basis.pop(g, None)
+        void_msgs = self._confiscate_contraband(illegal)
         self.adjust_reputation(faction, -8)
         self.sound.play("alarm")
         msgs.append(f"CONTRABAND CONFISCATED! Fined {money(fine)} CR by customs. "
                     f"({faction} standing -8)")
+        msgs.extend(void_msgs)
         return msgs
 
     def resolve_faction_patrol(self, enc: Dict[str, Any], cooperate: bool) -> List[str]:
@@ -2922,13 +2973,12 @@ class GameEngine:
                 fine = int(fine * (1.0 - zoe_perk))
                 fine = min(self.player.credits, fine)
                 self.player.credits -= fine
-                for g in list(illegal.keys()):
-                    self.player.remove_cargo(g, illegal[g])
-                    self.player.cargo_cost_basis.pop(g, None)
+                void_msgs = self._confiscate_contraband(illegal)
                 self.adjust_reputation(faction, -10)
                 self.sound.play("alarm")
                 msgs.append(f"The inspection turns up your contraband! Fined {money(fine)} CR and "
                             f"cargo seized. ({faction} standing -10)")
+                msgs.extend(void_msgs)
                 return msgs
             gain = self.adjust_reputation(faction, 1)
             msgs.append("The patrol sweeps a scanner wand over a few crates, then waves "
@@ -3052,6 +3102,13 @@ class GameEngine:
             msgs.append("The ride is violently smooth — not a bolt rattles loose.")
         delivered = self.check_mission_deliveries()
         msgs.extend(delivered)
+        for m in self.player.active_missions:
+            if (m.destination == dest.name and m.m_type == "bounty"
+                    and not m.completed and not m.failed):
+                msgs.append(
+                    f"Sensor Alert: Bounty target {m.bounty_target_name} is patrolling "
+                    f"near {dest.name} — engage from the Missions tab!"
+                )
         self.check_achievements()
         return msgs
 
@@ -3885,7 +3942,7 @@ class GameEngine:
             copy.deepcopy(self.player), copy.deepcopy(self.planets),
             copy.deepcopy(self.stocks), list(self.news_feed),
             list(self.available_missions), self.difficulty_id,
-            self.is_game_over, self._hof_recorded,
+            self.is_game_over, self.victory_achieved, self._hof_recorded,
         )
 
         try:
@@ -4015,6 +4072,10 @@ class GameEngine:
 
             self.is_game_over = False
             self._sanitize_player()
+            self.victory_achieved = (
+                self.calculate_net_worth() >= TARGET_NET_WORTH
+                or "nw_target" in self.player.achievements
+            )
             self.available_missions = generate_mission_board(
                 self.current_planet,
                 list(self.planets.values()),
@@ -4027,7 +4088,7 @@ class GameEngine:
         except Exception as e:
             (self.player, self.planets, self.stocks, self.news_feed,
              self.available_missions, self.difficulty_id,
-             self.is_game_over, self._hof_recorded) = backup
+             self.is_game_over, self.victory_achieved, self._hof_recorded) = backup
             return False, f"Failed to load save: {e}"
 
     @staticmethod
@@ -4319,7 +4380,12 @@ class CombatEncounter:
         on-screen buttons.
         """
         p = self._p()
-        if action == "missile":
+        if action in ("fire", "target_engines", "target_weapons", "target_shields"):
+            if not p.has_battery_weapons():
+                if p.has_missile_rack():
+                    return "No beam or kinetic batteries mounted — use Fire Torpedo (M) or mount a gun!"
+                return "Your ship has no functioning weapon systems!"
+        elif action == "missile":
             if not p.has_missile_rack():
                 return "You have no missile launcher installed!"
             if p.missiles <= 0:
@@ -4700,15 +4766,7 @@ class CombatEncounter:
             # their shield emitters.
             base_dmg = max(1, int(base_dmg * power))
 
-        evasion = 0.05
-        if p.has_module("thruster_booster"):
-            evasion += 0.15
-        if p.has_module("cloaking_field"):
-            evasion += 0.10
-        if p.has_crew_perk("nav"):
-            evasion += 0.10
-        if p.engines_damaged:
-            evasion -= 0.10
+        evasion = p.evasion_chance()
         # Evasive maneuvers open the dodge window wide for one incoming volley.
         if self.evasive_until_turn >= self.turn_count:
             evasion += 0.30
@@ -4927,33 +4985,36 @@ HTML_PAGE = r"""<!DOCTYPE html>
       position: sticky;
       top: 0;
       z-index: 100;
-      padding: 10px 20px;
+      padding: 8px 18px;
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
-      gap: 16px;
+      gap: 10px 14px;
     }
 
     .brand-group {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
+      flex-shrink: 0;
     }
     .game-logo {
       font-weight: 900;
-      font-size: 16px;
-      letter-spacing: 2px;
+      font-size: 15px;
+      letter-spacing: 1.5px;
       text-transform: uppercase;
       color: var(--cyan);
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
+      white-space: nowrap;
       text-shadow: 0 0 12px rgba(0, 229, 255, 0.4);
     }
     .rank-pill {
       background: var(--panel-hi);
       border: 1px solid var(--panel-border-hi);
+      color: var(--fg);
       padding: 3px 10px;
       border-radius: 12px;
       font-size: 12px;
@@ -4962,6 +5023,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       align-items: center;
       gap: 6px;
       cursor: pointer;
+      white-space: nowrap;
       transition: all 0.2s;
     }
     .rank-pill:hover { border-color: var(--cyan); }
@@ -4969,21 +5031,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
     .hud-stat-box {
       display: flex;
       align-items: center;
-      gap: 20px;
+      gap: 16px;
     }
     .hud-stat-item {
       display: flex;
       flex-direction: column;
+      white-space: nowrap;
     }
     .hud-stat-label {
       font-size: 10px;
       text-transform: uppercase;
-      letter-spacing: 1px;
+      letter-spacing: 0.8px;
       color: var(--fg-dim);
     }
     .hud-stat-val {
       font-family: var(--font-mono);
-      font-size: 15px;
+      font-size: 14px;
       font-weight: 700;
       display: flex;
       align-items: center;
@@ -4993,21 +5056,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
     .hud-actions {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
+      flex-shrink: 0;
     }
     .hud-btn {
       background: var(--panel);
       border: 1px solid var(--panel-border);
       color: var(--fg);
-      padding: 6px 12px;
+      padding: 5px 10px;
       border-radius: 6px;
       cursor: pointer;
       font-size: 12px;
       font-weight: 600;
+      white-space: nowrap;
       transition: all 0.2s;
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 5px;
     }
     .hud-btn:hover {
       background: var(--panel-hi);
@@ -5038,27 +5103,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
       display: flex;
       flex-wrap: wrap;
       align-items: center;
-      gap: 20px;
+      gap: 10px 18px;
     }
     .meter-group {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 7px;
+      white-space: nowrap;
     }
     .meter-label {
       font-size: 10px;
       text-transform: uppercase;
       color: var(--fg-dim);
       font-weight: 700;
-      width: 48px;
+      white-space: nowrap;
     }
     .meter-bar-outer {
-      width: 90px;
+      width: 84px;
       height: 8px;
       background: rgba(255, 255, 255, 0.08);
       border-radius: 4px;
       overflow: hidden;
       position: relative;
+      flex-shrink: 0;
     }
     .meter-bar-inner {
       height: 100%;
@@ -5069,7 +5136,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       font-family: var(--font-mono);
       font-size: 11px;
       font-weight: 600;
-      min-width: 60px;
+      white-space: nowrap;
     }
 
     /* Subsystem damage badges */
@@ -5181,7 +5248,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       border-radius: 8px;
       overflow: hidden;
       position: relative;
-      min-height: 520px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    #star-map-svg {
+      width: 100%;
+      height: auto;
+      max-height: 550px;
+      display: block;
     }
     .map-planet-node {
       cursor: pointer;
@@ -5526,9 +5601,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       position: fixed; top: 0; left: 0; right: 0; z-index: 900;
       background: var(--red); color: #fff; text-align: center;
       padding: 6px 12px; font-weight: 700; font-size: 13px;
-      transform: translateY(-100%); transition: transform 0.25s ease;
+      visibility: hidden;
+      transform: translateY(-100%); transition: transform 0.25s ease, visibility 0.25s ease;
     }
-    #conn-banner.active { transform: translateY(0); }
+    #conn-banner.active { visibility: visible; transform: translateY(0); }
     body.busy { cursor: progress; }
     body.busy button { pointer-events: none; }
     :focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
@@ -5562,6 +5638,103 @@ HTML_PAGE = r"""<!DOCTYPE html>
       vertical-align: middle;
       overflow: visible;
     }
+
+    /* Map Legend & Economy Traits */
+    .map-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding: 8px 14px;
+      background: rgba(7, 14, 40, 0.9);
+      border-top: 1px solid var(--panel-border);
+      font-size: 11px;
+      color: var(--fg-dim);
+      align-items: center;
+    }
+    .trait-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .trait-pill {
+      background: var(--bg2);
+      border: 1px solid var(--panel-border);
+      border-radius: 4px;
+      padding: 2px 7px;
+      font-size: 10px;
+      color: var(--fg-dim);
+      font-family: var(--font-mono);
+    }
+
+    /* Market Event Banner */
+    .market-event-banner {
+      display: none;
+      background: var(--gold-dim);
+      border: 1px solid var(--gold);
+      border-radius: 6px;
+      padding: 10px 14px;
+      margin-bottom: 14px;
+      font-size: 12px;
+      color: var(--gold);
+    }
+
+    /* Career Telemetry Strip */
+    .career-stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+    .stat-tile {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+    .stat-tile-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--fg-dim);
+    }
+    .stat-tile-val {
+      font-family: var(--font-mono);
+      font-size: 17px;
+      font-weight: 800;
+      color: var(--cyan);
+      margin-top: 2px;
+    }
+
+    /* Mobile & Tablet Responsive Overrides */
+    @media (max-width: 768px) {
+      #header-hud {
+        padding: 10px 12px;
+        gap: 10px;
+      }
+      .brand-group { flex-wrap: wrap; flex-shrink: 1; max-width: 100%; gap: 6px 8px; }
+      .game-logo { font-size: 14px; letter-spacing: 1px; }
+      .hud-stat-box { flex-wrap: wrap; gap: 10px 16px; width: 100%; }
+      .hud-actions { flex-wrap: wrap; width: 100%; }
+      #vitals-bar { padding: 8px 12px; gap: 10px; }
+      .vitals-meters { gap: 10px 14px; width: 100%; }
+      .meter-bar-outer { width: 70px; }
+      #tab-nav { padding: 0 8px; }
+      .tab-btn { padding: 10px 10px; font-size: 12px; }
+      #app-main { padding: 12px; }
+      .panel-card { padding: 14px; }
+      .panel-card-header { flex-wrap: wrap; gap: 8px; }
+      #map-svg-container { min-height: 280px; }
+      .search-input { width: 100%; }
+      .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+      #gift-factions-row, #faction-standings-list { grid-template-columns: 1fr !important; }
+      .modal-box, .combat-bridge {
+        padding: 16px;
+        max-height: 92vh;
+        overflow-y: auto;
+      }
+      #combat-holo-arena { padding: 0 14px !important; height: 130px !important; }
+      #combat-actions-bar { grid-template-columns: repeat(2, 1fr) !important; }
+    }
   </style>
 </head>
 <body>
@@ -5572,10 +5745,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="game-logo">
         <span>🚀</span> SPACE TRADER: ODYSSEY
       </div>
-      <div id="rank-badge" class="rank-pill" onclick="switchTab('log')" title="Click to view Career progression">
+      <button type="button" id="rank-badge" class="rank-pill" onclick="switchTab('log')" title="Click to view Career progression">
         <span id="hud-rank-insignia" style="color: var(--cyan);">·</span>
         <span id="hud-rank-title">Cadet</span>
-      </div>
+      </button>
       <div id="hud-renown-meter" style="font-size: 11px; color: var(--fg-dim);">
         <span id="hud-renown-val">0</span> Renown (<span id="hud-renown-next">6,000</span> to promo)
       </div>
@@ -5683,7 +5856,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div id="view-map" class="view-container active" role="tabpanel" aria-labelledby="tabbtn-map" tabindex="0">
       <div id="map-wrapper">
         <div id="map-svg-container">
-          <svg id="star-map-svg" width="100%" height="100%" viewBox="0 0 1000 650" role="group" aria-label="Sector star map" style="display: block;"></svg>
+          <svg id="star-map-svg" viewBox="0 0 1000 650" preserveAspectRatio="xMidYMid meet" role="group" aria-label="Sector star map"></svg>
+          <div class="map-legend">
+            <span><strong style="color: var(--cyan);">◎</strong> Jump Range</span>
+            <span><strong style="color: var(--green);">●</strong> Current Port</span>
+            <span><strong style="color: var(--gold);">---</strong> Plotted Vector</span>
+            <span>⚡ Sector Event</span>
+            <span>📜 Active Contract Target</span>
+          </div>
         </div>
 
         <div id="dossier-card">
@@ -5718,6 +5898,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </div>
           </div>
 
+          <div id="dossier-traits" class="trait-pills"></div>
+
           <div id="dossier-event-box" style="display: none; background: var(--gold-dim); border: 1px solid var(--gold); border-radius: 6px; padding: 10px; font-size: 12px; color: var(--gold);">
             <strong>Active Sector Event:</strong> <span id="dossier-event-title"></span>
             <div id="dossier-event-desc" style="margin-top: 4px; font-size: 11px; opacity: 0.9;"></div>
@@ -5737,6 +5919,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <button id="dossier-btn-engage" class="dossier-btn-engage" disabled onclick="executeTravel()">
             ⚡ Engage Hyperdrive
           </button>
+          <button id="dossier-btn-refuel" class="hud-btn" style="display: none; justify-content: center; width: 100%; padding: 9px;" onclick="switchTab('services')">
+            ⛽ Refuel at Station Depot
+          </button>
         </div>
       </div>
     </div>
@@ -5755,6 +5940,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </div>
           </div>
         </div>
+
+        <div id="market-event-banner" class="market-event-banner"></div>
 
         <div class="market-filter-bar">
           <div class="filter-pills" id="market-category-filters">
@@ -5909,9 +6096,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </div>
             <div style="font-size: 13px;">Current: <span id="depot-fuel-current">130</span> / <span id="depot-fuel-max">130</span> LY</div>
             <div style="display: flex; gap: 8px; margin-top: auto;">
-              <button class="btn-action-sm btn-buy" onclick="buyFuel(10)">+10 LY</button>
-              <button class="btn-action-sm btn-buy" onclick="buyFuel(50)">+50 LY</button>
-              <button class="btn-action-sm btn-buy" onclick="buyFuel(999)">Refuel to Max</button>
+              <button id="btn-fuel-10" class="btn-action-sm btn-buy" onclick="buyFuel(10)">+10 LY</button>
+              <button id="btn-fuel-50" class="btn-action-sm btn-buy" onclick="buyFuel(50)">+50 LY</button>
+              <button id="btn-fuel-max" class="btn-action-sm btn-buy" onclick="buyFuel(999)">Refuel to Max</button>
             </div>
           </div>
 
@@ -5923,8 +6110,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </div>
             <div style="font-size: 13px;">Integrity: <span id="depot-hull-current">100</span> / <span id="depot-hull-max">100</span> HP</div>
             <div style="display: flex; gap: 8px; margin-top: auto;">
-              <button class="btn-action-sm btn-buy" onclick="repairHull(10)">Repair 10 HP</button>
-              <button class="btn-action-sm btn-buy" onclick="repairHull(999)">Repair to Full</button>
+              <button id="btn-repair-10" class="btn-action-sm btn-buy" onclick="repairHull(10)">Repair 10 HP</button>
+              <button id="btn-repair-full" class="btn-action-sm btn-buy" onclick="repairHull(999)">Repair to Full</button>
             </div>
           </div>
 
@@ -5936,7 +6123,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </div>
             <div id="depot-subsystem-status" style="font-size: 13px;">All subsystems nominal.</div>
             <button id="btn-repair-subsystems" class="btn-action-sm btn-buy" style="margin-top: auto;" onclick="repairSubsystems()">
-              Overhaul Damaged Modules (1,500 CR)
+              Overhaul Damaged Modules
             </button>
           </div>
 
@@ -5949,10 +6136,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <div style="font-size: 12px; color: var(--fg-dim);">
               Torpedo Price: <strong id="depot-missiles-price" style="color: var(--red);">400</strong> CR each
             </div>
-            <div style="font-size: 13px;">Magazine: <span id="depot-missiles-count">0</span> / 8 Torpedoes</div>
+            <div style="font-size: 13px;">Magazine: <span id="depot-missiles-count">0</span> / <span id="depot-missiles-max">8</span> Torpedoes <span id="depot-rack-note" style="font-size: 11px; color: var(--fg-dim);"></span></div>
             <div style="display: flex; gap: 8px; margin-top: auto;">
-              <button class="btn-action-sm btn-buy" onclick="buyMissiles(1)">Arm 1 Torpedo</button>
-              <button class="btn-action-sm btn-buy" onclick="buyMissiles(8)">Restock Full Bay</button>
+              <button id="btn-missile-1" class="btn-action-sm btn-buy" onclick="buyMissiles(1)">Arm 1 Torpedo</button>
+              <button id="btn-missile-full" class="btn-action-sm btn-buy" onclick="buyMissiles(8)">Restock Full Bay</button>
             </div>
           </div>
 
@@ -5976,7 +6163,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
               captain can always earn fuel money. Anti-strand guarantee.
             </div>
             <div style="font-size: 12px; color: var(--fg-dim);">
-              Typical pay: <strong style="color: var(--green);">180–560 CR</strong> per shift (world dependent)
+              Local shift pay: <strong id="depot-oddjob-range" style="color: var(--green);">--</strong> per shift
             </div>
             <button id="btn-odd-jobs" class="btn-action-sm btn-buy" style="margin-top: auto;" onclick="workOddJobs()">
               Work a Station Shift (+1 Day)
@@ -6053,7 +6240,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <span style="font-weight: 700; color: var(--green);">Secure Savings Account</span>
                 <span id="bank-savings-bal" style="font-family: var(--font-mono); font-weight: 700; color: var(--green); font-size: 16px;">0 CR</span>
               </div>
-              <div style="font-size: 12px; color: var(--fg-dim); margin-bottom: 12px;">Earns 0.8% compound interest every sector travel day.</div>
+              <div id="bank-savings-desc" style="font-size: 12px; color: var(--fg-dim); margin-bottom: 12px;">Earns daily compound interest up to the reserve cap.</div>
               <div style="display: flex; gap: 8px;">
                 <button class="btn-action-sm btn-buy" onclick="promptDeposit()">Deposit Credits</button>
                 <button class="btn-action-sm btn-sell" onclick="promptWithdraw()">Withdraw Credits</button>
@@ -6067,10 +6254,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <span id="bank-loan-bal" style="font-family: var(--font-mono); font-weight: 700; color: var(--red); font-size: 16px;">0 CR</span>
               </div>
               <div style="font-size: 12px; color: var(--fg-dim); margin-bottom: 6px;">
-                Credit Score: <strong id="bank-credit-score" style="color: var(--cyan);">650</strong> · Limit: <strong id="bank-loan-limit" style="color: var(--fg);">10,000</strong> CR
+                Credit Score: <strong id="bank-credit-score" style="color: var(--cyan);">650</strong> · Limit: <strong id="bank-loan-limit" style="color: var(--fg);">10,000 CR</strong>
               </div>
               <div style="font-size: 12px; color: var(--fg-dim); margin-bottom: 12px;">
-                Interest: <span id="bank-interest-rate">1.5%</span> / day. Maintaining loans boosts your credit score!
+                Interest: <span id="bank-interest-rate">1.5%</span> / day. Repayments of 1,000+ CR improve your credit score (max 850).
               </div>
               <div style="display: flex; gap: 8px;">
                 <button class="btn-action-sm btn-buy" onclick="promptBorrow()">Borrow Funds</button>
@@ -6099,6 +6286,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <div class="panel-card-title">📊 Interstellar Securities Exchange</div>
               <div class="panel-card-subtitle">Trade equities in the solar system's top megacorporations.</div>
             </div>
+            <div id="stocks-portfolio-val" style="font-family: var(--font-mono); font-size: 13px; font-weight: 700; color: var(--gold);">Portfolio: 0 CR</div>
           </div>
           <div id="stocks-cards" style="display: flex; flex-direction: column; gap: 12px;">
             <!-- Dynamically populated -->
@@ -6109,6 +6297,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <!-- 9. CAREER & LOG VIEW -->
     <div id="view-log" class="view-container" role="tabpanel" aria-labelledby="tabbtn-log" tabindex="0">
+      <div id="career-stats-grid" class="career-stats-grid"></div>
       <div class="grid-2">
         <!-- Ranks and Reputation -->
         <div class="panel-card">
@@ -6210,9 +6399,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      <div style="display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--panel-border); padding-top: 16px; margin-bottom: 20px;">
-        <span style="font-size: 15px; font-weight: 700;">Total Transaction:</span>
-        <span id="trade-total-display" style="font-family: var(--font-mono); font-size: 20px; font-weight: 800; color: var(--gold);">0 CR</span>
+      <div style="border-top: 1px solid var(--panel-border); padding-top: 14px; margin-bottom: 18px;">
+        <div id="trade-breakdown-row" style="display: flex; justify-content: space-between; font-size: 11px; color: var(--fg-dim); margin-bottom: 8px;">
+          <span id="trade-fee-note">Market Depth Fee: 0 CR</span>
+          <span id="trade-profit-note"></span>
+        </div>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <span style="font-size: 15px; font-weight: 700;">Total Transaction:</span>
+          <span id="trade-total-display" style="font-family: var(--font-mono); font-size: 20px; font-weight: 800; color: var(--gold);">0 CR</span>
+        </div>
       </div>
 
       <button id="trade-btn-confirm" class="dossier-btn-engage" onclick="executeTradeModal()">
@@ -6224,7 +6419,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <!-- TACTICAL COMBAT BRIDGE MODAL -->
   <div id="combat-modal" role="dialog" aria-modal="true" aria-label="Tactical Combat">
     <div class="combat-bridge">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; border-bottom: 1px solid var(--red); padding-bottom: 12px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-bottom: 1px solid var(--red); padding-bottom: 12px; flex-wrap: wrap; gap: 8px;">
         <div style="display: flex; align-items: center; gap: 10px;">
           <span style="color: var(--red); font-size: 20px;">⚠️</span>
           <div>
@@ -6237,6 +6432,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <span id="combat-turn-counter" class="pill pill-red">Turn 1</span>
         </div>
       </div>
+
+      <div id="combat-status-strip" style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px;"></div>
 
       <!-- Holographic Tactical Combat Stage -->
       <div id="combat-holo-arena" style="position: relative; height: 160px; background: radial-gradient(circle at center, rgba(14,28,70,0.8) 0%, rgba(4,8,28,0.98) 100%); border: 1px solid var(--panel-border); border-radius: 8px; margin-bottom: 16px; overflow: hidden; display: flex; align-items: center; justify-content: space-between; padding: 0 44px;">
@@ -6316,16 +6513,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       <!-- Action Commands -->
       <div id="combat-actions-bar" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; margin-bottom: 16px;">
-        <button class="btn-action-sm btn-buy" onclick="sendCombatAction('fire')">⚡ Fire Batteries</button>
-        <button class="btn-action-sm" onclick="sendCombatAction('target_weapons')">🎯 Target Weapons</button>
-        <button class="btn-action-sm" onclick="sendCombatAction('target_engines')">🎯 Target Thrusters</button>
-        <button class="btn-action-sm" onclick="sendCombatAction('target_shields')">🎯 Target Shields</button>
+        <button class="btn-action-sm btn-buy" id="btn-combat-fire" onclick="sendCombatAction('fire')">⚡ Fire Batteries</button>
+        <button class="btn-action-sm" id="btn-combat-target-weapons" onclick="sendCombatAction('target_weapons')">🎯 Target Weapons</button>
+        <button class="btn-action-sm" id="btn-combat-target-engines" onclick="sendCombatAction('target_engines')">🎯 Target Thrusters</button>
+        <button class="btn-action-sm" id="btn-combat-target-shields" onclick="sendCombatAction('target_shields')">🎯 Target Shields</button>
         <button class="btn-action-sm btn-sell" id="btn-combat-missile" onclick="sendCombatAction('missile')">🚀 Fire Torpedo</button>
         <button class="btn-action-sm" id="btn-combat-drones" onclick="sendCombatAction('drones')">🛸 Deploy Drones</button>
-        <button class="btn-action-sm" onclick="sendCombatAction('recharge')">🛡️ Boost Capacitor</button>
+        <button class="btn-action-sm" id="btn-combat-recharge" onclick="sendCombatAction('recharge')">🛡️ Boost Capacitor</button>
         <button class="btn-action-sm" id="btn-combat-evade" onclick="sendCombatAction('evade')">💫 Evasive Maneuvers</button>
         <button class="btn-action-sm" id="btn-combat-board" onclick="sendCombatAction('board')">🏴‍☠️ Board Vessel</button>
-        <button class="btn-action-sm" style="color: var(--red);" onclick="sendCombatAction('flee')">🏃 Emergency Warp</button>
+        <button class="btn-action-sm" id="btn-combat-flee" style="color: var(--red);" onclick="sendCombatAction('flee')">🏃 Emergency Warp</button>
       </div>
 
       <!-- Combat Log Terminal -->
@@ -6488,12 +6685,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
       <p id="amount-modal-hint" style="font-size: 12px; color: var(--fg-dim); margin-bottom: 10px;"></p>
       <input type="number" id="amount-modal-input" class="search-input" style="width: 100%; font-size: 16px; padding: 10px;" min="1" value="500">
-      <div style="display: flex; gap: 8px; margin-top: 12px;">
+      <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px;">
         <button class="btn-action-sm" onclick="setAmountModalValue(100)">100</button>
         <button class="btn-action-sm" onclick="setAmountModalValue(500)">500</button>
         <button class="btn-action-sm" onclick="setAmountModalValue(1000)">1,000</button>
         <button class="btn-action-sm" onclick="setAmountModalValue(5000)">5,000</button>
         <button class="btn-action-sm" onclick="setAmountModalValue(10000)">10,000</button>
+        <button class="btn-action-sm btn-buy" id="amount-modal-max-btn" style="display: none;" onclick="setAmountModalMax()">Max</button>
       </div>
       <button class="dossier-btn-engage" id="amount-modal-confirm" style="margin-top: 16px;" onclick="confirmAmountModal()">Confirm</button>
     </div>
@@ -7122,13 +7320,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
         html += `
           <g class="map-planet-node" role="button" tabindex="0"
-             aria-label="${escHtml(p.name)} — ${escHtml(p.subtitle)}${isCurrent ? ', current position' : ''}${hasMissions ? ', contracts available' : ''}"
+             aria-label="${escHtml(p.name)} — ${escHtml(p.subtitle)}${isCurrent ? ', current position' : ''}${hasMissions ? ', active contract destination' : ''}"
              onclick="selectPlanet('${escJs(p.name)}')"
              onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectPlanet('${escJs(p.name)}'); }">
             <circle cx="${px}" cy="${py}" r="${nodeRadius + 4}" fill="${p.color}" opacity="0.15" />
             <circle class="planet-body" cx="${px}" cy="${py}" r="${nodeRadius}" fill="${p.color}" stroke="${strokeColor}" stroke-width="${strokeWidth}" />
             <text x="${px}" y="${py + 22}" text-anchor="middle" fill="${isSelected ? 'var(--cyan)' : 'var(--fg)'}" font-size="12" font-weight="${isSelected ? 'bold' : 'normal'}" font-family="system-ui">
-              ${p.name}
+              ${escHtml(p.name)}
             </text>
             ${p.active_event ? `<text x="${px}" y="${py - 14}" text-anchor="middle" fill="var(--gold)" font-size="10">⚡</text>` : ''}
             ${hasMissions ? `<text x="${px + 12}" y="${py - 10}" text-anchor="middle" font-size="11">📜</text>` : ''}
@@ -7151,12 +7349,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('dossier-faction-badge').textContent = planet.faction;
       document.getElementById('dossier-desc').textContent = planet.desc;
       document.getElementById('dossier-distance').textContent = planet.distance + ' LY';
-      document.getElementById('dossier-fuel').textContent = planet.fuel_cost + ' LY';
-      document.getElementById('dossier-days').textContent = planet.days_cost + ' Days';
+      document.getElementById('dossier-fuel').textContent = planet.is_current ? '0 LY (Docked)' : (planet.fuel_cost + ' LY');
+      document.getElementById('dossier-days').textContent = planet.is_current ? 'Docked' : `${planet.days_cost} ${planet.days_cost === 1 ? 'Day' : 'Days'}`;
       document.getElementById('dossier-security').textContent = planet.security;
       document.getElementById('dossier-security').style.color =
         planet.security === 'High' ? 'var(--green)' :
         planet.security === 'Medium' ? 'var(--gold)' : 'var(--red)';
+
+      const traitsEl = document.getElementById('dossier-traits');
+      if (traitsEl) {
+        traitsEl.innerHTML = `
+          <span class="trait-pill">Tech ${planet.tech}x</span>
+          <span class="trait-pill">Agri ${planet.agri}x</span>
+          <span class="trait-pill">Mining ${planet.mining}x</span>
+          <span class="trait-pill">Wealth ${planet.rich}x</span>
+          <span class="trait-pill">Crime ${planet.crime}x</span>
+        `;
+      }
 
       const eventBox = document.getElementById('dossier-event-box');
       if (planet.active_event) {
@@ -7175,7 +7384,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           misBox.style.display = 'block';
           misList.innerHTML = planet.active_missions.map(m => `
             <div style="font-size: 11px; display: flex; justify-content: space-between;">
-              <span style="color: var(--fg);">${m.title}</span>
+              <span style="color: var(--fg);">${escHtml(m.title)}</span>
               <strong style="color: var(--green); font-family: var(--font-mono);">+${m.reward_credits.toLocaleString()} CR</strong>
             </div>
           `).join('');
@@ -7191,7 +7400,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         scanBox.style.display = 'block';
         scanList.innerHTML = planet.remote_deals.map(d => `
           <div style="display: flex; justify-content: space-between; font-size: 11px;">
-            <span>${d.is_contraband ? '🔴' : '🔸'} ${d.good} <span style="color: var(--fg-dim);">(x${d.stock})</span></span>
+            <span>${d.is_contraband ? '🔴' : '🔸'} ${escHtml(d.good)} <span style="color: var(--fg-dim);">(x${d.stock})</span></span>
             <span style="color: var(--green); font-family: var(--font-mono);">+${d.margin} CR</span>
           </div>
         `).join('');
@@ -7203,15 +7412,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
 
       const btn = document.getElementById('dossier-btn-engage');
+      const refuelBtn = document.getElementById('dossier-btn-refuel');
       if (planet.is_current) {
         btn.disabled = true;
         btn.textContent = '📍 Current Location';
+        if (refuelBtn) refuelBtn.style.display = 'none';
       } else if (!planet.in_range) {
         btn.disabled = true;
         btn.textContent = `❌ Insufficient Fuel (${planet.fuel_cost} LY needed)`;
+        if (refuelBtn) {
+          refuelBtn.style.display = (gameState.player.fuel < gameState.player.max_fuel) ? 'flex' : 'none';
+        }
       } else {
         btn.disabled = false;
         btn.textContent = `⚡ Engage Hyperdrive to ${planet.name}`;
+        if (refuelBtn) refuelBtn.style.display = 'none';
       }
     }
 
@@ -7254,6 +7469,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('market-station-sub').textContent = `Commercial Terminal at ${gameState.current_planet.name} Spaceport`;
       document.getElementById('market-free-cargo').textContent = gameState.player.cargo_free;
 
+      const evBanner = document.getElementById('market-event-banner');
+      const ev = gameState.current_planet.active_event;
+      if (evBanner) {
+        if (ev) {
+          evBanner.style.display = 'block';
+          const goodLabel = ev.affected_good ? ` · ${commodityName(ev.affected_good)} ×${Number(ev.multiplier || 1).toFixed(2)}` : '';
+          evBanner.innerHTML = `⚡ <strong>${escHtml(ev.name)}:</strong> ${escHtml(ev.desc)}${escHtml(goodLabel)}`;
+        } else {
+          evBanner.style.display = 'none';
+        }
+      }
+
       if (marketCategoryFilter !== 'all') goods = goods.filter(g => g.category === marketCategoryFilter);
       if (query) goods = goods.filter(g => g.name.toLowerCase().includes(query));
       if (marketSortKey) {
@@ -7285,10 +7512,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         html += `
           <tr>
             <td>
-              <div style="font-weight: 700; color: var(--fg);">${g.name}</div>
-              <div style="font-size: 11px; color: var(--fg-dim);">${g.desc}</div>
+              <div style="font-weight: 700; color: var(--fg);">${escHtml(g.name)}</div>
+              <div style="font-size: 11px; color: var(--fg-dim);">${escHtml(g.desc)}</div>
             </td>
-            <td><span class="pill pill-cyan">${g.category}</span></td>
+            <td><span class="pill ${g.is_contraband ? 'pill-red' : 'pill-cyan'}">${escHtml(g.category)}</span></td>
             <td><strong style="color: var(--fg);">${g.stock}</strong> T</td>
             <td><strong style="color: ${buyColor}; font-family: var(--font-mono);">${g.buy_price} CR</strong></td>
             <td><strong style="color: var(--gold); font-family: var(--font-mono);">${g.sell_price} CR</strong></td>
@@ -7299,12 +7526,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </td>
             <td>
               <strong style="color: var(--cyan);">${g.player_qty}</strong> T
+              ${g.reserved_qty > 0 ? `<div style="font-size: 10px; color: var(--gold);">🔒 ${g.reserved_qty} T sealed</div>` : ''}
               ${g.player_qty > 0 && g.cost_basis > 0 ? `<div style="font-size: 10px; color: ${g.unit_profit >= 0 ? 'var(--green)' : 'var(--red)'}; font-family: var(--font-mono);">${g.unit_profit >= 0 ? '+' : ''}${g.unit_profit} (${g.profit_pct >= 0 ? '+' : ''}${g.profit_pct}%)</div>` : ''}
             </td>
             <td>
               <div style="display: flex; gap: 4px;">
-                <button class="btn-action-sm btn-buy" ${!g.can_buy ? 'disabled' : ''} onclick="openTradeModal('${g.id}', 'buy')">Buy</button>
-                <button class="btn-action-sm btn-sell" ${!g.can_sell ? 'disabled' : ''} onclick="openTradeModal('${g.id}', 'sell')">Sell</button>
+                <button class="btn-action-sm btn-buy" ${!g.can_buy ? 'disabled' : ''} onclick="openTradeModal('${escJs(g.id)}', 'buy')">Buy</button>
+                <button class="btn-action-sm btn-sell" ${!g.can_sell ? 'disabled' : ''} onclick="openTradeModal('${escJs(g.id)}', 'sell')">Sell</button>
               </div>
             </td>
           </tr>
@@ -7328,7 +7556,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       return mode === 'buy' ? unit * qty + fee : Math.max(0, unit * qty - fee);
     }
 
-    function openTradeModal(goodId, mode) {
+    function openTradeModal(goodId, mode, defaultMax = false) {
       selectedGoodId = goodId;
       tradeMode = mode;
       const g = gameState.current_planet.market.find(item => item.id === goodId);
@@ -7355,8 +7583,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       const slider = document.getElementById('trade-slider');
       slider.max = maxQty;
-      slider.value = 1;
-      onTradeSliderChange(1);
+      const initialVal = defaultMax ? maxQty : 1;
+      slider.value = initialVal;
+      onTradeSliderChange(initialVal);
 
       showModal('trade-modal');
     }
@@ -7371,7 +7600,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const qty = parseInt(val, 10);
       document.getElementById('trade-qty-display').textContent = qty;
       const unitP = tradeMode === 'buy' ? g.buy_price : g.sell_price;
-      document.getElementById('trade-total-display').textContent = `${tradeTotal(unitP, qty, tradeMode).toLocaleString()} CR`;
+      const total = tradeTotal(unitP, qty, tradeMode);
+      const fee = marketFee(unitP, qty);
+      document.getElementById('trade-total-display').textContent = `${total.toLocaleString()} CR`;
+
+      const feeNote = document.getElementById('trade-fee-note');
+      if (feeNote) feeNote.textContent = `Market Depth Fee: ${fee.toLocaleString()} CR`;
+
+      const plNote = document.getElementById('trade-profit-note');
+      if (plNote) {
+        if (tradeMode === 'sell' && g.cost_basis > 0) {
+          const estPL = Math.round(total - g.cost_basis * qty);
+          plNote.style.color = estPL >= 0 ? 'var(--green)' : 'var(--red)';
+          plNote.textContent = `Est. Net P/L: ${estPL >= 0 ? '+' : ''}${estPL.toLocaleString()} CR`;
+        } else {
+          plNote.textContent = '';
+        }
+      }
     }
 
     function setTradeQty(val) {
@@ -7408,7 +7653,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         html += `
           <div style="background: var(--bg2); border: 1px solid ${c.is_contraband ? 'var(--red)' : 'var(--panel-border)'}; border-radius: 8px; padding: 12px;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-              <strong style="color: ${c.is_contraband ? 'var(--red)' : 'var(--fg)'}; font-size: 13px;">${c.name}</strong>
+              <strong style="color: ${c.is_contraband ? 'var(--red)' : 'var(--fg)'}; font-size: 13px;">${escHtml(c.name)}</strong>
               <span class="pill ${c.is_contraband ? 'pill-red' : 'pill-cyan'}" style="font-size: 10px;">${c.qty} T</span>
             </div>
             <div style="font-size: 11px; color: var(--fg-dim);">Sell here: <strong style="color: var(--gold);">${c.sell_price} CR</strong>/unit</div>
@@ -7418,8 +7663,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <div style="font-size: 11px; color: var(--fg-dim);">Total Value: <strong style="color: var(--gold); font-family: var(--font-mono);">${c.total_value.toLocaleString()} CR</strong></div>
             ${c.reserved > 0 ? `<div style="font-size: 11px; color: var(--cyan);">🔒 ${c.reserved} T sealed for active contracts</div>` : ''}
             <div style="display: flex; gap: 6px; margin-top: 8px;">
-              <button class="btn-action-sm btn-sell" style="flex: 1;" ${c.sellable <= 0 ? 'disabled' : ''} onclick="openTradeModal('${c.id}', 'sell')">Sell All</button>
-              <button class="btn-action-sm" style="flex: 1; color: var(--red);" ${c.sellable <= 0 ? 'disabled' : ''} title="Dump cargo into space (no refund, no customs fine)" onclick="promptJettison('${c.id}', ${c.sellable})">♻ Jettison</button>
+              <button class="btn-action-sm btn-sell" style="flex: 1;" ${c.sellable <= 0 ? 'disabled' : ''} onclick="openTradeModal('${escJs(c.id)}', 'sell', true)">Sell All</button>
+              <button class="btn-action-sm" style="flex: 1; color: var(--red);" ${c.sellable <= 0 ? 'disabled' : ''} title="Dump cargo into space (no refund, no customs fine)" onclick="promptJettison('${escJs(c.id)}', ${c.sellable})">♻ Jettison</button>
             </div>
           </div>
         `;
@@ -7431,11 +7676,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function promptJettison(goodId, maxQty) {
       openAmountModal(
         '♻ Jettison Cargo',
-        `Dump units of this commodity into the void. No refund — but customs cannot fine you for cargo you no longer carry. You hold ${maxQty} unit(s).`,
+        `Dump units of ${commodityName(goodId)} into the void. No refund — but customs cannot fine you for cargo you no longer carry. You hold ${maxQty} sellable unit(s).`,
         'Jettison Into Space',
         Math.max(1, Math.min(maxQty, 1)),
         'jettison_cargo',
-        { key: 'qty', good: goodId }
+        { key: 'qty', good: goodId },
+        maxQty
       );
     }
 
@@ -7494,16 +7740,35 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     // --- Shipyard & Outfitter ---
+    function formatWeaponSpecs(w) {
+      const acc = Math.round((w.accuracy || 0) * 100);
+      const crit = Math.round((w.crit_chance || 0) * 100);
+      if ((w.damage || 0) <= 0) {
+        return `Torpedo Launcher · 85–125 dmg · Acc: ${acc}%`;
+      }
+      return `Dmg: ${w.damage} · Acc: ${acc}% · Crit: ${crit}%`;
+    }
+
+    function formatEquipSpecs(eq) {
+      if (eq.slot_type === 'weapon') return formatWeaponSpecs(eq);
+      if (eq.slot_type === 'shield') return `Shield Capacity: +${eq.shield_hp} HP`;
+      const parts = [];
+      if (eq.cargo_bonus > 0) parts.push(`+${eq.cargo_bonus} T Cargo`);
+      if (eq.fuel_save > 0) parts.push(`-${Math.round(eq.fuel_save * 100)}% Fuel Burn`);
+      if (eq.evasion_bonus > 0) parts.push(`+${Math.round(eq.evasion_bonus * 100)}% Evasion`);
+      return parts.join(' · ');
+    }
+
     function renderShipyard() {
       if (!gameState) return;
       const p = gameState.player;
-      
+
       // Hardpoints Matrix
       const matrixContainer = document.getElementById('hardpoint-matrix-container');
       if (matrixContainer) {
-        document.getElementById('hardpoint-ship-subtitle').textContent = 
+        document.getElementById('hardpoint-ship-subtitle').textContent =
           `${p.ship_name} [${p.ship_class}] · Hardpoints: ${p.weapon_slots} Weapon, ${p.shield_slots} Shield, ${p.module_slots} Module Bays`;
-        
+
         let mHtml = '';
         // Weapons Column
         mHtml += `
@@ -7515,10 +7780,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
           mHtml += `
             <div class="hardpoint-mounted">
               <div>
-                <div style="font-weight: 700; color: var(--fg); font-size: 13px;">${w.name}</div>
-                <div style="font-size: 11px; color: var(--fg-dim);">Dmg: ${w.damage} · Acc: ${w.accuracy}%</div>
+                <div style="font-weight: 700; color: var(--fg); font-size: 13px;">${escHtml(w.name)}</div>
+                <div style="font-size: 11px; color: var(--fg-dim);">${formatWeaponSpecs(w)}</div>
               </div>
-              <button class="btn-action-sm btn-sell" onclick="sendAction('sell_equipment', { eq_id: '${w.id}' })">Dismount (+${w.refund_val.toLocaleString()} CR)</button>
+              <button class="btn-action-sm btn-sell" onclick="sendAction('sell_equipment', { eq_id: '${escJs(w.id)}' })">Dismount (+${w.refund_val.toLocaleString()} CR)</button>
             </div>
           `;
         });
@@ -7538,10 +7803,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
           mHtml += `
             <div class="hardpoint-mounted">
               <div>
-                <div style="font-weight: 700; color: var(--fg); font-size: 13px;">${s.name}</div>
+                <div style="font-weight: 700; color: var(--fg); font-size: 13px;">${escHtml(s.name)}</div>
                 <div style="font-size: 11px; color: var(--fg-dim);">Cap: +${s.shield_hp} HP</div>
               </div>
-              <button class="btn-action-sm btn-sell" onclick="sendAction('sell_equipment', { eq_id: '${s.id}' })">Dismount (+${s.refund_val.toLocaleString()} CR)</button>
+              <button class="btn-action-sm btn-sell" onclick="sendAction('sell_equipment', { eq_id: '${escJs(s.id)}' })">Dismount (+${s.refund_val.toLocaleString()} CR)</button>
             </div>
           `;
         });
@@ -7561,10 +7826,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
           mHtml += `
             <div class="hardpoint-mounted">
               <div>
-                <div style="font-weight: 700; color: var(--fg); font-size: 13px;">${m.name}</div>
-                <div style="font-size: 11px; color: var(--fg-dim);">${m.desc.slice(0, 32)}...</div>
+                <div style="font-weight: 700; color: var(--fg); font-size: 13px;">${escHtml(m.name)}</div>
+                <div style="font-size: 11px; color: var(--fg-dim);">${escHtml(m.desc.slice(0, 44))}${m.desc.length > 44 ? '...' : ''}</div>
               </div>
-              <button class="btn-action-sm btn-sell" onclick="sendAction('sell_equipment', { eq_id: '${m.id}' })">Dismount (+${m.refund_val.toLocaleString()} CR)</button>
+              <button class="btn-action-sm btn-sell" onclick="sendAction('sell_equipment', { eq_id: '${escJs(m.id)}' })">Dismount (+${m.refund_val.toLocaleString()} CR)</button>
             </div>
           `;
         });
@@ -7582,24 +7847,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
       let html = '';
       gameState.all_ships.forEach(s => {
         html += `
-          <div style="background: var(--bg2); border: 1px solid ${s.is_current ? 'var(--cyan)' : 'var(--panel-border)'}; border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center;">
-            <div style="flex: 1;">
+          <div style="background: var(--bg2); border: 1px solid ${s.is_current ? 'var(--cyan)' : 'var(--panel-border)'}; border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;">
+            <div style="flex: 1; min-width: 210px;">
               <div style="font-weight: 700; color: ${s.is_current ? 'var(--cyan)' : 'var(--fg)'}; font-size: 15px;">
-                ${s.name} ${s.is_current ? '<span class="pill pill-cyan">COMMISSIONED</span>' : ''}
+                ${escHtml(s.name)} ${s.is_current ? '<span class="pill pill-cyan">COMMISSIONED</span>' : ''}
               </div>
-              <div style="font-size: 11px; color: var(--fg-dim); margin-bottom: 6px;">[${s.ship_class}] · ${s.desc}</div>
-              <div style="display: flex; gap: 12px; font-size: 11px; color: var(--fg-dim);">
+              <div style="font-size: 11px; color: var(--fg-dim); margin-bottom: 6px;">[${escHtml(s.ship_class)}] · ${escHtml(s.desc)}</div>
+              <div style="display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; color: var(--fg-dim);">
                 <span>Hull: <strong style="color: var(--green);">${s.max_hull}</strong></span>
                 <span>Shield: <strong style="color: var(--cyan);">${s.max_shield}</strong></span>
                 <span>Cargo: <strong style="color: var(--purple);">${s.cargo_cap} T</strong></span>
                 <span>Range: <strong style="color: var(--gold);">${s.max_fuel} LY</strong></span>
                 <span>Speed: <strong>${s.speed}x</strong></span>
+                <span>Slots: <strong>${s.weapon_slots}W/${s.shield_slots}S/${s.module_slots}M</strong></span>
               </div>
             </div>
-            <div style="text-align: right; margin-left: 16px;">
+            <div style="text-align: right;">
               <div style="font-family: var(--font-mono); font-size: 14px; font-weight: 700; color: var(--gold);">${s.net_cost < 0 ? '+' + (-s.net_cost).toLocaleString() + ' CR refund' : s.net_cost.toLocaleString() + ' CR'}</div>
-              <div style="font-size: 10px; color: var(--fg-dim); margin-bottom: 6px;">(Trade-in: -${s.trade_in_value.toLocaleString()} CR)</div>
-              ${s.is_current ? '' : `<button class="btn-action-sm btn-buy" ${!s.can_afford ? 'disabled' : ''} onclick="sendAction('buy_ship', { ship_id: '${s.id}' })">Commission</button>`}
+              <div style="font-size: 10px; color: var(--fg-dim); margin-bottom: 6px;">(After ${s.trade_in_value.toLocaleString()} CR trade-in)</div>
+              ${s.is_current ? '' : `<button class="btn-action-sm btn-buy" ${!s.can_afford ? 'disabled' : ''} onclick="sendAction('buy_ship', { ship_id: '${escJs(s.id)}' })">Commission</button>`}
             </div>
           </div>
         `;
@@ -7608,17 +7874,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       // Outfitter
       const oContainer = document.getElementById('outfitter-cards');
+      const slotsFull = {
+        weapon: (p.equipped_weapons || []).length >= p.weapon_slots,
+        shield: (p.equipped_shields || []).length >= p.shield_slots,
+        module: (p.equipped_modules || []).length >= p.module_slots,
+      };
       let oHtml = '';
       gameState.all_equipment.forEach(eq => {
+        const specText = formatEquipSpecs(eq);
+        const full = !eq.is_equipped && slotsFull[eq.slot_type];
+        const canEquip = eq.can_afford && !full;
         oHtml += `
-          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px; display: flex; justify-content: space-between; align-items: center;">
-            <div>
-              <div style="font-weight: 700; color: var(--fg);">${eq.name} <span class="pill pill-cyan" style="font-size: 9px;">${eq.slot_type}</span></div>
-              <div style="font-size: 11px; color: var(--fg-dim);">${eq.desc}</div>
+          <div style="background: var(--bg2); border: 1px solid ${eq.is_equipped ? 'var(--cyan)' : 'var(--panel-border)'}; border-radius: 8px; padding: 12px; display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+            <div style="flex: 1;">
+              <div style="font-weight: 700; color: var(--fg);">${escHtml(eq.name)} <span class="pill pill-cyan" style="font-size: 9px;">${escHtml(eq.slot_type)}</span></div>
+              <div style="font-size: 11px; color: var(--fg-dim);">${escHtml(eq.desc)}</div>
+              ${specText ? `<div style="font-size: 10px; color: var(--cyan); font-family: var(--font-mono); margin-top: 3px;">${escHtml(specText)}</div>` : ''}
             </div>
-            <div style="text-align: right; margin-left: 14px;">
+            <div style="text-align: right;">
               <div style="font-family: var(--font-mono); font-size: 13px; font-weight: 700; color: var(--gold); margin-bottom: 4px;">${eq.cost.toLocaleString()} CR</div>
-              ${eq.is_equipped ? `<button class="btn-action-sm btn-sell" onclick="sendAction('sell_equipment', { eq_id: '${eq.id}' })">Dismount (+${eq.refund_val.toLocaleString()} CR)</button>` : `<button class="btn-action-sm btn-buy" ${!eq.can_afford ? 'disabled' : ''} onclick="sendAction('buy_equipment', { eq_id: '${eq.id}' })">Equip</button>`}
+              ${eq.is_equipped ? `<button class="btn-action-sm btn-sell" onclick="sendAction('sell_equipment', { eq_id: '${escJs(eq.id)}' })">Dismount (+${eq.refund_val.toLocaleString()} CR)</button>` : `<button class="btn-action-sm btn-buy" ${!canEquip ? 'disabled' : ''} onclick="sendAction('buy_equipment', { eq_id: '${escJs(eq.id)}' })">${full ? 'Slots Full' : 'Equip'}</button>`}
             </div>
           </div>
         `;
@@ -7636,19 +7911,45 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('depot-fuel-price').textContent = p.fuel_unit_price;
       document.getElementById('depot-fuel-current').textContent = p.fuel;
       document.getElementById('depot-fuel-max').textContent = p.max_fuel;
+      const fuelFull = p.fuel >= p.max_fuel;
+      ['btn-fuel-10', 'btn-fuel-50', 'btn-fuel-max'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.disabled = fuelFull || p.credits < p.fuel_unit_price;
+      });
 
       document.getElementById('depot-repair-price').textContent = p.repair_cost_per_hp;
       document.getElementById('depot-hull-current').textContent = p.hull;
       document.getElementById('depot-hull-max').textContent = p.max_hull;
+      const hullFull = p.hull >= p.max_hull;
+      ['btn-repair-10', 'btn-repair-full'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.disabled = hullFull || p.credits < p.repair_cost_per_hp;
+      });
 
-      const hasDamaged = p.weapons_damaged || p.engines_damaged || p.shields_damaged;
-      document.getElementById('depot-subsystem-status').textContent = hasDamaged ? 'MALFUNCTION: Damaged systems detected.' : 'All subsystems nominal.';
+      const damagedNames = [];
+      if (p.weapons_damaged) damagedNames.push('Weapons');
+      if (p.engines_damaged) damagedNames.push('Thrusters');
+      if (p.shields_damaged) damagedNames.push('Shields');
+      const hasDamaged = damagedNames.length > 0;
+      const subStatus = document.getElementById('depot-subsystem-status');
+      subStatus.textContent = hasDamaged
+        ? `MALFUNCTION: ${damagedNames.join(', ')} damaged.`
+        : 'All subsystems nominal.';
+      subStatus.style.color = hasDamaged ? 'var(--red)' : 'var(--green)';
       const subBtn = document.getElementById('btn-repair-subsystems');
-      subBtn.disabled = !hasDamaged;
+      subBtn.disabled = !hasDamaged || p.credits < p.subsystem_repair_cost;
       subBtn.textContent = `Overhaul Damaged Modules (${p.subsystem_repair_cost.toLocaleString()} CR)`;
 
       document.getElementById('depot-missiles-count').textContent = p.missiles;
+      document.getElementById('depot-missiles-max').textContent = p.max_missiles;
       document.getElementById('depot-missiles-price').textContent = p.missile_price;
+      const rackNote = document.getElementById('depot-rack-note');
+      if (rackNote) rackNote.textContent = p.has_missile_rack ? '' : '(Requires Torpedo Rack)';
+      const missilesFull = !p.has_missile_rack || p.missiles >= p.max_missiles;
+      ['btn-missile-1', 'btn-missile-full'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.disabled = missilesFull || p.credits < p.missile_price;
+      });
 
       const insStatus = document.getElementById('depot-insurance-status');
       const insBtn = document.getElementById('btn-buy-insurance');
@@ -7663,6 +7964,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         insBtn.disabled = p.credits < p.insurance_price;
         insBtn.textContent = `Purchase Policy (${p.insurance_price.toLocaleString()} CR)`;
       }
+
+      const oddRangeEl = document.getElementById('depot-oddjob-range');
+      if (oddRangeEl) {
+        const mult = 0.8 + (cp.rich || 0) * 0.4 + (cp.tech || 0) * 0.1;
+        const lo = Math.floor(180 * mult);
+        const hi = Math.floor(320 * mult);
+        oddRangeEl.textContent = `${lo.toLocaleString()}–${hi.toLocaleString()} CR`;
+      }
     }
 
     function buyFuel(amount) { sendAction('buy_fuel', { amount }); }
@@ -7674,23 +7983,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // --- Crew Lounge ---
     function renderCrew() {
       if (!gameState) return;
-      document.getElementById('crew-daily-wages').textContent = gameState.player.total_daily_wages;
+      const p = gameState.player;
+      document.getElementById('crew-daily-wages').textContent = p.total_daily_wages;
+      const crewFull = (p.hired_crew || []).length >= 4;
       const container = document.getElementById('crew-cards');
       let html = '';
       gameState.all_crew.forEach(c => {
+        const cannotHire = crewFull || p.credits < c.hire_cost;
         html += `
-          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 10px;">
+          <div style="background: var(--bg2); border: 1px solid ${c.is_hired ? 'var(--cyan)' : 'var(--panel-border)'}; border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 10px;">
             <div style="display: flex; justify-content: space-between; align-items: center;">
               <div>
-                <div style="font-weight: 700; color: var(--fg); font-size: 15px;">${c.name}</div>
-                <div style="font-size: 11px; color: var(--cyan);">${c.role}</div>
+                <div style="font-weight: 700; color: var(--fg); font-size: 15px;">${escHtml(c.name)}</div>
+                <div style="font-size: 11px; color: var(--cyan);">${escHtml(c.role)}</div>
               </div>
               <span class="pill pill-gold">${c.daily_wage} CR / day</span>
             </div>
-            <p style="font-size: 12px; color: var(--fg-dim); line-height: 1.4;">${c.desc}</p>
+            <p style="font-size: 12px; color: var(--fg-dim); line-height: 1.4;">${escHtml(c.desc)}</p>
             <div style="margin-top: auto; display: flex; justify-content: space-between; align-items: center;">
               <span style="font-size: 11px; color: var(--fg-dim);">Hire Fee: <strong>${c.hire_cost.toLocaleString()} CR</strong></span>
-              ${c.is_hired ? `<button class="btn-action-sm btn-sell" onclick="sendAction('dismiss_crew', { crew_id: '${c.id}' })">Dismiss</button>` : `<button class="btn-action-sm btn-buy" onclick="sendAction('hire_crew', { crew_id: '${c.id}' })">Hire Officer</button>`}
+              ${c.is_hired ? `<button class="btn-action-sm btn-sell" onclick="sendAction('dismiss_crew', { crew_id: '${escJs(c.id)}' })">Dismiss</button>` : `<button class="btn-action-sm btn-buy" ${cannotHire ? 'disabled' : ''} onclick="sendAction('hire_crew', { crew_id: '${escJs(c.id)}' })">${crewFull ? 'Roster Full (4/4)' : 'Hire Officer'}</button>`}
             </div>
           </div>
         `;
@@ -7699,25 +8011,49 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     // --- Missions ---
+    function missionBadge(mType) {
+      const META = {
+        delivery: ['DELIVERY', 'pill-cyan'],
+        smuggle: ['CONTRABAND', 'pill-red'],
+        bounty: ['BOUNTY', 'pill-gold'],
+        medical: ['MEDICAL', 'pill-green'],
+        passenger: ['PASSENGER', 'pill-purple'],
+      };
+      const [label, cls] = META[mType] || ['CONTRACT', 'pill-cyan'];
+      return `<span class="pill ${cls}" style="font-size: 9px; margin-left: 6px;">${label}</span>`;
+    }
+
     function renderMissions() {
       if (!gameState) return;
+      const p = gameState.player;
+      const logFull = (p.active_missions || []).length >= 5;
       const aList = document.getElementById('available-missions-list');
       let aHtml = '';
       gameState.available_missions.forEach(m => {
         const urgent = m.days_left <= 3;
+        const requiresCargo = Boolean(m.cargo_good) && m.cargo_qty > 0;
+        const needCargo = requiresCargo && p.cargo_free < m.cargo_qty;
+        const blocked = logFull || needCargo;
+        const btnLabel = logFull ? 'Log Full (5/5)' : (needCargo ? `Need ${m.cargo_qty}T` : 'Accept');
+        const payloadMeta = requiresCargo
+          ? `· <span style="color: var(--purple);">📦 ${m.cargo_qty} T cargo</span>`
+          : (m.m_type === 'passenger' && m.cargo_qty > 0
+              ? `· <span style="color: var(--purple);">🧳 ${m.cargo_qty} Passenger${m.cargo_qty > 1 ? 's' : ''} (0 T)</span>`
+              : '');
         aHtml += `
-          <div style="background: var(--bg2); border: 1px solid ${urgent ? 'var(--red)' : 'var(--panel-border)'}; border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center;">
+          <div style="background: var(--bg2); border: 1px solid ${urgent ? 'var(--red)' : 'var(--panel-border)'}; border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px;">
             <div>
-              <div style="font-weight: 700; color: var(--cyan);">${m.title}</div>
-              <div style="font-size: 11px; color: var(--fg-dim);">${m.desc}</div>
+              <div style="font-weight: 700; color: var(--cyan);">${escHtml(m.title)} ${missionBadge(m.m_type)}</div>
+              <div style="font-size: 11px; color: var(--fg-dim);">${escHtml(m.desc)}</div>
               <div style="font-size: 11px; color: var(--fg); margin-top: 4px;">
-                Destination: <strong style="color: var(--gold);">${m.destination}</strong> · Deadline: <strong style="color: ${urgent ? 'var(--red)' : 'var(--fg)'};">${m.days_left} days</strong>
+                Destination: <strong style="color: var(--gold);">${escHtml(m.destination)}</strong> · Deadline: <strong style="color: ${urgent ? 'var(--red)' : 'var(--fg)'};">${m.days_left} ${m.days_left === 1 ? 'day' : 'days'}</strong>
+                ${payloadMeta}
                 ${m.est_days != null ? `· <span style="color: var(--cyan);">${m.distance} LY · ~${m.est_days}d · ${m.est_fuel} fuel</span>` : ''}
               </div>
             </div>
-            <div style="text-align: right; margin-left: 14px;">
+            <div style="text-align: right; flex-shrink: 0;">
               <div style="font-family: var(--font-mono); font-size: 14px; font-weight: 700; color: var(--green); margin-bottom: 4px;">+${m.reward_credits.toLocaleString()} CR</div>
-              <button class="btn-action-sm btn-buy" onclick="sendAction('accept_mission', { mission_id: '${m.id}' })">Accept</button>
+              <button class="btn-action-sm btn-buy" ${blocked ? 'disabled' : ''} onclick="sendAction('accept_mission', { mission_id: '${escJs(m.id)}' })">${btnLabel}</button>
             </div>
           </div>
         `;
@@ -7726,23 +8062,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       const actList = document.getElementById('active-missions-list');
       let actHtml = '';
-      gameState.player.active_missions.forEach(m => {
+      p.active_missions.forEach(m => {
         const canDeliver = (m.destination === gameState.current_planet.name);
+        let actionControls = '';
+        if (canDeliver && m.m_type === 'bounty') {
+          actionControls = `<button class="btn-action-sm btn-buy" style="border-color: var(--red); color: var(--red); background: var(--red-dim);" onclick="sendAction('engage_bounty', { mission_id: '${escJs(m.id)}' })">⚔️ Engage Target</button>`;
+        } else if (canDeliver) {
+          actionControls = `<span class="pill pill-green">Ready to Deliver</span>`;
+        } else {
+          actionControls = `<button class="btn-action-sm btn-buy" onclick="selectPlanet('${escJs(m.destination)}'); switchTab('map');">Plot Course</button>`;
+        }
         actHtml += `
-          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center;">
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px;">
             <div>
-              <div style="font-weight: 700; color: var(--gold); font-size: 14px;">${m.title}</div>
+              <div style="font-weight: 700; color: var(--gold); font-size: 14px;">${escHtml(m.title)} ${missionBadge(m.m_type)}</div>
               <div style="font-size: 11px; color: var(--fg-dim); margin-top: 2px;">
-                ${m.m_type === 'bounty' ? 'Hunt target near' : 'Destination:'} <strong style="color: var(--cyan);">${m.destination}</strong> · Reward: <strong style="color: var(--green); font-family: var(--font-mono);">${m.reward_credits.toLocaleString()} CR</strong>
+                ${m.m_type === 'bounty' ? 'Hunt target near' : 'Destination:'} <strong style="color: var(--cyan);">${escHtml(m.destination)}</strong> · Reward: <strong style="color: var(--green); font-family: var(--font-mono);">${m.reward_credits.toLocaleString()} CR</strong>
               </div>
               <div style="font-size: 11px; color: ${m.days_left <= 2 ? 'var(--red)' : 'var(--fg)'}; margin-top: 2px;">
                 Remaining Time: ${m.days_left} Days
                 ${m.est_days != null && !canDeliver ? `· ETA ${m.est_days}d (${m.est_fuel} fuel)` : ''}
               </div>
             </div>
-            <div style="display: flex; gap: 8px; align-items: center;">
-              ${canDeliver && m.m_type !== 'bounty' ? `<span class="pill pill-green">Ready to Deliver</span>` : `<button class="btn-action-sm btn-buy" onclick="selectPlanet('${escJs(m.destination)}'); switchTab('map');">Plot Course</button>`}
-              <button class="btn-action-sm btn-sell" onclick="sendAction('abandon_mission', { mission_id: '${m.id}' })">Forfeit</button>
+            <div style="display: flex; gap: 8px; align-items: center; flex-shrink: 0;">
+              ${actionControls}
+              <button class="btn-action-sm btn-sell" onclick="sendAction('abandon_mission', { mission_id: '${escJs(m.id)}' })">Forfeit</button>
             </div>
           </div>
         `;
@@ -7754,11 +8098,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function renderBank() {
       if (!gameState) return;
       const p = gameState.player;
+      const eco = gameState.economy || { savings_rate_pct: 0.2, savings_interest_cap: 60000 };
       document.getElementById('bank-savings-bal').textContent = p.savings.toLocaleString() + ' CR';
+      const savDesc = document.getElementById('bank-savings-desc');
+      if (savDesc) {
+        savDesc.textContent = `Earns ${eco.savings_rate_pct}% compound interest every travel day (capped at ${Number(eco.savings_interest_cap).toLocaleString()} CR balance).`;
+      }
       document.getElementById('bank-loan-bal').textContent = p.loan.toLocaleString() + ' CR';
       document.getElementById('bank-credit-score').textContent = p.credit_score;
       document.getElementById('bank-loan-limit').textContent = p.loan_limit.toLocaleString() + ' CR';
       document.getElementById('bank-interest-rate').textContent = p.effective_interest_rate + '%';
+
+      const portEl = document.getElementById('stocks-portfolio-val');
+      if (portEl) {
+        portEl.textContent = `Portfolio: ${(p.stock_portfolio_value || 0).toLocaleString()} CR`;
+      }
 
       // Diplomatic gifts grid
       const gContainer = document.getElementById('gift-factions-row');
@@ -7770,7 +8124,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 6px; padding: 8px 10px; display: flex; justify-content: space-between; align-items: center; gap: 6px;">
               <div>
                 <div style="font-weight: 700; font-size: 11px;">${escHtml(faction)}</div>
-                <div style="font-size: 10px; color: ${repColor};">${p.standing[faction]} (${rep > 0 ? '+' : ''}${rep})</div>
+                <div style="font-size: 10px; color: ${repColor};">${escHtml(p.standing[faction])} (${rep > 0 ? '+' : ''}${rep})</div>
               </div>
               <button class="btn-action-sm" style="color: var(--purple);" onclick="promptGift('${escJs(faction)}')">Gift</button>
             </div>
@@ -7784,9 +8138,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
           '🤝 Diplomatic Gift — ' + faction,
           'Donate credits to earn standing (~+1 per 500 CR, max +8 per gift). Minimum 500 CR.',
           'Present Gift',
-          1000,
+          Math.min(1000, Math.max(500, p.credits)),
           'faction_gift',
-          { key: 'amount', faction }
+          { key: 'amount', faction },
+          p.credits
         );
       }
       window.promptGift = promptGift;
@@ -7796,21 +8151,37 @@ HTML_PAGE = r"""<!DOCTYPE html>
       let html = '';
       gameState.all_stocks.forEach(stk => {
         const trendColor = stk.change_pct >= 0 ? 'var(--green)' : 'var(--red)';
+        const pts = (stk.history && stk.history.length) ? stk.history : [stk.price];
+        const minP = Math.min(...pts), maxP = Math.max(...pts);
+        const span = maxP === minP ? 1 : (maxP - minP);
+        const sparkCoords = pts.map((val, i) => {
+          const x = (i / Math.max(1, pts.length - 1)) * 64;
+          const y = 20 - ((val - minP) / span) * 16;
+          return `${x.toFixed(1)},${y.toFixed(1)}`;
+        }).join(' ');
         html += `
-          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px; display: flex; justify-content: space-between; align-items: center;">
-            <div>
+          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px; display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+            <div style="flex: 1;">
               <div style="font-weight: 700; color: var(--fg);">
-                ${stk.name} <span class="pill pill-cyan" style="font-size: 10px;">${stk.symbol}</span>
+                ${escHtml(stk.name)} <span class="pill pill-cyan" style="font-size: 10px;">${escHtml(stk.symbol)}</span>
               </div>
-              <div style="font-size: 11px; color: var(--fg-dim);">${stk.desc}</div>
-              <div style="font-size: 11px; color: var(--fg); margin-top: 2px;">Owned: <strong>${stk.shares_owned}</strong> shares</div>
+              <div style="font-size: 11px; color: var(--fg-dim);">${escHtml(stk.desc)}</div>
+              <div style="font-size: 11px; color: var(--fg); margin-top: 3px;">
+                Owned: <strong>${stk.shares_owned}</strong> shares
+                ${stk.shares_owned > 0 ? `<span style="color: var(--gold); font-family: var(--font-mono); margin-left: 6px;">(${(stk.total_value || 0).toLocaleString()} CR)</span>` : ''}
+              </div>
             </div>
-            <div style="text-align: right; margin-left: 14px;">
-              <div style="font-family: var(--font-mono); font-size: 15px; font-weight: 700; color: var(--gold);">${stk.price} CR</div>
-              <div style="font-size: 11px; color: ${trendColor}; font-weight: 700; margin-bottom: 4px;">${stk.change_pct >= 0 ? '+' : ''}${stk.change_pct}%</div>
-              <div style="display: flex; gap: 4px;">
-                <button class="btn-action-sm btn-buy" onclick="tradeStock('${stk.symbol}', 'buy')">Buy</button>
-                <button class="btn-action-sm btn-sell" ${stk.shares_owned <= 0 ? 'disabled' : ''} onclick="tradeStock('${stk.symbol}', 'sell')">Sell</button>
+            <div style="display: flex; align-items: center; gap: 12px;">
+              <svg class="sparkline-svg" width="68" height="22" aria-hidden="true">
+                <polyline points="${sparkCoords}" fill="none" stroke="${trendColor}" stroke-width="2" />
+              </svg>
+              <div style="text-align: right;">
+                <div style="font-family: var(--font-mono); font-size: 15px; font-weight: 700; color: var(--gold);">${stk.price} CR</div>
+                <div style="font-size: 11px; color: ${trendColor}; font-weight: 700; margin-bottom: 4px;">${stk.change_pct >= 0 ? '+' : ''}${stk.change_pct}%</div>
+                <div style="display: flex; gap: 4px;">
+                  <button class="btn-action-sm btn-buy" ${p.credits < stk.price ? 'disabled' : ''} onclick="tradeStock('${escJs(stk.symbol)}', 'buy')">Buy</button>
+                  <button class="btn-action-sm btn-sell" ${stk.shares_owned <= 0 ? 'disabled' : ''} onclick="tradeStock('${escJs(stk.symbol)}', 'sell')">Sell</button>
+                </div>
               </div>
             </div>
           </div>
@@ -7825,6 +8196,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function renderLog() {
       if (!gameState) return;
       const p = gameState.player;
+      const st = p.stats || {};
+
+      // Career Telemetry Strip
+      const statsGrid = document.getElementById('career-stats-grid');
+      if (statsGrid) {
+        const profit = Number(st.trading_profit || 0);
+        statsGrid.innerHTML = `
+          <div class="stat-tile"><div class="stat-tile-label">Sector Jumps</div><div class="stat-tile-val">${Number(st.jumps_made || 0).toLocaleString()}</div></div>
+          <div class="stat-tile"><div class="stat-tile-label">Trading Profit</div><div class="stat-tile-val" style="color: ${profit >= 0 ? 'var(--green)' : 'var(--red)'};">${profit >= 0 ? '+' : ''}${profit.toLocaleString()} CR</div></div>
+          <div class="stat-tile"><div class="stat-tile-label">Contracts Done</div><div class="stat-tile-val">${Number(st.missions_completed || 0).toLocaleString()}</div></div>
+          <div class="stat-tile"><div class="stat-tile-label">Pirates Defeated</div><div class="stat-tile-val" style="color: var(--gold);">${Number(st.pirates_defeated || 0).toLocaleString()}</div></div>
+          <div class="stat-tile"><div class="stat-tile-label">Bounties Claimed</div><div class="stat-tile-val" style="color: var(--gold);">${Number(st.bounties_claimed || 0).toLocaleString()}</div></div>
+          <div class="stat-tile"><div class="stat-tile-label">Contraband Moved</div><div class="stat-tile-val" style="color: var(--purple);">${Number(st.contraband_sold || 0).toLocaleString()} T</div></div>
+        `;
+      }
 
       // Ranks
       const rContainer = document.getElementById('ranks-progression-list');
@@ -7834,9 +8220,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         rHtml += `
           <div style="background: var(--bg2); border-left: 3px solid ${r.color}; border-radius: 4px; padding: 8px 12px; display: flex; justify-content: space-between; align-items: center;">
             <div>
-              <span style="color: ${r.color}; font-weight: 700;">${r.insignia} ${r.name}</span>
+              <span style="color: ${r.color}; font-weight: 700;">${escHtml(r.insignia)} ${escHtml(r.name)}</span>
               <span style="font-size: 11px; color: var(--fg-dim); margin-left: 6px;">(${r.renown.toLocaleString()} Renown)</span>
-              <div style="font-size: 11px; color: var(--fg-dim);">${r.perk}</div>
+              <div style="font-size: 11px; color: var(--fg-dim);">${escHtml(r.perk)}</div>
             </div>
             ${isCurrent ? '<span class="pill pill-cyan">ACTIVE</span>' : ''}
           </div>
@@ -7852,9 +8238,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const repColor = rep >= 15 ? 'var(--green)' : (rep <= -15 ? 'var(--red)' : 'var(--fg-dim)');
         fHtml += `
           <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 6px; padding: 8px 12px;">
-            <div style="font-weight: 700; font-size: 12px;">${faction}</div>
+            <div style="font-weight: 700; font-size: 12px;">${escHtml(faction)}</div>
             <div style="display: flex; justify-content: space-between; font-size: 11px; margin-top: 4px;">
-              <span style="color: ${repColor}; font-weight: 700;">${standing}</span>
+              <span style="color: ${repColor}; font-weight: 700;">${escHtml(standing)}</span>
               <span style="font-family: var(--font-mono); color: var(--fg-dim);">${rep > 0 ? '+' : ''}${rep}</span>
             </div>
           </div>
@@ -7869,8 +8255,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         aHtml += `
           <div style="background: var(--bg2); border: 1px solid ${ach.unlocked ? 'var(--gold)' : 'var(--panel-border)'}; border-radius: 6px; padding: 8px; text-align: center; opacity: ${ach.unlocked ? '1' : '0.4'};">
             <div style="font-size: 18px; margin-bottom: 2px;">${ach.unlocked ? '🏆' : '🔒'}</div>
-            <div style="font-size: 11px; font-weight: 700; color: ${ach.unlocked ? 'var(--gold)' : 'var(--fg)'};">${ach.title}</div>
-            <div style="font-size: 9px; color: var(--fg-dim); margin-top: 2px;">${ach.desc}</div>
+            <div style="font-size: 11px; font-weight: 700; color: ${ach.unlocked ? 'var(--gold)' : 'var(--fg)'};">${escHtml(ach.title)}</div>
+            <div style="font-size: 9px; color: var(--fg-dim); margin-top: 2px;">${escHtml(ach.desc)}</div>
           </div>
         `;
       });
@@ -8065,6 +8451,34 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('combat-enemy-shield-val').textContent = `${c.enemy_shield} / ${c.enemy_max_shield}`;
       document.getElementById('combat-enemy-shield-bar').style.width = c.enemy_max_shield > 0 ? `${(c.enemy_shield / c.enemy_max_shield) * 100}%` : '0%';
 
+      // Status pills strip (player tactical bonuses & enemy damaged modules)
+      const strip = document.getElementById('combat-status-strip');
+      if (strip) {
+        const pills = [];
+        const hasBats = c.has_battery_weapons !== false;
+        pills.push(`<span class="pill ${hasBats ? 'pill-cyan' : 'pill-red'}">${hasBats ? `⚡ ${c.battery_count || 1} Battery Armed` : '⚠️ No Laser/Cannon Battery'}</span>`);
+        if (c.player_evasion_pct != null) pills.push(`<span class="pill pill-green">Dodge: ${c.player_evasion_pct}%</span>`);
+        if (c.drones_active) pills.push(`<span class="pill pill-purple">🛸 Drones Active</span>`);
+        if (c.evasive_active) pills.push(`<span class="pill pill-cyan">💫 Evasive Pattern</span>`);
+        if (p.weapons_damaged) pills.push(`<span class="pill pill-red">Player Weapons Damaged</span>`);
+        if (p.engines_damaged) pills.push(`<span class="pill pill-red">Player Thrusters Damaged</span>`);
+        if (p.shields_damaged) pills.push(`<span class="pill pill-red">Player Shields Offline</span>`);
+        if (c.enemy_weapons_damaged) pills.push(`<span class="pill pill-gold">Enemy Weapons Damaged</span>`);
+        if (c.enemy_engines_damaged) pills.push(`<span class="pill pill-gold">Enemy Thrusters Crippled</span>`);
+        if (c.enemy_emitters_fried) pills.push(`<span class="pill pill-gold">Enemy Emitters Fried</span>`);
+        strip.innerHTML = pills.join('');
+      }
+
+      // Battery-gated action buttons (do not let torpedo-only rigs burn turns)
+      const noBats = (c.has_battery_weapons === false);
+      ['btn-combat-fire', 'btn-combat-target-weapons', 'btn-combat-target-engines', 'btn-combat-target-shields'].forEach(id => {
+        const b = document.getElementById(id);
+        if (b) {
+          b.disabled = noBats;
+          b.title = noBats ? 'Requires a mounted laser or cannon battery (only Torpedoes/Warp available)' : '';
+        }
+      });
+
       // Torpedo Button
       document.getElementById('btn-combat-missile').textContent = `🚀 Fire Torpedo (${c.player_missiles} left)`;
       document.getElementById('btn-combat-missile').disabled = (c.player_missiles <= 0);
@@ -8078,6 +8492,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const evadeBtn = document.getElementById('btn-combat-evade');
       if (evadeBtn) {
         evadeBtn.disabled = !c.can_flee;
+        evadeBtn.textContent = c.evasive_active ? '💫 Evasive Active' : '💫 Evasive Maneuvers';
         evadeBtn.title = c.can_flee ? 'Halve the accuracy of the next enemy volley' : 'Thrusters damaged — no evasive work possible';
       }
 
@@ -8316,13 +8731,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // --- Amount Input Modal (bank / stocks) ---
     let amountModalAction = null;
     let amountModalPayload = {};
+    let amountModalMaxValue = null;
 
-    function openAmountModal(title, hint, confirmLabel, defaultValue, action, payload = {}) {
+    function openAmountModal(title, hint, confirmLabel, defaultValue, action, payload = {}, maxValue = null) {
       amountModalAction = action;
       amountModalPayload = payload;
+      amountModalMaxValue = (typeof maxValue === 'number' && maxValue > 0) ? Math.floor(maxValue) : null;
       document.getElementById('amount-modal-title').textContent = title;
       document.getElementById('amount-modal-hint').textContent = hint;
       document.getElementById('amount-modal-confirm').textContent = confirmLabel;
+      const maxBtn = document.getElementById('amount-modal-max-btn');
+      if (maxBtn) {
+        if (amountModalMaxValue !== null) {
+          maxBtn.style.display = 'inline-block';
+          maxBtn.textContent = `Max (${amountModalMaxValue.toLocaleString()})`;
+        } else {
+          maxBtn.style.display = 'none';
+        }
+      }
       const input = document.getElementById('amount-modal-input');
       input.value = defaultValue;
       showModal('amount-modal');
@@ -8333,10 +8759,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
       hideModal('amount-modal');
       amountModalAction = null;
       amountModalPayload = {};
+      amountModalMaxValue = null;
     }
 
     function setAmountModalValue(v) {
       document.getElementById('amount-modal-input').value = v;
+    }
+
+    function setAmountModalMax() {
+      if (amountModalMaxValue !== null) {
+        document.getElementById('amount-modal-input').value = amountModalMaxValue;
+      }
     }
 
     function confirmAmountModal() {
@@ -8353,42 +8786,47 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     // --- Bank prompt replacements ---
     function promptDeposit() {
+      const maxDep = gameState.player.credits;
       openAmountModal('🏦 Deposit to Savings',
-        `Available credits: ${gameState.player.credits.toLocaleString()} CR. Savings earn ${gameState.economy.savings_rate_pct}% daily on the first ${gameState.economy.savings_interest_cap.toLocaleString()} CR.`,
-        'Deposit Credits', Math.min(500, gameState.player.credits),
-        'bank_deposit', { key: 'amount' });
+        `Available credits: ${maxDep.toLocaleString()} CR. Savings earn ${gameState.economy.savings_rate_pct}% daily on the first ${gameState.economy.savings_interest_cap.toLocaleString()} CR.`,
+        'Deposit Credits', Math.max(1, Math.min(500, maxDep)),
+        'bank_deposit', { key: 'amount' }, maxDep);
     }
     function promptWithdraw() {
+      const maxW = gameState.player.savings;
       openAmountModal('🏦 Withdraw from Savings',
-        `Savings balance: ${gameState.player.savings.toLocaleString()} CR.`,
-        'Withdraw Credits', Math.min(500, gameState.player.savings),
-        'bank_withdraw', { key: 'amount' });
+        `Savings balance: ${maxW.toLocaleString()} CR.`,
+        'Withdraw Credits', Math.max(1, Math.min(500, maxW)),
+        'bank_withdraw', { key: 'amount' }, maxW);
     }
     function promptBorrow() {
+      const maxB = Math.max(0, gameState.player.loan_limit - gameState.player.loan);
       openAmountModal('🏦 Borrow from First Galactic Bank',
-        `Credit limit remaining: ${(gameState.player.loan_limit - gameState.player.loan).toLocaleString()} CR at ${gameState.player.effective_interest_rate}% daily interest.`,
-        'Borrow Funds', 1000,
-        'bank_borrow', { key: 'amount' });
+        `Credit limit remaining: ${maxB.toLocaleString()} CR at ${gameState.player.effective_interest_rate}% daily interest.`,
+        'Borrow Funds', Math.max(1, Math.min(1000, maxB || 1000)),
+        'bank_borrow', { key: 'amount' }, maxB);
     }
     function promptRepay() {
+      const maxR = Math.min(gameState.player.loan, gameState.player.credits);
       openAmountModal('🏦 Repay Loan',
-        `Outstanding debt: ${gameState.player.loan.toLocaleString()} CR. On-time repayments boost your credit score.`,
-        'Repay Loan', Math.min(1000, gameState.player.loan),
-        'bank_repay', { key: 'amount' });
+        `Outstanding debt: ${gameState.player.loan.toLocaleString()} CR. Repayments of 1,000+ CR improve your credit score.`,
+        'Repay Loan', Math.max(1, Math.min(1000, maxR)),
+        'bank_repay', { key: 'amount' }, maxR);
     }
     function tradeStock(symbol, mode) {
       const stk = gameState.all_stocks.find(s => s.symbol === symbol);
       if (!stk) return;
       if (mode === 'buy') {
+        const maxBuy = Math.floor(gameState.player.credits / Math.max(1, stk.price));
         openAmountModal(`📊 Buy ${stk.symbol} Shares`,
           `Current price: ${stk.price.toFixed(2)} CR/share. You hold ${stk.shares_owned} shares.`,
-          'Buy Shares', 5,
-          'buy_stock', { key: 'qty', symbol });
+          'Buy Shares', Math.max(1, Math.min(5, maxBuy || 1)),
+          'buy_stock', { key: 'qty', symbol }, maxBuy);
       } else {
         openAmountModal(`📊 Sell ${stk.symbol} Shares`,
           `Current price: ${stk.price.toFixed(2)} CR/share. You hold ${stk.shares_owned} shares.`,
-          'Sell Shares', Math.min(5, stk.shares_owned),
-          'sell_stock', { key: 'qty', symbol });
+          'Sell Shares', Math.max(1, Math.min(5, stk.shares_owned)),
+          'sell_stock', { key: 'qty', symbol }, stk.shares_owned);
       }
     }
 
@@ -8755,10 +9193,12 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "enemy_max_shield": c.enemy_max_shield,
             "enemy_weapons_damaged": c.enemy_weapons_damaged,
             "enemy_engines_damaged": c.enemy_engines_damaged,
+            "enemy_emitters_fried": c.enemy_emitters_fried,
             "personality": c.personality,
             "personality_desc": ENEMY_PERSONALITIES.get(c.personality, ""),
             "turn_count": c.turn_count,
             "drones_active": c.drones_active,
+            "evasive_active": c.evasive_until_turn >= c.turn_count,
             "combat_log": c.combat_log[-12:],
             "is_finished": c.is_finished,
             "player_won": c.player_won,
@@ -8771,6 +9211,12 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "can_flee": c.can_flee(),
             "player_missiles": c.player_missiles(),
             "has_drone_bay": engine.player.has_drone_bay(),
+            "has_battery_weapons": engine.player.has_battery_weapons(),
+            "battery_count": sum(
+                1 for wid in engine.player.equipped_weapons
+                if EQUIPMENT_ITEMS.get(wid) and EQUIPMENT_ITEMS[wid].damage > 0
+            ),
+            "player_evasion_pct": int(round(engine.player.evasion_chance() * 100)),
             "is_bounty": c.is_bounty,
             "bounty_reward": c.bounty_reward,
             "threat_level": c.threat_level(),
@@ -8881,6 +9327,10 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "total_daily_wages": int(engine.total_daily_wages()),
             "active_missions": active_missions,
             "stocks_owned": player.stocks_owned,
+            "stock_portfolio_value": sum(
+                int(engine.stocks[sym].price * q)
+                for sym, q in player.stocks_owned.items() if sym in engine.stocks
+            ),
             "achievements": list(player.achievements),
             "stats": player.stats,
             "net_worth": net_worth,
@@ -8895,6 +9345,7 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "has_drone_bay": player.has_drone_bay(),
             "has_deep_scanner": player.has_module("deep_scanner"),
             "has_missile_rack": player.has_missile_rack(),
+            "has_battery_weapons": player.has_battery_weapons(),
             "max_jump_range": round(engine.max_jump_range(), 1),
             "visited_count": len(player.visited),
             "total_planets": len(engine.planets),
@@ -9201,6 +9652,33 @@ def handle_action(session: GameSession, data: Dict[str, Any]) -> Dict[str, Any]:
                 else:
                     success, message = False, "Combat is still in progress."
 
+        elif action == "engage_bounty":
+            mid = _arg(data, "mission_id", "str", "")
+            bounty_m = next(
+                (m for m in engine.player.active_missions
+                 if m.id == mid and m.m_type == "bounty"
+                 and not m.completed and not m.failed),
+                None,
+            )
+            if not bounty_m:
+                success, message = False, "Active bounty contract not found."
+            elif bounty_m.destination != engine.current_planet.name:
+                success, message = False, f"Fly to {bounty_m.destination} to intercept {bounty_m.bounty_target_name}."
+            else:
+                enc_b = {
+                    "type": "bounty_combat",
+                    "title": f"Bounty Target Intercepted: {bounty_m.bounty_target_name}!",
+                    "target_name": bounty_m.bounty_target_name,
+                    "target_ship": bounty_m.bounty_target_ship,
+                    "mission_id": bounty_m.id,
+                    "reward": bounty_m.reward_credits,
+                }
+                session.active_combat = start_combat(engine, enc_b)
+                success = True
+                sound = "alarm"
+                message = f"Intercepted bounty target {bounty_m.bounty_target_name}!"
+                logs.append(message)
+
         elif action in ENGINE_ACTIONS:
             method, arg_specs, ok_sound = ENGINE_ACTIONS[action]
             args = [_arg(data, key, kind, default) for key, kind, default in arg_specs]
@@ -9269,9 +9747,13 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         if content_type.startswith("text/html"):
             self.send_header("Content-Security-Policy", HTML_CSP)
+        if status >= 400:
+            self.close_connection = True
+            self.send_header("Connection", "close")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+        self.wfile.flush()
 
     def _json(self, payload: Dict[str, Any], status: int = 200) -> None:
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status)
@@ -9412,6 +9894,19 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
             return
         if length > MAX_BODY_BYTES:
             self._fail(413, "Request body too large.")
+            # Half-close write side and drain bounded unread payload so Linux
+            # TCP close() does not send an RST before the client reads the 413 JSON.
+            try:
+                self.connection.shutdown(socket.SHUT_WR)
+                self.connection.settimeout(0.1)
+                remaining = min(length, MAX_BODY_BYTES * 2)
+                while remaining > 0:
+                    chunk = self.rfile.read1(min(8192, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+            except OSError:
+                pass
             return
 
         try:
@@ -9870,7 +10365,7 @@ def run_self_test() -> None:
         e_ins.new_game("Insured", "normal")
         e_ins.player.insurance_active = True
         e_ins.player.cargo["food"] = 5
-        enc2 = {"enemy_name": "Executioner", "enemy_ship": "leviathan", "type": "pirate_ambush"}
+        enc2 = {"enemy_name": "Executioner", "enemy_ship": "behemoth", "type": "pirate_ambush"}
         combat2 = start_combat(e_ins, enc2)
         combat2._handle_player_death()
         check("insurance triggers instead of death", combat2.insurance_used)
@@ -10016,7 +10511,7 @@ def run_self_test() -> None:
         print("\n--- 20. Death & deep scanner ---")
         e_dth = GameEngine(muted=True)
         e_dth.new_game("Doomed", "normal")
-        enc_dth = {"enemy_name": "Executioner", "enemy_ship": "leviathan", "type": "pirate_ambush"}
+        enc_dth = {"enemy_name": "Executioner", "enemy_ship": "behemoth", "type": "pirate_ambush"}
         combat_dth = start_combat(e_dth, enc_dth)
         combat_dth._handle_player_death()
         check("death sets engine game-over flag", e_dth.is_game_over)
