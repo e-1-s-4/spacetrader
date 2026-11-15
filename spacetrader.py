@@ -95,11 +95,12 @@ PLAYER_MISSILE_CAP = 8
 BASE_SPREAD = 0.05          # 5% station markup/markdown at Normal difficulty
 MAX_ACTIVE_MISSIONS = 5
 MAX_CREW = 4
-SAVE_VERSION = 5
+SAVE_VERSION = 6
 PRICE_HISTORY_LEN = 10       # days kept per commodity for the sparkline charts
 HOF_FILENAME = "st_odyssey_scores.json"   # persistent Hall of Fame flight records
 HOF_MAX_ENTRIES = 10
 GIFT_MIN = 500               # minimum diplomatic gift
+BANKRUPTCY_GRACE_DAYS = 5    # consecutive insolvent days before foreclosure
 MIN_SPREAD = 0.01            # a station always keeps at least a 1% edge per side
 MIN_ROUTE_MARGIN_CR = 3     # trade advisor: absolute floor on a route's margin
 MIN_ROUTE_MARGIN_PCT = 0.05  # ...and a proportional floor (5% of the buy price)
@@ -1092,6 +1093,7 @@ def generate_mission_board(
     day: int,
     career_tier: int = 0,
     exclude_bounty_names: Optional[Set[str]] = None,
+    ship_speed: float = 1.0,
 ) -> List[Mission]:
     """Build the contract board. career_tier (0-2) enriches rewards with rank."""
     missions: List[Mission] = []
@@ -1101,6 +1103,7 @@ def generate_mission_board(
 
     # Career tier sweetens the pot for proven captains.
     tier_mult = 1.0 + 0.12 * clamp(career_tier, 0, 2)
+    eff_speed = max(0.5, float(ship_speed))
 
     def new_id(prefix: str) -> str:
         # Suffix with a unique token: two boards generated the same day could
@@ -1111,6 +1114,11 @@ def generate_mission_board(
     def pick_dst() -> Planet:
         return random.choice(dest_candidates)
 
+    def reachable_days(dist: float, raw_days: int, min_floor: int) -> int:
+        # Ensure contracts are physically completable on slower hulls (+2d slack).
+        direct_days = max(1, int(dist * 0.55 / eff_speed))
+        return max(min_floor, raw_days, direct_days + 2)
+
     # 1. Cargo deliveries — one or two per board.
     for _ in range(random.choice([1, 2, 2])):
         dst = pick_dst()
@@ -1118,7 +1126,7 @@ def generate_mission_board(
         good = random.choice(legal_goods)
         qty = random.randint(5, 18)
         dist = math.hypot(current_planet.x - dst.x, current_planet.y - dst.y)
-        days_allowed = max(3, int(dist * 0.8) + 3)
+        days_allowed = reachable_days(dist, int(dist * 0.8) + 3, 3)
         reward = int((COMMODITIES[good].base_price * qty * 1.65 + dist * 120) * tier_mult)
 
         missions.append(Mission(
@@ -1143,7 +1151,7 @@ def generate_mission_board(
         c_good = random.choice(["weapons", "narcotics", "ai_cores"])
         c_qty = random.randint(3, 10)
         c_dist = math.hypot(current_planet.x - dst_smug.x, current_planet.y - dst_smug.y)
-        c_days = max(4, int(c_dist * 0.7) + 2)
+        c_days = reachable_days(c_dist, int(c_dist * 0.7) + 2, 4)
         c_reward = int((COMMODITIES[c_good].base_price * c_qty * 2.8 + c_dist * 190) * tier_mult)
 
         missions.append(Mission(
@@ -1158,8 +1166,8 @@ def generate_mission_board(
             bounty_target_ship=None,
             reward_credits=c_reward,
             days_left=c_days,
-            desc=f"Discreetly sneak {c_qty}x {COMMODITIES[c_good].name} into {dst_smug.name}. "
-                 f"Evade customs scans!"
+            desc=f"Discreetly sneak {c_qty}x {COMMODITIES[c_good].name} into {dst_smug.name} "
+                 f"within {c_days} days. Evade customs scans!"
         ))
 
     # 3. Bounty
@@ -1171,7 +1179,7 @@ def generate_mission_board(
     b_ship = random.choice(bounty_ships)
     b_dist = math.hypot(current_planet.x - dst_bounty.x, current_planet.y - dst_bounty.y)
     b_reward = int(random.randint(5_000, 13_000) * tier_mult)
-    b_days = max(5, int(b_dist) + 5)
+    b_days = reachable_days(b_dist, int(b_dist) + 5, 5)
 
     missions.append(Mission(
         id=new_id("bounty"),
@@ -1195,6 +1203,7 @@ def generate_mission_board(
     med_qty = random.randint(6, 14)
     med_reward = int((75 * med_qty * 2.4 + 900) * tier_mult)
     med_dist = math.hypot(current_planet.x - dst_med.x, current_planet.y - dst_med.y)
+    med_days = reachable_days(med_dist, int(med_dist * 0.7) + 2, 3)
 
     missions.append(Mission(
         id=new_id("med"),
@@ -1207,8 +1216,8 @@ def generate_mission_board(
         bounty_target_name=None,
         bounty_target_ship=None,
         reward_credits=med_reward,
-        days_left=max(3, int(med_dist * 0.7) + 2),
-        desc=f"Outbreak reported on {dst_med.name}! Rush {med_qty}x Bio-Vaccines to save lives."
+        days_left=med_days,
+        desc=f"Outbreak reported on {dst_med.name}! Rush {med_qty}x Bio-Vaccines within {med_days} days to save lives."
     ))
 
     # 5. VIP passenger charter — no cargo bay required.
@@ -1217,7 +1226,7 @@ def generate_mission_board(
         passengers = random.randint(1, 6)
         psg_dist = math.hypot(current_planet.x - dst_psg.x, current_planet.y - dst_psg.y)
         psg_reward = int((900 * passengers + psg_dist * 150 + 400) * tier_mult)
-        psg_days = max(3, int(psg_dist * 0.6) + 3)
+        psg_days = reachable_days(psg_dist, int(psg_dist * 0.6) + 3, 3)
 
         missions.append(Mission(
             id=new_id("psg"),
@@ -1379,6 +1388,10 @@ class Player:
     hired_crew: List[str] = field(default_factory=list)
     active_missions: List[Mission] = field(default_factory=list)
     stocks_owned: Dict[str, int] = field(default_factory=dict)
+    stocks_cost_basis: Dict[str, float] = field(default_factory=dict)
+    stock_profit: int = 0
+    insolvency_days: int = 0
+    unpaid_wage_days: int = 0
     achievements: Set[str] = field(default_factory=set)
     stats: Dict[str, int] = field(default_factory=lambda: dict(DEFAULT_STATS))
     net_worth_history: List[int] = field(default_factory=lambda: [STARTING_CREDITS])
@@ -1545,17 +1558,14 @@ class GameEngine:
         self.available_missions: List[Mission] = []
         self.news_feed: List[str] = []
         self.is_game_over = False
+        self.game_over_reason: str = ""
         self.victory_achieved = False
         self.last_result: str = ""
         self._hof_recorded: bool = False
 
         self.apply_difficulty_start()
-        for p in self.planets.values():
-            p.generate_market()
-        self.available_missions = generate_mission_board(
-            self.current_planet, list(self.planets.values()), self.player.day,
-            career_tier=self.career_tier(),
-        )
+        self._warm_up_markets()
+        self._refresh_mission_board()
         self.recalculate_ship_stats()
         self.player.hull = self.player.max_hull
         self.player.shield = self.player.max_shield
@@ -1575,6 +1585,46 @@ class GameEngine:
         self.player.credits = self.difficulty.starting_credits
         self.player.net_worth_history = [self.difficulty.starting_credits]
 
+    def _refresh_mission_board(self) -> None:
+        """Rebuild the local contract board for the current system and hull speed."""
+        ship_speed = SHIP_TEMPLATES.get(
+            self.player.ship_id, SHIP_TEMPLATES[STARTING_SHIP]
+        ).speed
+        self.available_missions = generate_mission_board(
+            self.current_planet,
+            list(self.planets.values()),
+            self.player.day,
+            career_tier=self.career_tier(),
+            exclude_bounty_names={
+                m.bounty_target_name
+                for m in self.player.active_missions
+                if m.bounty_target_name
+            },
+            ship_speed=ship_speed,
+        )
+
+    @staticmethod
+    def _record_stock_price(stk: StockData, replace_last: bool = False) -> None:
+        """Append or replace today's equity price point while capping window length."""
+        if replace_last and stk.history:
+            stk.history[-1] = stk.price
+        else:
+            stk.history.append(stk.price)
+        if len(stk.history) > 30:
+            stk.history.pop(0)
+
+    def _warm_up_markets(self, days: int = 5) -> None:
+        """Seed pre-launch market & equity history so charts and trends work on Day 1."""
+        for _ in range(days):
+            for p in self.planets.values():
+                p.generate_market(days_passed=1)
+                if p.active_event:
+                    p.active_event.fresh = False
+            for stk in self.stocks.values():
+                pct_chg = random.gauss(0.0, stk.volatility * 0.75)
+                stk.price = max(5.0, round(stk.price * (1.0 + pct_chg), 2))
+                self._record_stock_price(stk, replace_last=False)
+
     def new_game(self, name: str, difficulty_id: str) -> None:
         """Reset everything for a fresh run."""
         difficulty_id = difficulty_id if difficulty_id in DIFFICULTIES else "normal"
@@ -1590,15 +1640,12 @@ class GameEngine:
         self.available_missions = []
         self.news_feed = []
         self.is_game_over = False
+        self.game_over_reason = ""
         self.victory_achieved = False
         self.last_result = ""
         self._hof_recorded = False
-        for p in self.planets.values():
-            p.generate_market()
-        self.available_missions = generate_mission_board(
-            self.current_planet, list(self.planets.values()), self.player.day,
-            career_tier=self.career_tier(),
-        )
+        self._warm_up_markets()
+        self._refresh_mission_board()
         self.recalculate_ship_stats()
         self.player.hull = self.player.max_hull
         self.player.shield = self.player.max_shield
@@ -1702,7 +1749,8 @@ class GameEngine:
         self.player.shield = int(clamp(self.player.shield, 0, self.player.max_shield))
         self.player.fuel = int(clamp(self.player.fuel, 0, self.player.max_fuel))
 
-    def calculate_net_worth(self) -> int:
+    def gross_asset_value(self) -> int:
+        """Total market value of liquid credits, savings, cargo, equities, and hull/fittings."""
         p = self.current_planet
 
         cargo_val = sum(
@@ -1717,30 +1765,90 @@ class GameEngine:
 
         ship_val = SHIP_TEMPLATES[self.player.ship_id].cost
         eq_val = sum(
-            EQUIPMENT_ITEMS[w].cost
-            for w in self.player.equipped_weapons
-            if w in EQUIPMENT_ITEMS
-        )
-        eq_val += sum(
-            EQUIPMENT_ITEMS[s].cost
-            for s in self.player.equipped_shields
-            if s in EQUIPMENT_ITEMS
-        )
-        eq_val += sum(
-            EQUIPMENT_ITEMS[m].cost
-            for m in self.player.equipped_modules
-            if m in EQUIPMENT_ITEMS
+            EQUIPMENT_ITEMS[item_id].cost
+            for item_id in (
+                self.player.equipped_weapons
+                + self.player.equipped_shields
+                + self.player.equipped_modules
+            )
+            if item_id in EQUIPMENT_ITEMS
         )
 
-        total = (
+        return int(
             self.player.credits
             + self.player.savings
             + cargo_val
             + stocks_val
             + int((ship_val + eq_val) * 0.75)
-            - self.player.loan
         )
-        return max(0, int(total))
+
+    def calculate_net_worth(self) -> int:
+        return max(0, int(self.gross_asset_value() - self.player.loan))
+
+    def calculate_final_score(self, won: Optional[bool] = None) -> Dict[str, Any]:
+        """Compute itemized final score, rating grade, and career outcome."""
+        is_win = (
+            bool(won) if won is not None
+            else (self.victory_achieved or self.calculate_net_worth() >= TARGET_NET_WORTH)
+        )
+        nw = self.calculate_net_worth()
+        s = self.player.stats
+
+        wealth_points = nw // 25
+        deeds_points = (
+            s.get("missions_completed", 0) * 350
+            + s.get("pirates_defeated", 0) * 400
+            + s.get("bounties_claimed", 0) * 650
+            + len(self.player.achievements) * 500
+            + len(self.player.visited) * 200
+        )
+        speed_bonus = (
+            max(0, (365 - self.player.day) * 60)
+            if is_win
+            else min(self.player.day * 15, 1_500)
+        )
+        victory_bonus = 10_000 if is_win else 0
+        diff_mult = {
+            "easy": 0.85,
+            "normal": 1.00,
+            "hard": 1.25,
+            "nightmare": 1.60,
+        }.get(self.player.difficulty_id, 1.00)
+
+        raw_total = wealth_points + deeds_points + speed_bonus + victory_bonus
+        total_score = max(0, int(round(raw_total * diff_mult)))
+
+        if total_score >= 55_000:
+            grade = "S+"
+        elif total_score >= 40_000:
+            grade = "S"
+        elif total_score >= 28_000:
+            grade = "A"
+        elif total_score >= 18_000:
+            grade = "B"
+        elif total_score >= 9_000:
+            grade = "C"
+        else:
+            grade = "D"
+
+        if is_win:
+            outcome = "Mogul Victory"
+        elif self.is_game_over:
+            outcome = "Bankrupt" if self.game_over_reason == "bankruptcy" else "Destroyed"
+        else:
+            outcome = "In Progress"
+
+        return {
+            "net_worth": nw,
+            "wealth_points": wealth_points,
+            "deeds_points": deeds_points,
+            "speed_bonus": speed_bonus,
+            "victory_bonus": victory_bonus,
+            "difficulty_mult": diff_mult,
+            "total_score": total_score,
+            "grade": grade,
+            "outcome": outcome,
+        }
 
     def adjust_reputation(self, faction: str, delta: int) -> int:
         """Change standing with a faction, applying the Diplomat's perk, the
@@ -1845,6 +1953,8 @@ class GameEngine:
 
     def advance_day(self, days: int = 1) -> None:
         for _ in range(days):
+            if self.is_game_over:
+                break
             self.player.day += 1
 
             if self.player.loan > 0:
@@ -1863,11 +1973,27 @@ class GameEngine:
             if total_wages > 0:
                 if self.player.credits >= total_wages:
                     self.player.credits -= total_wages
+                    self.player.unpaid_wage_days = 0
                 else:
                     shortfall = total_wages - self.player.credits
                     self.player.credits = 0
                     self.player.loan += shortfall
+                    self.player.unpaid_wage_days += 1
                     self.add_news("Warning: unpaid crew wages were added to your loan.")
+                    if (self.player.unpaid_wage_days >= 2
+                            and self.player.loan > self.loan_limit()
+                            and self.player.hired_crew):
+                        resigned_id = max(
+                            self.player.hired_crew,
+                            key=lambda cid: CREW_INDEX[cid].daily_wage if cid in CREW_INDEX else 0,
+                        )
+                        self.player.hired_crew.remove(resigned_id)
+                        self.recalculate_ship_stats()
+                        self.player.unpaid_wage_days = 0
+                        crew_name = CREW_INDEX[resigned_id].name if resigned_id in CREW_INDEX else resigned_id
+                        self.add_news(f"Crew departure: {crew_name} resigned over unpaid wages!")
+            else:
+                self.player.unpaid_wage_days = 0
 
             # Daily regeneration
             repair_hp = 0
@@ -1905,9 +2031,7 @@ class GameEngine:
             for sym, stk in self.stocks.items():
                 pct_chg = random.gauss(0.0025, stk.volatility)
                 stk.price = max(5.0, round(stk.price * (1 + pct_chg), 2))
-                stk.history.append(stk.price)
-                if len(stk.history) > 30:
-                    stk.history.pop(0)
+                self._record_stock_price(stk, replace_last=False)
 
             # Market wire: occasional headline shocks move a random equity.
             if random.random() < 0.12:
@@ -1917,12 +2041,7 @@ class GameEngine:
                 stk.price = max(5.0, round(stk.price * (1 + shock), 2))
                 # Replace today's existing sample instead of appending a second
                 # one so shock days do not distort the history window.
-                if stk.history:
-                    stk.history[-1] = stk.price
-                else:
-                    stk.history.append(stk.price)
-                if len(stk.history) > 30:
-                    stk.history.pop(0)
+                self._record_stock_price(stk, replace_last=True)
                 direction = "soars" if shock > 0 else "tumbles"
                 self.add_news(
                     f"Market Wire: ${sym} ({stk.name.split()[0]}) {direction} "
@@ -1943,12 +2062,7 @@ class GameEngine:
                         stk.price = max(5.0, round(stk.price * (1 + bump), 2))
                         # Replace today's already-recorded point so same-day
                         # events do not insert an extra sample into history.
-                        if stk.history:
-                            stk.history[-1] = stk.price
-                        else:
-                            stk.history.append(stk.price)
-                        if len(stk.history) > 30:
-                            stk.history.pop(0)
+                        self._record_stock_price(stk, replace_last=True)
 
             expired: List[Mission] = []
             for m in self.player.active_missions:
@@ -1970,20 +2084,31 @@ class GameEngine:
                         lost_note = f" {lost}x {COMMODITIES[em.cargo_good].name} repossessed."
                 self.add_news(f"Mission failed: contract '{em.title}' expired!{lost_note}")
 
+            gross_assets = self.gross_asset_value()
+            if self.player.loan > self.loan_limit() * 2 and self.player.loan > gross_assets:
+                self.player.insolvency_days += 1
+                if self.player.insolvency_days >= BANKRUPTCY_GRACE_DAYS:
+                    self.is_game_over = True
+                    self.game_over_reason = "bankruptcy"
+                    self.add_news(
+                        "BANKRUPTCY FORECLOSURE: First Galactic Bank seized your vessel to cover defaulted debts."
+                    )
+                    self.record_hall_of_fame(won=False)
+                    self.sound.play("death")
+                    break
+                self.add_news(
+                    f"Debt Default Warning ({self.player.insolvency_days}/{BANKRUPTCY_GRACE_DAYS}): "
+                    f"repay debt or raise net assets before foreclosure!"
+                )
+            else:
+                self.player.insolvency_days = 0
+
         nw = self.calculate_net_worth()
         self.player.net_worth_history.append(nw)
         if len(self.player.net_worth_history) > 60:
             self.player.net_worth_history.pop(0)
 
-        self.available_missions = generate_mission_board(
-            self.current_planet,
-            list(self.planets.values()),
-            self.player.day,
-            career_tier=self.career_tier(),
-            exclude_bounty_names={
-                m.bounty_target_name for m in self.player.active_missions if m.bounty_target_name
-            },
-        )
+        self._refresh_mission_board()
         self.check_promotion()
         self.check_achievements()
 
@@ -2180,18 +2305,23 @@ class GameEngine:
     # ------------------------------------------------------------------ #
     # Station services
 
+    def fuel_unit_price(self, planet: Optional[Planet] = None) -> int:
+        p = planet or self.current_planet
+        return max(1, int(
+            p.fuel_price * self.difficulty.fuel_mult
+            * (1.0 - RANK_SERVICE_DISCOUNT[self.rank_index()])
+        ))
+
     @requires_alive
     def buy_fuel(self, amount: int) -> Tuple[bool, str]:
         if amount <= 0:
             return False, "Enter an amount greater than zero."
-        p = self.current_planet
         missing = self.player.max_fuel - self.player.fuel
         if missing <= 0:
             return False, "Fuel tank is already full."
 
         amount = min(amount, missing)
-        unit = max(1, int(p.fuel_price * self.difficulty.fuel_mult
-                          * (1.0 - RANK_SERVICE_DISCOUNT[self.rank_index()])))
+        unit = self.fuel_unit_price()
         cost = amount * unit
 
         if self.player.credits < cost:
@@ -2572,54 +2702,47 @@ class GameEngine:
                 return True, msg
         return False, "Contract not found in active missions."
 
+    def _complete_mission_payout(self, m: Mission, noun_prefix: str, reward_label: str) -> str:
+        cur_rank = self.rank()
+        bonus_mult = 1.0 + RANK_CONTRACT_BONUS[self.rank_index()]
+        payout = int(m.reward_credits * bonus_mult)
+        self.player.credits += payout
+        m.completed = True
+        if m in self.player.active_missions:
+            self.player.active_missions.remove(m)
+        self.player.stats["missions_completed"] += 1
+        dest_planet = self.planets.get(m.destination)
+        rep_note = ""
+        if dest_planet:
+            gain = self.adjust_reputation(dest_planet.faction, 5)
+            if gain:
+                rep_note = f" ({dest_planet.faction} standing +{gain})"
+        rank_note = (
+            "" if payout == m.reward_credits
+            else f" [{cur_rank.name}'s share +{money(payout - m.reward_credits)} CR]"
+        )
+        self.sound.play("victory")
+        return f"{noun_prefix} {reward_label}: {money(payout)} CR.{rank_note}{rep_note}"
+
     def check_mission_deliveries(self) -> List[str]:
         completed_msgs: List[str] = []
-        cur_rank = self.rank()
         for m in list(self.player.active_missions):
             if m.destination == self.player.location and not m.completed and not m.failed:
                 if m.m_type == "passenger":
                     # VIPs disembark on arrival — no cargo hand-over needed.
-                    bonus_mult = 1.0 + RANK_CONTRACT_BONUS[self.rank_index()]
-                    payout = int(m.reward_credits * bonus_mult)
-                    self.player.credits += payout
-                    m.completed = True
-                    self.player.active_missions.remove(m)
-                    self.player.stats["missions_completed"] += 1
-                    dest_planet = self.planets.get(m.destination)
-                    rep_note = ""
-                    if dest_planet:
-                        gain = self.adjust_reputation(dest_planet.faction, 5)
-                        if gain:
-                            rep_note = f" ({dest_planet.faction} standing +{gain})"
-                    rank_note = "" if payout == m.reward_credits else \
-                        f" [{cur_rank.name}'s share +{money(payout - m.reward_credits)} CR]"
                     completed_msgs.append(
-                        f"Passengers delivered: '{m.title}' complete! Fare: {money(payout)} CR."
-                        f"{rank_note}{rep_note}"
+                        self._complete_mission_payout(
+                            m, f"Passengers delivered: '{m.title}' complete!", "Fare"
+                        )
                     )
-                    self.sound.play("victory")
                 elif m.m_type in ("delivery", "smuggle", "medical"):
                     if m.cargo_good and self.player.cargo.get(m.cargo_good, 0) >= m.cargo_qty:
                         self._remove_cargo_tracked(m.cargo_good, m.cargo_qty)
-                        bonus_mult = 1.0 + RANK_CONTRACT_BONUS[self.rank_index()]
-                        payout = int(m.reward_credits * bonus_mult)
-                        self.player.credits += payout
-                        m.completed = True
-                        self.player.active_missions.remove(m)
-                        self.player.stats["missions_completed"] += 1
-                        dest_planet = self.planets.get(m.destination)
-                        rep_note = ""
-                        if dest_planet:
-                            gain = self.adjust_reputation(dest_planet.faction, 5)
-                            if gain:
-                                rep_note = f" ({dest_planet.faction} standing +{gain})"
-                        rank_note = "" if payout == m.reward_credits else \
-                            f" [{cur_rank.name}'s share +{money(payout - m.reward_credits)} CR]"
                         completed_msgs.append(
-                            f"Completed '{m.title}'! Received {money(payout)} CR reward."
-                            f"{rank_note}{rep_note}"
+                            self._complete_mission_payout(
+                                m, f"Completed '{m.title}'!", "Reward"
+                            )
                         )
-                        self.sound.play("victory")
         self.check_achievements()
         self.check_promotion()
         return completed_msgs
@@ -2669,6 +2792,9 @@ class GameEngine:
         self.player.location = dest.name
         self.player.mark_visited(dest.name)
         self.advance_day(days_cost)
+
+        if self.is_game_over:
+            return True, f"Bankruptcy foreclosure executed en route to {dest.name}.", None
 
         self.sound.play("warp")
         self.add_news(f"Arrived at {dest.name} in the {dest.faction} sector.")
@@ -3112,15 +3238,7 @@ class GameEngine:
         self.add_news(f"Wormhole transit: spat out at {dest.name}!")
         # The local contract board is planet-specific — regenerate it for the
         # new arrival system so the mission tab is not left empty.
-        self.available_missions = generate_mission_board(
-            self.current_planet,
-            list(self.planets.values()),
-            self.player.day,
-            career_tier=self.career_tier(),
-            exclude_bounty_names={
-                m.bounty_target_name for m in self.player.active_missions if m.bounty_target_name
-            },
-        )
+        self._refresh_mission_board()
         msgs = [f"The wormhole swallows your ship whole and vomits it out near {dest.name}!"]
         if random.random() < 0.3:
             dmg = random.randint(4, 12)
@@ -3233,7 +3351,7 @@ class GameEngine:
                     loose = self.player.sellable_cargo(good)
                     if loose <= 0:
                         continue
-                    stolen_qty += self.player.remove_cargo(good, min(
+                    stolen_qty += self._remove_cargo_tracked(good, min(
                         loose, random.randint(1, 3)))
                 self.sound.play("alarm")
                 msgs.append(f"Catastrophe — the hull shears back and a security drone "
@@ -3412,10 +3530,7 @@ class GameEngine:
         so the trade advisor and GUI never overstate fuel costs for senior
         officers.
         """
-        p = planet or self.current_planet
-        unit_price = max(1, int(p.fuel_price * self.difficulty.fuel_mult
-                                * (1.0 - RANK_SERVICE_DISCOUNT[self.rank_index()])))
-        return units * unit_price
+        return units * self.fuel_unit_price(planet)
 
     def compute_best_trade_routes(self, from_current_only: bool = False) -> List[Dict[str, Any]]:
         """Best cargo routes, priced with the SAME maths the market uses.
@@ -3607,8 +3722,14 @@ class GameEngine:
         if self.player.credits < cost:
             return False, f"Insufficient funds! Need {money(cost)} CR for {qty} shares."
 
+        old_qty = self.player.stocks_owned.get(symbol, 0)
+        old_basis = self.player.stocks_cost_basis.get(symbol, stk.price)
+        new_qty = old_qty + qty
+        new_basis = ((old_qty * old_basis) + cost) / max(1, new_qty)
+
         self.player.credits -= cost
-        self.player.stocks_owned[symbol] = self.player.stocks_owned.get(symbol, 0) + qty
+        self.player.stocks_owned[symbol] = new_qty
+        self.player.stocks_cost_basis[symbol] = round(new_basis, 2)
         self.sound.play("coin")
         msg = f"Bought {qty} shares of ${symbol} for {money(cost)} CR."
         self.announce(msg)
@@ -3626,13 +3747,43 @@ class GameEngine:
             return False, f"You own no shares of ${symbol}."
 
         income = int(math.floor(round(self.stocks[symbol].price * to_sell, 2)))
+        had_basis = symbol in self.player.stocks_cost_basis
+        basis = self.player.stocks_cost_basis.get(symbol, self.stocks[symbol].price)
+        realized = int(round(income - basis * to_sell))
+        if had_basis:
+            self.player.stock_profit += realized
+
         self.player.stocks_owned[symbol] = owned - to_sell
         if self.player.stocks_owned[symbol] <= 0:
             self.player.stocks_owned.pop(symbol, None)
+            self.player.stocks_cost_basis.pop(symbol, None)
 
         self.player.credits += income
         self.sound.play("sell")
-        msg = f"Sold {to_sell} shares of ${symbol} for {money(income)} CR."
+        pl_note = f" (P/L: {'+' if realized >= 0 else ''}{money(realized)} CR)" if had_basis else ""
+        msg = f"Sold {to_sell} shares of ${symbol} for {money(income)} CR{pl_note}."
+        self.announce(msg)
+        return True, msg
+
+    def can_declare_bankruptcy(self) -> bool:
+        return (
+            not self.is_game_over
+            and self.player.loan > 0
+            and (self.player.insolvency_days > 0 or self.player.loan > self.gross_asset_value())
+        )
+
+    @requires_alive
+    def declare_bankruptcy(self) -> Tuple[bool, str]:
+        if not self.can_declare_bankruptcy():
+            return False, "You are not insolvent — debt must exceed gross assets to file for bankruptcy."
+        self.is_game_over = True
+        self.game_over_reason = "bankruptcy"
+        self.add_news(
+            f"BANKRUPTCY FILED: {self.player.name} surrendered command under {money(self.player.loan)} CR debt."
+        )
+        self.record_hall_of_fame(won=False)
+        self.sound.play("death")
+        msg = "Bankruptcy declared. First Galactic Bank liquidated your vessel and ended your commission."
         self.announce(msg)
         return True, msg
 
@@ -3710,6 +3861,8 @@ class GameEngine:
         self.player.stats["odd_jobs_done"] += 1
         flavor = random.choice(self.ODD_JOB_FLAVOR)
         self.advance_day(1)
+        if self.is_game_over:
+            return True, "First Galactic Bank foreclosed on your vessel while you were off-shift."
         self.sound.play("coin")
         msg = (f"Dock shift complete: {flavor} Earned {money(wage)} CR "
                f"(one day passes).")
@@ -3791,10 +3944,14 @@ class GameEngine:
         if getattr(self, "_hof_recorded", False):
             return
         self._hof_recorded = True
+        fs = self.calculate_final_score(won=won)
         entry = {
             "name": self.player.name,
             "day": self.player.day,
             "net_worth": self.calculate_net_worth(),
+            "score": fs["total_score"],
+            "grade": fs["grade"],
+            "outcome": fs["outcome"],
             "rank": self.rank().name,
             "difficulty": self.difficulty.name,
             "won": bool(won),
@@ -3883,6 +4040,10 @@ class GameEngine:
                 "hired_crew": self.player.hired_crew,
                 "active_missions": [asdict(m) for m in self.player.active_missions],
                 "stocks_owned": self.player.stocks_owned,
+                "stocks_cost_basis": self.player.stocks_cost_basis,
+                "stock_profit": self.player.stock_profit,
+                "insolvency_days": self.player.insolvency_days,
+                "unpaid_wage_days": self.player.unpaid_wage_days,
                 "achievements": list(self.player.achievements),
                 "visited": sorted(self.player.visited),
                 "stats": self.player.stats,
@@ -3972,7 +4133,8 @@ class GameEngine:
             copy.deepcopy(self.player), copy.deepcopy(self.planets),
             copy.deepcopy(self.stocks), list(self.news_feed),
             list(self.available_missions), self.difficulty_id,
-            self.is_game_over, self.victory_achieved, self._hof_recorded,
+            self.is_game_over, self.game_over_reason,
+            self.victory_achieved, self._hof_recorded,
         )
 
         try:
@@ -4044,6 +4206,16 @@ class GameEngine:
                 k: int(q) for k, q in _as_dict(p_data.get("stocks_owned")).items()
                 if isinstance(k, str) and _is_num(q)
             }
+            self.player.stocks_cost_basis = {
+                k: float(b) for k, b in _as_dict(p_data.get("stocks_cost_basis")).items()
+                if k in self.stocks and _is_num(b) and b >= 0
+            }
+            raw_sp = p_data.get("stock_profit", 0)
+            self.player.stock_profit = int(raw_sp) if _is_num(raw_sp) else 0
+            raw_ins = p_data.get("insolvency_days", 0)
+            self.player.insolvency_days = int(raw_ins) if _is_num(raw_ins) else 0
+            raw_uwd = p_data.get("unpaid_wage_days", 0)
+            self.player.unpaid_wage_days = int(raw_uwd) if _is_num(raw_uwd) else 0
             self.player.achievements = set(_str_list(p_data.get("achievements")))
             saved_stats = dict(DEFAULT_STATS)
             for k, v in _as_dict(p_data.get("stats")).items():
@@ -4101,27 +4273,21 @@ class GameEngine:
                 self.player.highest_rank_index, self.rank_index())
 
             self.is_game_over = False
+            self.game_over_reason = ""
             self._sanitize_player()
             self.victory_achieved = (
                 self.calculate_net_worth() >= TARGET_NET_WORTH
                 or "nw_target" in self.player.achievements
             )
-            self.available_missions = generate_mission_board(
-                self.current_planet,
-                list(self.planets.values()),
-                self.player.day,
-                career_tier=self.career_tier(),
-                exclude_bounty_names={
-                    m.bounty_target_name for m in self.player.active_missions if m.bounty_target_name
-                },
-            )
+            self._refresh_mission_board()
             self.check_achievements()
             self.sound.play("buy")
             return True, f"Save slot '{slot}' loaded. Welcome back, {self.player.name}."
         except Exception as e:
             (self.player, self.planets, self.stocks, self.news_feed,
              self.available_missions, self.difficulty_id,
-             self.is_game_over, self.victory_achieved, self._hof_recorded) = backup
+             self.is_game_over, self.game_over_reason,
+             self.victory_achieved, self._hof_recorded) = backup
             return False, f"Failed to load save: {e}"
 
     @staticmethod
@@ -4250,12 +4416,22 @@ class GameEngine:
             if sym in self.stocks and qty > 0:
                 clean_stocks[sym] = qty
         p.stocks_owned = clean_stocks
+        p.stocks_cost_basis = {
+            sym: max(0.0, float(b))
+            for sym, b in p.stocks_cost_basis.items()
+            if sym in clean_stocks and _is_num(b)
+        }
+        p.insolvency_days = int(clamp(p.insolvency_days, 0, BANKRUPTCY_GRACE_DAYS))
+        p.unpaid_wage_days = max(0, int(p.unpaid_wage_days))
+        p.highest_rank_index = int(clamp(p.highest_rank_index, 0, len(RANKS) - 1))
         p.reputation = {
             f: int(clamp(v, REPUTATION_MIN, REPUTATION_MAX))
             for f, v in p.reputation.items()
         }
 
         self.recalculate_ship_stats()
+        # A live loaded vessel always starts with at least 1 hull point.
+        p.hull = int(clamp(p.hull, 1, p.max_hull))
 
         # A hold that no longer fits (edited save / changed fittings) sheds its
         # largest stacks until it does — contract cargo is shed last.
@@ -4425,6 +4601,11 @@ class CombatEncounter:
                 return "You have no missile launcher installed!"
             if p.missiles <= 0:
                 return "Missile magazines are empty! Buy more at the shipyard."
+        elif action == "drones":
+            if not p.has_drone_bay():
+                return "No drone bay installed! Purchase the Autonomous Drone Bay module."
+            if self.drones_active:
+                return "Drone wing is already deployed and attacking each turn."
         elif action == "evade":
             if p.engines_damaged:
                 return "Thrusters are too badly damaged for evasive work — hold the line!"
@@ -4787,6 +4968,7 @@ class CombatEncounter:
             return msgs
         self.player_dead = True
         self.engine.is_game_over = True
+        self.engine.game_over_reason = "destroyed"
         self.engine.record_hall_of_fame(won=False)
         self.engine.sound.play("death")
         return [
@@ -4942,7 +5124,8 @@ class CombatEncounter:
 
         if self.personality == "opportunist":
             roll = random.random()
-            if roll < 0.25 and p.cargo:
+            has_stealable = any(p.sellable_cargo(g) > 0 for g in p.cargo)
+            if roll < 0.25 and has_stealable:
                 msgs.extend(self._enemy_steal_cargo())
                 return msgs
             if roll < 0.45:
@@ -6337,8 +6520,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
               </div>
               <div id="bank-savings-desc" style="font-size: 12px; color: var(--fg-dim); margin-bottom: 12px;">Earns daily compound interest up to the reserve cap.</div>
               <div style="display: flex; gap: 8px;">
-                <button class="btn-action-sm btn-buy" onclick="promptDeposit()">Deposit Credits</button>
-                <button class="btn-action-sm btn-sell" onclick="promptWithdraw()">Withdraw Credits</button>
+                <button id="btn-bank-deposit" class="btn-action-sm btn-buy" onclick="promptDeposit()">Deposit Credits</button>
+                <button id="btn-bank-withdraw" class="btn-action-sm btn-sell" onclick="promptWithdraw()">Withdraw Credits</button>
               </div>
             </div>
 
@@ -6351,12 +6534,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <div style="font-size: 12px; color: var(--fg-dim); margin-bottom: 6px;">
                 Credit Score: <strong id="bank-credit-score" style="color: var(--cyan);">650</strong> · Limit: <strong id="bank-loan-limit" style="color: var(--fg);">10,000 CR</strong>
               </div>
-              <div style="font-size: 12px; color: var(--fg-dim); margin-bottom: 12px;">
+              <div style="font-size: 12px; color: var(--fg-dim); margin-bottom: 8px;">
                 Interest: <span id="bank-interest-rate">1.5%</span> / day. Repayments of 1,000+ CR improve your credit score (max 850).
               </div>
-              <div style="display: flex; gap: 8px;">
-                <button class="btn-action-sm btn-buy" onclick="promptBorrow()">Borrow Funds</button>
-                <button class="btn-action-sm btn-sell" onclick="promptRepay()">Repay Loan</button>
+              <div id="bank-insolvency-status" style="display: none; font-size: 11px; padding: 8px 10px; border-radius: 6px; margin-bottom: 10px; background: var(--red-dim); border: 1px solid var(--red); color: var(--red);"></div>
+              <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
+                <button id="btn-bank-borrow" class="btn-action-sm btn-buy" onclick="promptBorrow()">Borrow Funds</button>
+                <button id="btn-bank-repay" class="btn-action-sm btn-sell" onclick="promptRepay()">Repay Loan</button>
+                <button id="btn-bank-bankrupt" class="btn-action-sm" style="display: none; border-color: var(--red); color: var(--red);" onclick="toggleBankruptcyConfirm(true)">📉 File Bankruptcy</button>
+              </div>
+              <div id="bankruptcy-confirm-row" style="display: none; margin-top: 10px; padding: 10px; border-radius: 6px; background: var(--red-dim); border: 1px solid var(--red); font-size: 11px;">
+                <div style="color: var(--fg); margin-bottom: 8px;">Surrender vessel &amp; end your career in bankruptcy? This is permanent unless you reload a saved record.</div>
+                <div style="display: flex; gap: 8px;">
+                  <button class="btn-action-sm" style="background: var(--red); color: #fff; border-color: var(--red);" onclick="confirmBankruptcyFiling()">Confirm Bankruptcy</button>
+                  <button class="btn-action-sm" onclick="toggleBankruptcyConfirm(false)">Cancel</button>
+                </div>
               </div>
             </div>
 
@@ -6381,7 +6573,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <div class="panel-card-title">📊 Interstellar Securities Exchange</div>
               <div class="panel-card-subtitle">Trade equities in the solar system's top megacorporations.</div>
             </div>
-            <div id="stocks-portfolio-val" style="font-family: var(--font-mono); font-size: 13px; font-weight: 700; color: var(--gold);">Portfolio: 0 CR</div>
+            <div style="text-align: right;">
+              <div id="stocks-portfolio-val" style="font-family: var(--font-mono); font-size: 13px; font-weight: 700; color: var(--gold);">Portfolio: 0 CR</div>
+              <div id="stocks-realized-pl" style="font-family: var(--font-mono); font-size: 11px; color: var(--fg-dim);">Realized P/L: 0 CR</div>
+            </div>
           </div>
           <div id="stocks-cards" style="display: flex; flex-direction: column; gap: 12px;">
             <!-- Dynamically populated -->
@@ -6613,9 +6808,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <!-- Action Commands -->
       <div id="combat-actions-bar" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; margin-bottom: 16px;">
         <button class="btn-action-sm btn-buy" id="btn-combat-fire" onclick="sendCombatAction('fire')">⚡ Fire Batteries [F]</button>
-        <button class="btn-action-sm" id="btn-combat-target-weapons" onclick="sendCombatAction('target_weapons')">🎯 Target Weapons</button>
-        <button class="btn-action-sm" id="btn-combat-target-engines" onclick="sendCombatAction('target_engines')">🎯 Target Thrusters</button>
-        <button class="btn-action-sm" id="btn-combat-target-shields" onclick="sendCombatAction('target_shields')">🎯 Target Shields</button>
+        <button class="btn-action-sm" id="btn-combat-target-weapons" onclick="sendCombatAction('target_weapons')">🎯 Target Weapons [1]</button>
+        <button class="btn-action-sm" id="btn-combat-target-engines" onclick="sendCombatAction('target_engines')">🎯 Target Thrusters [2]</button>
+        <button class="btn-action-sm" id="btn-combat-target-shields" onclick="sendCombatAction('target_shields')">🎯 Target Shields [3]</button>
         <button class="btn-action-sm btn-sell" id="btn-combat-missile" onclick="sendCombatAction('missile')">🚀 Fire Torpedo [M]</button>
         <button class="btn-action-sm" id="btn-combat-drones" onclick="sendCombatAction('drones')">🛸 Deploy Drones [D]</button>
         <button class="btn-action-sm" id="btn-combat-recharge" onclick="sendCombatAction('recharge')">🛡️ Boost Capacitor [R]</button>
@@ -6736,7 +6931,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
         <div>
           <h4 style="color: var(--fg-dim); margin-bottom: 4px;">⌨️ Hotkeys & New Kit</h4>
-          <p><strong>1–9</strong> switch tabs · <strong>←/→</strong> move between tabs · <strong>F</strong> fire · <strong>M</strong> torpedo · <strong>R</strong> recharge · <strong>E</strong> evade · <strong>D</strong> drones · <strong>B</strong> board · <strong>W</strong> emergency warp · <strong>Esc</strong> closes dialogs (except the combat and vessel-loss screens). Every dialog traps keyboard focus and hands it back when it closes, and the star map can be flown entirely from the keyboard. New equipment worth saving for: the <em>Bussard Ram-Scoop</em> (free fuel daily) and the <em>Heavy Extraction Rig</em> (double mining yields).</p>
+          <p><strong>1–9</strong> switch tabs · <strong>←/→</strong> move between tabs · Combat: <strong>F</strong> fire · <strong>1/2/3</strong> target weapons/thrusters/shields · <strong>M</strong> torpedo · <strong>R</strong> recharge · <strong>E</strong> evade · <strong>D</strong> drones · <strong>B</strong> board · <strong>W</strong> emergency warp · <strong>Esc</strong> closes dialogs (except the combat and vessel-loss screens). Every dialog traps keyboard focus and hands it back when it closes, and the star map can be flown entirely from the keyboard. New equipment worth saving for: the <em>Bussard Ram-Scoop</em> (free fuel daily) and the <em>Heavy Extraction Rig</em> (double mining yields).</p>
         </div>
       </div>
     </div>
@@ -6745,15 +6940,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <!-- GAME OVER MODAL -->
   <div id="gameover-modal" class="generic-modal" role="dialog" aria-modal="true" aria-labelledby="gameover-modal-title">
     <div class="modal-box" style="text-align: center; border-color: var(--red);">
-      <div style="font-size: 48px; margin-bottom: 10px;">💀</div>
+      <div id="gameover-icon" style="font-size: 48px; margin-bottom: 10px;">💀</div>
       <h3 id="gameover-modal-title" style="color: var(--red); font-size: 22px; margin-bottom: 8px;">VESSEL DESTROYED</h3>
-      <p style="font-size: 13px; color: var(--fg-dim); margin-bottom: 20px; line-height: 1.6;">
+      <p id="gameover-desc" style="font-size: 13px; color: var(--fg-dim); margin-bottom: 14px; line-height: 1.6;">
         Your ship broke apart in the void. The sector remembers your final transmission.<br>
         Recovery options are available from your flight recorder archives.
       </p>
+      <div id="gameover-scorecard" style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px; margin-bottom: 16px; text-align: left; font-size: 12px;"></div>
       <div style="display: flex; flex-direction: column; gap: 10px;">
-        <button class="dossier-btn-engage" onclick="recoverSave('precombat')">⏪ Load Pre-Combat Snapshot</button>
-        <button class="dossier-btn-engage" style="background: var(--gold); color: #020514;" onclick="recoverSave('autosave')">💾 Load Last Autosave</button>
+        <button id="gameover-btn-precombat" class="dossier-btn-engage" onclick="recoverSave('precombat')">⏪ Load Pre-Combat Snapshot</button>
+        <button id="gameover-btn-autosave" class="dossier-btn-engage" style="background: var(--gold); color: #020514;" onclick="recoverSave('autosave')">💾 Load Last Autosave</button>
         <button class="hud-btn" style="justify-content: center; padding: 12px;" onclick="openNewGameModal()">🔄 Start New Career</button>
       </div>
     </div>
@@ -6764,10 +6960,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="modal-box" style="text-align: center; border-color: var(--gold); box-shadow: 0 0 60px rgba(255, 183, 3, 0.3);">
       <div style="font-size: 48px; margin-bottom: 10px;">🏆</div>
       <h3 id="victory-modal-title" style="color: var(--gold); font-size: 22px; margin-bottom: 8px;">GALACTIC MOGUL ACHIEVED</h3>
-      <p style="font-size: 13px; color: var(--fg-dim); margin-bottom: 20px; line-height: 1.6;">
+      <p style="font-size: 13px; color: var(--fg-dim); margin-bottom: 14px; line-height: 1.6;">
         Net worth has surpassed <strong style="color: var(--green);">500,000 CR</strong>!<br>
         The sector bows to your commercial empire, <strong id="victory-captain-name" style="color: var(--cyan);">Commander</strong>.
       </p>
+      <div id="victory-scorecard" style="background: var(--bg2); border: 1px solid var(--gold); border-radius: 8px; padding: 12px; margin-bottom: 16px; text-align: left; font-size: 12px;"></div>
       <div style="display: flex; flex-direction: column; gap: 10px;">
         <button class="dossier-btn-engage" style="background: var(--gold); color: #020514;" onclick="dismissVictory()">Continue Playing (Sandbox Mode)</button>
         <button class="hud-btn" style="justify-content: center; padding: 12px;" onclick="dismissVictory(); openNewGameModal();">🔄 Begin a New Career</button>
@@ -7472,8 +7669,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const eventBox = document.getElementById('dossier-event-box');
       if (planet.active_event) {
         eventBox.style.display = 'block';
-        document.getElementById('dossier-event-title').textContent = planet.active_event.name;
-        document.getElementById('dossier-event-desc').textContent = planet.active_event.desc;
+        const ev = planet.active_event;
+        document.getElementById('dossier-event-title').textContent = ev.name;
+        const goodPart = ev.good ? ` (${commodityName(ev.good)} ×${Number(ev.mult || 1).toFixed(2)}, ${ev.duration || 0}d left)` : '';
+        document.getElementById('dossier-event-desc').textContent = (ev.desc || '') + goodPart;
       } else {
         eventBox.style.display = 'none';
       }
@@ -7576,8 +7775,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (evBanner) {
         if (ev) {
           evBanner.style.display = 'block';
-          const goodLabel = ev.affected_good ? ` · ${commodityName(ev.affected_good)} ×${Number(ev.multiplier || 1).toFixed(2)}` : '';
-          evBanner.innerHTML = `⚡ <strong>${escHtml(ev.name)}:</strong> ${escHtml(ev.desc)}${escHtml(goodLabel)}`;
+          const evGood = ev.good || ev.affected_good;
+          const evMult = ev.mult != null ? ev.mult : ev.multiplier;
+          const goodLabel = evGood ? ` · ${commodityName(evGood)} ×${Number(evMult || 1).toFixed(2)}` : '';
+          const durLabel = ev.duration != null ? ` (${ev.duration}d remaining)` : '';
+          evBanner.innerHTML = `⚡ <strong>${escHtml(ev.name)}:</strong> ${escHtml(ev.desc)}${escHtml(goodLabel)}${escHtml(durLabel)}`;
         } else {
           evBanner.style.display = 'none';
         }
@@ -7995,7 +8197,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </div>
             <div style="text-align: right;">
               <div style="font-family: var(--font-mono); font-size: 14px; font-weight: 700; color: var(--gold);">${s.net_cost < 0 ? '+' + (-s.net_cost).toLocaleString() + ' CR refund' : s.net_cost.toLocaleString() + ' CR'}</div>
-              <div style="font-size: 10px; color: var(--fg-dim); margin-bottom: 6px;">(After ${s.trade_in_value.toLocaleString()} CR trade-in)</div>
+              <div style="font-size: 10px; color: var(--fg-dim); margin-bottom: 6px;">(After ${s.trade_in_value.toLocaleString()} CR trade-in${p.hull < p.max_hull ? ` · ${p.ship_trade_in_pct}% hull-prorated` : ''})</div>
               ${s.is_current ? '' : `<button class="btn-action-sm btn-buy" ${!s.can_afford ? 'disabled' : ''} onclick="sendAction('buy_ship', { ship_id: '${escJs(s.id)}' })">Commission</button>`}
             </div>
           </div>
@@ -8171,10 +8373,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
           : (m.m_type === 'passenger' && m.cargo_qty > 0
               ? `· <span style="color: var(--purple);">🧳 ${m.cargo_qty} Passenger${m.cargo_qty > 1 ? 's' : ''} (0 T)</span>`
               : '');
+        const tightEta = (m.est_days != null && m.est_days > m.days_left);
         aHtml += `
           <div style="background: var(--bg2); border: 1px solid ${urgent ? 'var(--red)' : 'var(--panel-border)'}; border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px;">
             <div>
-              <div style="font-weight: 700; color: var(--cyan);">${escHtml(m.title)} ${missionBadge(m.m_type)}</div>
+              <div style="font-weight: 700; color: var(--cyan);">${escHtml(m.title)} ${missionBadge(m.m_type)}${tightEta ? '<span class="pill pill-red" style="font-size: 9px; margin-left: 4px;">⚠ Tight ETA</span>' : ''}</div>
               <div style="font-size: 11px; color: var(--fg-dim);">${escHtml(m.desc)}</div>
               <div style="font-size: 11px; color: var(--fg); margin-top: 4px;">
                 Destination: <strong style="color: var(--gold);">${escHtml(m.destination)}</strong> · Deadline: <strong style="color: ${urgent ? 'var(--red)' : 'var(--fg)'};">${m.days_left} ${m.days_left === 1 ? 'day' : 'days'}</strong>
@@ -8195,6 +8398,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       let actHtml = '';
       p.active_missions.forEach(m => {
         const canDeliver = (m.destination === gameState.current_planet.name);
+        const tightEta = (!canDeliver && m.est_days != null && m.est_days > m.days_left);
         let actionControls = '';
         if (canDeliver && m.m_type === 'bounty') {
           actionControls = `<button class="btn-action-sm btn-buy" style="border-color: var(--red); color: var(--red); background: var(--red-dim);" onclick="sendAction('engage_bounty', { mission_id: '${escJs(m.id)}' })">⚔️ Engage Target</button>`;
@@ -8204,9 +8408,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
           actionControls = `<button class="btn-action-sm btn-buy" onclick="selectPlanet('${escJs(m.destination)}'); switchTab('map');">Plot Course</button>`;
         }
         actHtml += `
-          <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+          <div style="background: var(--bg2); border: 1px solid ${tightEta ? 'var(--red)' : 'var(--panel-border)'}; border-radius: 8px; padding: 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px;">
             <div>
-              <div style="font-weight: 700; color: var(--gold); font-size: 14px;">${escHtml(m.title)} ${missionBadge(m.m_type)}</div>
+              <div style="font-weight: 700; color: var(--gold); font-size: 14px;">${escHtml(m.title)} ${missionBadge(m.m_type)}${tightEta ? '<span class="pill pill-red" style="font-size: 9px; margin-left: 4px;">⚠ Tight ETA</span>' : ''}</div>
               <div style="font-size: 11px; color: var(--fg-dim); margin-top: 2px;">
                 ${m.m_type === 'bounty' ? 'Hunt target near' : 'Destination:'} <strong style="color: var(--cyan);">${escHtml(m.destination)}</strong> · Reward: <strong style="color: var(--green); font-family: var(--font-mono);">${m.reward_credits.toLocaleString()} CR</strong>
               </div>
@@ -8240,9 +8444,60 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('bank-loan-limit').textContent = p.loan_limit.toLocaleString() + ' CR';
       document.getElementById('bank-interest-rate').textContent = p.effective_interest_rate + '%';
 
+      const depBtn = document.getElementById('btn-bank-deposit');
+      if (depBtn) {
+        depBtn.disabled = p.credits <= 0;
+        depBtn.title = p.credits <= 0 ? 'No credits on hand to deposit' : '';
+      }
+      const wdBtn = document.getElementById('btn-bank-withdraw');
+      if (wdBtn) {
+        wdBtn.disabled = p.savings <= 0;
+        wdBtn.title = p.savings <= 0 ? 'Savings balance is 0 CR' : '';
+      }
+      const borBtn = document.getElementById('btn-bank-borrow');
+      if (borBtn) {
+        const remLimit = Math.max(0, p.loan_limit - p.loan);
+        borBtn.disabled = remLimit <= 0;
+        borBtn.title = remLimit <= 0 ? 'Credit limit reached' : '';
+      }
+      const repBtn = document.getElementById('btn-bank-repay');
+      if (repBtn) {
+        repBtn.disabled = p.loan <= 0 || p.credits <= 0;
+        repBtn.title = p.loan <= 0 ? 'No outstanding loan' : (p.credits <= 0 ? 'No credits to repay with' : '');
+      }
+
+      const insBox = document.getElementById('bank-insolvency-status');
+      const bankrBtn = document.getElementById('btn-bank-bankrupt');
+      const bankrConf = document.getElementById('bankruptcy-confirm-row');
+      if (insBox) {
+        if ((p.insolvency_days || 0) > 0) {
+          const grace = p.bankruptcy_grace_days || 5;
+          const rem = Math.max(0, grace - p.insolvency_days);
+          insBox.style.display = 'block';
+          insBox.textContent = `⚠ INSOLVENCY WARNING (${p.insolvency_days}/${grace} days): Debt (${p.loan.toLocaleString()} CR) exceeds Gross Assets (${(p.gross_asset_value || 0).toLocaleString()} CR). Foreclosure in ${rem} ${rem === 1 ? 'day' : 'days'}!`;
+        } else if (p.can_declare_bankruptcy) {
+          insBox.style.display = 'block';
+          insBox.textContent = `⚠ Debt (${p.loan.toLocaleString()} CR) exceeds Gross Assets (${(p.gross_asset_value || 0).toLocaleString()} CR). Repay debt or you may file for bankruptcy.`;
+        } else {
+          insBox.style.display = 'none';
+        }
+      }
+      if (bankrBtn) {
+        bankrBtn.style.display = p.can_declare_bankruptcy ? 'inline-block' : 'none';
+      }
+      if (bankrConf && !p.can_declare_bankruptcy) {
+        bankrConf.style.display = 'none';
+      }
+
       const portEl = document.getElementById('stocks-portfolio-val');
       if (portEl) {
         portEl.textContent = `Portfolio: ${(p.stock_portfolio_value || 0).toLocaleString()} CR`;
+      }
+      const plEl = document.getElementById('stocks-realized-pl');
+      if (plEl) {
+        const sp = Number(p.stock_profit || 0);
+        plEl.textContent = `Realized P/L: ${sp > 0 ? '+' : ''}${sp.toLocaleString()} CR`;
+        plEl.style.color = sp > 0 ? 'var(--green)' : (sp < 0 ? 'var(--red)' : 'var(--fg-dim)');
       }
 
       // Diplomatic gifts grid
@@ -8251,13 +8506,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         let gHtml = '';
         for (const [faction, rep] of Object.entries(p.reputation)) {
           const repColor = rep >= 15 ? 'var(--green)' : (rep <= -15 ? 'var(--red)' : 'var(--fg-dim)');
+          const canGift = p.credits >= 500;
           gHtml += `
             <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 6px; padding: 8px 10px; display: flex; justify-content: space-between; align-items: center; gap: 6px;">
               <div>
                 <div style="font-weight: 700; font-size: 11px;">${escHtml(faction)}</div>
                 <div style="font-size: 10px; color: ${repColor};">${escHtml(p.standing[faction])} (${rep > 0 ? '+' : ''}${rep})</div>
               </div>
-              <button class="btn-action-sm" style="color: var(--purple);" onclick="promptGift('${escJs(faction)}')">Gift</button>
+              <button class="btn-action-sm" style="color: var(--purple);" ${!canGift ? 'disabled title="Requires at least 500 CR"' : ''} onclick="promptGift('${escJs(faction)}')">Gift</button>
             </div>
           `;
         }
@@ -8290,6 +8546,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
           const y = 20 - ((val - minP) / span) * 16;
           return `${x.toFixed(1)},${y.toFixed(1)}`;
         }).join(' ');
+        let basisHtml = '';
+        if (stk.shares_owned > 0 && stk.avg_cost != null) {
+          const uPl = Number(stk.unrealized_pl || 0);
+          const uPct = Number(stk.unrealized_pct || 0);
+          const uCol = uPl >= 0 ? 'var(--green)' : 'var(--red)';
+          basisHtml = `<div style="font-size: 10px; font-family: var(--font-mono); color: var(--fg-dim); margin-top: 2px;">Avg Cost: ${stk.avg_cost.toFixed(2)} CR · P/L: <span style="color: ${uCol}; font-weight: 700;">${uPl > 0 ? '+' : ''}${uPl.toLocaleString()} CR (${uPct > 0 ? '+' : ''}${uPct}%)</span></div>`;
+        }
         html += `
           <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px; display: flex; justify-content: space-between; align-items: center; gap: 12px;">
             <div style="flex: 1;">
@@ -8301,6 +8564,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 Owned: <strong>${stk.shares_owned}</strong> shares
                 ${stk.shares_owned > 0 ? `<span style="color: var(--gold); font-family: var(--font-mono); margin-left: 6px;">(${(stk.total_value || 0).toLocaleString()} CR)</span>` : ''}
               </div>
+              ${basisHtml}
             </div>
             <div style="display: flex; align-items: center; gap: 12px;">
               <svg class="sparkline-svg" width="68" height="22" aria-hidden="true">
@@ -8319,6 +8583,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
         `;
       });
       sContainer.innerHTML = html;
+    }
+
+    function toggleBankruptcyConfirm(show) {
+      const row = document.getElementById('bankruptcy-confirm-row');
+      if (row) row.style.display = show ? 'block' : 'none';
+    }
+
+    function confirmBankruptcyFiling() {
+      toggleBankruptcyConfirm(false);
+      sendAction('declare_bankruptcy');
     }
 
     // (bank amount dialogs now live in the styled Amount Input Modal below)
@@ -8410,16 +8684,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
         let hHtml = '';
         hof.forEach((entry, idx) => {
           const medal = idx === 0 ? '🥇' : (idx === 1 ? '🥈' : (idx === 2 ? '🥉' : '·'));
+          const badge = entry.won
+            ? '<span class="pill pill-cyan" style="font-size:9px;">MOGUL</span>'
+            : (entry.outcome === 'Bankrupt'
+                ? '<span class="pill pill-red" style="font-size:9px;">BANKRUPT</span>'
+                : '<span class="pill pill-red" style="font-size:9px;">DESTROYED</span>');
+          const scoreLine = entry.score != null
+            ? `<div style="font-family: var(--font-mono); font-size: 10px; color: var(--cyan);">Score: ${Number(entry.score).toLocaleString()} (${escHtml(entry.grade || '—')})</div>`
+            : '';
           hHtml += `
             <div style="background: var(--bg2); border: 1px solid ${entry.won ? 'var(--gold)' : 'var(--panel-border)'}; border-radius: 6px; padding: 8px 12px; display: flex; justify-content: space-between; align-items: center;">
               <div style="display: flex; align-items: center; gap: 8px;">
                 <span style="font-size: 15px;">${medal}</span>
                 <div>
-                  <div style="font-weight: 700; font-size: 12px; color: ${entry.won ? 'var(--gold)' : 'var(--fg)'};">${escHtml(entry.name)} ${entry.won ? '<span class="pill pill-cyan" style="font-size:9px;">MOGUL</span>' : ''}</div>
+                  <div style="font-weight: 700; font-size: 12px; color: ${entry.won ? 'var(--gold)' : 'var(--fg)'};">${escHtml(entry.name)} ${badge}</div>
                   <div style="font-size: 10px; color: var(--fg-dim);">${escHtml(entry.rank)} · ${escHtml(entry.difficulty)} · Day ${entry.day} · ${escHtml(entry.achieved_at || '')}</div>
                 </div>
               </div>
-              <strong style="font-family: var(--font-mono); color: var(--gold);">${(entry.net_worth || 0).toLocaleString()} CR</strong>
+              <div style="text-align: right;">
+                <strong style="font-family: var(--font-mono); color: var(--gold);">${(entry.net_worth || 0).toLocaleString()} CR</strong>
+                ${scoreLine}
+              </div>
             </div>
           `;
         });
@@ -8661,7 +8946,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       // Drone Bay Button
       const droneBtn = document.getElementById('btn-combat-drones');
-      droneBtn.disabled = !c.has_drone_bay;
+      droneBtn.disabled = !c.has_drone_bay || c.drones_active;
+      droneBtn.title = !c.has_drone_bay
+        ? 'Requires an Autonomous Drone Bay module'
+        : (c.drones_active ? 'Drone wing already deployed in this engagement' : 'Launch interceptor drones');
       droneBtn.textContent = c.drones_active ? '🛸 Drones Active [D]' : '🛸 Deploy Drones [D]';
 
       // Evasive Maneuvers Button
@@ -8859,7 +9147,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     // --- New Game Dialog ---
     function openNewGameModal() {
+      const diffEl = document.getElementById('newgame-diff');
+      if (diffEl && gameState?.player?.difficulty_id) {
+        diffEl.value = gameState.player.difficulty_id;
+      }
       showModal('newgame-modal');
+      const nameEl = document.getElementById('newgame-name');
+      if (nameEl) setTimeout(() => nameEl.focus(), 50);
     }
     function closeNewGameModal() {
       hideModal('newgame-modal');
@@ -8883,9 +9177,50 @@ HTML_PAGE = r"""<!DOCTYPE html>
       hideModal('manual-modal');
     }
 
+    // --- Scoreboard Renderer ---
+    function renderScorecardHtml(fs, p) {
+      if (!fs) return '';
+      return `
+        <div style="display: flex; justify-content: space-between; align-items: center; padding-bottom: 8px; margin-bottom: 8px; border-bottom: 1px solid var(--panel-border);">
+          <div>
+            <div style="font-size: 11px; color: var(--fg-dim);">FINAL SCORE (${escHtml(fs.outcome || 'In Progress')})</div>
+            <div style="font-family: var(--font-mono); font-size: 20px; font-weight: 800; color: var(--gold);">${Number(fs.total_score || 0).toLocaleString()} PTS</div>
+          </div>
+          <div style="text-align: center; background: var(--bg); border: 1px solid var(--cyan); border-radius: 6px; padding: 6px 12px;">
+            <div style="font-size: 9px; color: var(--fg-dim);">GRADE</div>
+            <div style="font-family: var(--font-mono); font-size: 20px; font-weight: 800; color: var(--cyan);">${escHtml(fs.grade || 'D')}</div>
+          </div>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 11px; color: var(--fg-dim);">
+          <div>Net Worth: <strong style="color: var(--fg);">${Number(fs.net_worth || 0).toLocaleString()} CR</strong></div>
+          <div>Days Flown: <strong style="color: var(--fg);">${Number(p.day || 1)}</strong></div>
+          <div>Wealth Score: <strong style="color: var(--gold);">+${Number(fs.wealth_points || 0).toLocaleString()}</strong></div>
+          <div>Deeds &amp; Exploration: <strong style="color: var(--cyan);">+${Number(fs.deeds_points || 0).toLocaleString()}</strong></div>
+          <div>Speed / Victory: <strong style="color: var(--green);">+${(Number(fs.speed_bonus || 0) + Number(fs.victory_bonus || 0)).toLocaleString()}</strong></div>
+          <div>Difficulty Mult: <strong style="color: var(--purple);">×${Number(fs.difficulty_mult || 1).toFixed(2)}</strong></div>
+        </div>
+      `;
+    }
+
     // --- Game Over / Victory ---
     function checkGameOver() {
       if (gameState && gameState.player.is_game_over) {
+        const p = gameState.player;
+        const isBankrupt = p.game_over_reason === 'bankruptcy';
+        const iconEl = document.getElementById('gameover-icon');
+        const titleEl = document.getElementById('gameover-modal-title');
+        const descEl = document.getElementById('gameover-desc');
+        const preBtn = document.getElementById('gameover-btn-precombat');
+        const scEl = document.getElementById('gameover-scorecard');
+        if (iconEl) iconEl.textContent = isBankrupt ? '📉' : '💀';
+        if (titleEl) titleEl.textContent = isBankrupt ? 'BANKRUPTCY FORECLOSURE' : 'VESSEL DESTROYED';
+        if (descEl) {
+          descEl.innerHTML = isBankrupt
+            ? 'First Galactic Bank seized your ship and ended your commission under insurmountable debt.<br>Recovery options are available from your flight recorder archives.'
+            : 'Your ship broke apart in the void. The sector remembers your final transmission.<br>Recovery options are available from your flight recorder archives.';
+        }
+        if (preBtn) preBtn.style.display = isBankrupt ? 'none' : 'flex';
+        if (scEl) scEl.innerHTML = renderScorecardHtml(p.final_score, p);
         if (!document.getElementById('gameover-modal').classList.contains('active')) {
           showModal('gameover-modal');
           playSound('death');
@@ -8904,6 +9239,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (gameState && gameState.player.victory && !victoryShown) {
         victoryShown = true;
         document.getElementById('victory-captain-name').textContent = gameState.player.name;
+        const vSc = document.getElementById('victory-scorecard');
+        if (vSc) vSc.innerHTML = renderScorecardHtml(gameState.player.final_score, gameState.player);
         showModal('victory-modal');
         playSound('victory');
       }
@@ -8992,7 +9329,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const maxB = Math.max(0, gameState.player.loan_limit - gameState.player.loan);
       openAmountModal('🏦 Borrow from First Galactic Bank',
         `Credit limit remaining: ${maxB.toLocaleString()} CR at ${gameState.player.effective_interest_rate}% daily interest.`,
-        'Borrow Funds', Math.max(1, Math.min(1000, maxB || 1000)),
+        'Borrow Funds', Math.max(1, Math.min(1000, maxB)),
         'bank_borrow', { key: 'amount' }, maxB);
     }
     function promptRepay() {
@@ -9053,6 +9390,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const combat = gameState && gameState.active_combat;
       if (combat && !combat.is_finished) {
         if (e.key === 'f' || e.key === 'F') sendCombatAction('fire');
+        if (e.key === '1') sendCombatAction('target_weapons');
+        if (e.key === '2') sendCombatAction('target_engines');
+        if (e.key === '3') sendCombatAction('target_shields');
         if (e.key === 'm' || e.key === 'M') sendCombatAction('missile');
         if (e.key === 'r' || e.key === 'R') sendCombatAction('recharge');
         if (e.key === 'e' || e.key === 'E') sendCombatAction('evade');
@@ -9060,7 +9400,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (e.key === 'b' || e.key === 'B') sendCombatAction('board');
         if (e.key === 'w' || e.key === 'W') sendCombatAction('flee');
       } else if (combat && combat.is_finished && (e.key === 'Enter')) {
-        dismissCombat();
+        combatDismiss();
       }
     });
 
@@ -9365,6 +9705,13 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
         last_change = 0.0
         if len(history) >= 2:
             last_change = round(((history[-1] - history[-2]) / max(1.0, history[-2])) * 100.0, 1)
+        avg_cost = (
+            round(player.stocks_cost_basis[sym], 2)
+            if (owned > 0 and sym in player.stocks_cost_basis)
+            else None
+        )
+        unrealized_pl = int(round((stk.price - avg_cost) * owned)) if avg_cost is not None else 0
+        unrealized_pct = round(((stk.price - avg_cost) / avg_cost) * 100.0, 1) if (avg_cost and avg_cost > 0) else 0.0
         stocks_list.append({
             "symbol": sym,
             "name": stk.name,
@@ -9373,6 +9720,9 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "volatility": stk.volatility,
             "desc": stk.desc,
             "shares_owned": owned,
+            "avg_cost": avg_cost,
+            "unrealized_pl": unrealized_pl,
+            "unrealized_pct": unrealized_pct,
             "total_value": int(owned * stk.price),
             "change_pct": last_change,
         })
@@ -9435,6 +9785,8 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
         }
 
     net_worth = engine.calculate_net_worth()
+    final_score = engine.calculate_final_score()
+    trade_in_pct = int(round(clamp(player.hull / max(1, ship_tmpl.max_hull), 0.05, 1.0) * 70))
 
     _state = {
         "player": {
@@ -9465,10 +9817,7 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "missiles": player.missiles,
             "max_missiles": PLAYER_MISSILE_CAP,
             "missile_price": engine.missile_price(),
-            "fuel_unit_price": max(1, int(
-                current_p.fuel_price * engine.difficulty.fuel_mult
-                * (1.0 - RANK_SERVICE_DISCOUNT[engine.rank_index()])
-            )),
+            "fuel_unit_price": engine.fuel_unit_price(),
             "insurance_active": player.insurance_active,
             "insurance_price": engine.insurance_price(),
             "weapons_damaged": player.weapons_damaged,
@@ -9540,9 +9889,12 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
                 int(engine.stocks[sym].price * q)
                 for sym, q in player.stocks_owned.items() if sym in engine.stocks
             ),
+            "stock_profit": player.stock_profit,
             "achievements": list(player.achievements),
             "stats": player.stats,
             "net_worth": net_worth,
+            "gross_asset_value": engine.gross_asset_value(),
+            "ship_trade_in_pct": trade_in_pct,
             "target_net_worth": TARGET_NET_WORTH,
             "net_worth_pct": round(min(100.0, (net_worth / TARGET_NET_WORTH) * 100.0), 1),
             "net_worth_history": player.net_worth_history[-30:],
@@ -9550,6 +9902,11 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "standing": {f: reputation_rank(player.rep(f)) for f in FACTIONS},
             "victory": net_worth >= TARGET_NET_WORTH,
             "is_game_over": engine.is_game_over,
+            "game_over_reason": engine.game_over_reason,
+            "insolvency_days": player.insolvency_days,
+            "bankruptcy_grace_days": BANKRUPTCY_GRACE_DAYS,
+            "can_declare_bankruptcy": engine.can_declare_bankruptcy(),
+            "final_score": final_score,
             "effective_max_shield": player.effective_max_shield(),
             "has_drone_bay": player.has_drone_bay(),
             "has_deep_scanner": player.has_module("deep_scanner"),
@@ -9667,6 +10024,7 @@ ENGINE_ACTIONS: Dict[str, EngineSpec] = {
     "bank_repay":        ("repay", (("amount", "int", 100),), "coin"),
     "buy_stock":         ("buy_stock", (("symbol", "str", ""), ("qty", "int", 1)), "coin"),
     "sell_stock":        ("sell_stock", (("symbol", "str", ""), ("qty", "int", 1)), "sell"),
+    "declare_bankruptcy": ("declare_bankruptcy", (), "death"),
 }
 
 META_ACTIONS = ("new_game", "load_game", "save_game")
@@ -10964,8 +11322,161 @@ def run_self_test() -> None:
         e_n5.check_achievements()
         check("missions_15 achievement unlocks", "missions_15" in e_n5.player.achievements)
 
-        # --- 29. Cleanup ---
-        print("\n--- 29. Cleanup ---")
+        # --- 29. Overhaul regressions: history, deadlines, stock basis, score & bankruptcy ---
+        print("\n--- 29. Overhaul regressions ---")
+        e_oh = GameEngine(muted=True)
+        e_oh.new_game("OverhaulTester", "normal")
+        check("market starts with 5-day price history", all(
+            len(p.price_history.get(gid, [])) >= 5
+            for p in e_oh.planets.values() for gid in COMMODITIES
+        ))
+        check("stocks start with 5-day history", all(
+            len(stk.history) >= 5 for stk in e_oh.stocks.values()
+        ))
+        check("warm-up leaves starting day at 1", e_oh.player.day == 1)
+
+        # Slow-hull contracts must always allow direct transit + 2 days
+        e_oh.player.ship_id = "behemoth"
+        e_oh.recalculate_ship_stats()
+        e_oh._refresh_mission_board()
+        for m in e_oh.available_missions:
+            if m.origin == e_oh.current_planet.name and m.destination in e_oh.planets:
+                _, direct_days = e_oh.calculate_travel_cost_between(
+                    e_oh.current_planet, e_oh.planets[m.destination]
+                )
+                check(f"slow hull contract {m.id} reachable",
+                      m.days_left >= direct_days + 2,
+                      f"days_left={m.days_left}, direct={direct_days}")
+
+        # Combat drone blocker & opportunist AI skipping sealed freight
+        e_cb = GameEngine(muted=True)
+        e_cb.new_game("CombatCheck", "normal")
+        e_cb.player.equipped_modules = []
+        e_cb.player.cargo = {"food": 4}
+        e_cb.player.cargo_cost_basis = {"food": 25.0}
+        e_cb.player.active_missions = [
+            Mission(id="M_SEALED", m_type="delivery", title="Sealed Food", desc="Seal",
+                    origin="Earth", destination="Mars", reward_credits=500,
+                    days_left=5, cargo_good="food", cargo_qty=4,
+                    bounty_target_name="", bounty_target_ship="")
+        ]
+        cb = start_combat(e_cb, {"enemy_name": "Opportunist", "enemy_ship": "sparrow",
+                                 "type": "pirate_ambush"})
+        cb.personality = "opportunist"
+        t_before = cb.turn_count
+        msg_no_bay = cb.player_action("drones")
+        check("drones without bay blocked without consuming turn",
+              cb.turn_count == t_before and any("Drone Bay" in x for x in msg_no_bay))
+        e_cb.player.equipped_modules = ["drone_bay"]
+        msg_dep = cb.player_action("drones")
+        check("drones deploy succeeds with bay", cb.drones_active and any("DRONE BAY OPEN" in x for x in msg_dep))
+        t_after_dep = cb.turn_count
+        msg_dup = cb.player_action("drones")
+        check("duplicate drone deploy blocked without consuming turn",
+              cb.turn_count == t_after_dep and any("already" in x for x in msg_dup))
+        # Opportunist AI should never claim to steal sealed contract cargo
+        cb.enemy_hull = cb.enemy_max_hull
+        real_rand_cb = random.random
+        random.random = lambda: 0.0
+        try:
+            steal_check_msgs = cb._enemy_turn()
+        finally:
+            random.random = real_rand_cb
+        check("opportunist skips steal when cargo is contract-sealed",
+              e_cb.player.cargo.get("food", 0) == 4
+              and not any("snatch" in x for x in steal_check_msgs))
+
+        # Ghost encounter vents cargo via _remove_cargo_tracked (cleans cost basis)
+        e_gh = GameEngine(muted=True)
+        e_gh.new_game("GhostCheck", "normal")
+        e_gh.player.cargo = {"water": 5}
+        e_gh.player.cargo_cost_basis = {"water": 20.0}
+        e_gh.resolve_ghost({"title": "Ghost"}, False)
+        check("ghost strip cleans cargo_cost_basis",
+              all(k in e_gh.player.cargo for k in e_gh.player.cargo_cost_basis))
+
+        # Tampered hull=0 save clamps to >= 1 on load
+        tamper_slot = "3"
+        e_oh.save_game(tamper_slot)
+        t_path = slot_path(tamper_slot)
+        with open(t_path, "r", encoding="utf-8") as fh:
+            td = json.load(fh)
+        td["player"]["hull"] = 0
+        with open(t_path, "w", encoding="utf-8") as fh:
+            json.dump(td, fh)
+        e_oh_load = GameEngine(muted=True)
+        ok_tl, _ = e_oh_load.load_game(tamper_slot)
+        check("tampered hull=0 save loads safely with hull >= 1", ok_tl and e_oh_load.player.hull >= 1)
+
+        # Stock weighted-average cost basis + realized profit + round-trip
+        e_st = GameEngine(muted=True)
+        e_st.new_game("Broker", "normal")
+        e_st.player.credits = 100_000
+        sym = next(iter(e_st.stocks.keys()))
+        e_st.stocks[sym].price = 100.0
+        ok_b1, _ = e_st.buy_stock(sym, 10)
+        e_st.stocks[sym].price = 200.0
+        ok_b2, _ = e_st.buy_stock(sym, 10)
+        check("stock avg cost basis tracks weighted average",
+              ok_b1 and ok_b2 and abs(e_st.player.stocks_cost_basis.get(sym, 0.0) - 150.0) < 0.01)
+        e_st.stocks[sym].price = 250.0
+        ok_s1, msg_s1 = e_st.sell_stock(sym, 10)
+        check("stock sell records realized profit",
+              ok_s1 and e_st.player.stock_profit == 1_000 and "+1,000 CR" in msg_s1)
+        e_st.save_game("2")
+        e_st2 = GameEngine(muted=True)
+        ok_sl, _ = e_st2.load_game("2")
+        check("stock basis and profit survive save/load",
+              ok_sl and e_st2.player.stock_profit == 1_000
+              and abs(e_st2.player.stocks_cost_basis.get(sym, 0.0) - 150.0) < 0.01)
+
+        # Unpaid crew resignation after 2 days when over loan limit
+        e_wg = GameEngine(muted=True)
+        e_wg.new_game("Deadbeat", "normal")
+        e_wg.player.credits = 0
+        e_wg.player.hired_crew = ["sable", "t800"]
+        e_wg.recalculate_ship_stats()
+        e_wg.player.loan = e_wg.loan_limit() + 5_000
+        e_wg.advance_day(2)
+        check("unpaid crew resigns highest-wage officer after 2 days",
+              e_wg.player.hired_crew == ["t800"])
+
+        # Bankruptcy foreclosure after 5 insolvent days + voluntary filing + final score
+        e_bk = GameEngine(muted=True)
+        e_bk.new_game("Insolvent", "normal")
+        e_bk.player.credits = 0
+        e_bk.player.savings = 0
+        e_bk.player.cargo = {}
+        e_bk.player.loan = e_bk.loan_limit() * 3 + e_bk.gross_asset_value() + 10_000
+        check("voluntary bankruptcy allowed when insolvent", e_bk.can_declare_bankruptcy())
+        e_bk.advance_day(BANKRUPTCY_GRACE_DAYS)
+        check("insolvency triggers bankruptcy game over after grace period",
+              e_bk.is_game_over and e_bk.game_over_reason == "bankruptcy")
+        fs_bk = e_bk.calculate_final_score()
+        check("bankrupt scorecard reports outcome and grade",
+              fs_bk["outcome"] == "Bankrupt" and fs_bk["grade"] in ("S+", "S", "A", "B", "C", "D"))
+
+        e_bk2 = GameEngine(muted=True)
+        e_bk2.new_game("Solvent", "normal")
+        check("voluntary bankruptcy refused when solvent", not e_bk2.can_declare_bankruptcy())
+        ok_vb, _ = e_bk2.declare_bankruptcy()
+        check("declare_bankruptcy rejects solvent captain", not ok_vb and not e_bk2.is_game_over)
+        e_bk2.player.loan = e_bk2.gross_asset_value() + 25_000
+        ok_vb2, _ = e_bk2.declare_bankruptcy()
+        check("declare_bankruptcy ends career when underwater",
+              ok_vb2 and e_bk2.is_game_over and e_bk2.game_over_reason == "bankruptcy")
+
+        e_win = GameEngine(muted=True)
+        e_win.new_game("Victor", "hard")
+        e_win.player.credits = TARGET_NET_WORTH + 250_000
+        e_win.check_achievements()
+        fs_win = e_win.calculate_final_score()
+        check("win scorecard includes victory bonus and difficulty mult",
+              fs_win["outcome"] == "Mogul Victory" and fs_win["victory_bonus"] == 10_000
+              and fs_win["difficulty_mult"] == 1.25 and fs_win["total_score"] > 30_000)
+
+        # --- 30. Cleanup ---
+        print("\n--- 30. Cleanup ---")
         shutil.rmtree(scratch, ignore_errors=True)
         check("test scratch dir removed", not os.path.exists(scratch))
 
