@@ -1091,6 +1091,7 @@ def generate_mission_board(
     all_planets: List[Planet],
     day: int,
     career_tier: int = 0,
+    exclude_bounty_names: Optional[Set[str]] = None,
 ) -> List[Mission]:
     """Build the contract board. career_tier (0-2) enriches rewards with rank."""
     missions: List[Mission] = []
@@ -1163,7 +1164,9 @@ def generate_mission_board(
 
     # 3. Bounty
     dst_bounty = pick_dst()
-    target_name = random.choice(PIRATE_NAMES)
+    blocked_names = exclude_bounty_names or set()
+    name_pool = [n for n in PIRATE_NAMES if n not in blocked_names] or PIRATE_NAMES
+    target_name = random.choice(name_pool)
     bounty_ships = ["viper", "orion", "valkyrie", "drake"]
     b_ship = random.choice(bounty_ships)
     b_dist = math.hypot(current_planet.x - dst_bounty.x, current_planet.y - dst_bounty.y)
@@ -1872,10 +1875,14 @@ class GameEngine:
                 repair_hp += 8
             if self.player.has_crew("aria"):
                 repair_hp += 8
+            if self.player.has_crew("t800"):
+                repair_hp += 4
             if repair_hp > 0:
                 self.player.hull = min(self.player.max_hull, self.player.hull + repair_hp)
 
-            if self.player.has_module("nanite_repair") or self.player.has_crew("aria"):
+            if (self.player.has_module("nanite_repair")
+                    or self.player.has_crew("aria")
+                    or self.player.has_crew("t800")):
                 damaged = self.player.damaged_subsystems()
                 if damaged:
                     fixed = damaged[0]
@@ -1934,7 +1941,12 @@ class GameEngine:
                         bump = 0.02 if ev.mult > 1.0 else -0.015
                         stk = self.stocks[linked]
                         stk.price = max(5.0, round(stk.price * (1 + bump), 2))
-                        stk.history.append(stk.price)
+                        # Replace today's already-recorded point so same-day
+                        # events do not insert an extra sample into history.
+                        if stk.history:
+                            stk.history[-1] = stk.price
+                        else:
+                            stk.history.append(stk.price)
                         if len(stk.history) > 30:
                             stk.history.pop(0)
 
@@ -1968,6 +1980,9 @@ class GameEngine:
             list(self.planets.values()),
             self.player.day,
             career_tier=self.career_tier(),
+            exclude_bounty_names={
+                m.bounty_target_name for m in self.player.active_missions if m.bounty_target_name
+            },
         )
         self.check_promotion()
         self.check_achievements()
@@ -2130,9 +2145,13 @@ class GameEngine:
 
         price = self.get_sell_price(good)
         total_income = self.quote_sell(good, qty)
+        had_basis = good in self.player.cargo_cost_basis
         basis = self.player.cargo_cost_basis.get(good, float(price))
         total_profit = int(round(total_income - basis * qty))
-        pct_return = ((total_income / qty - basis) / max(1.0, basis)) * 100.0
+        if basis > 0:
+            pct_return = ((total_income / qty - basis) / basis) * 100.0
+        else:
+            pct_return = 100.0 if total_income > 0 else 0.0
 
         self._remove_cargo_tracked(good, qty)
 
@@ -2149,7 +2168,10 @@ class GameEngine:
 
         self.sound.play("sell")
         self.check_achievements()
-        profit_tag = f" (Profit: {('+' if total_profit >= 0 else '')}{money(total_profit)} CR, {pct_return:+.1f}%)" if basis > 0 else ""
+        profit_tag = (
+            f" (Profit: {('+' if total_profit >= 0 else '')}{money(total_profit)} CR, {pct_return:+.1f}%)"
+            if had_basis else ""
+        )
         msg = f"Sold {qty}x {COMMODITIES[good].name} for {money(total_income)} CR{profit_tag}."
         self.announce(msg)
         return True, msg
@@ -3009,6 +3031,7 @@ class GameEngine:
             added = self._acquire_cargo(good, qty, 0.0)
             self.player.credits += salvage_cr
             self.sound.play("victory")
+            self.check_achievements()
             return [f"Salvage team recovered {money(salvage_cr)} CR and {added}x {COMMODITIES[good].name}!"]
         dmg = random.randint(8, 20)
         self.player.hull = max(1, self.player.hull - dmg)
@@ -3030,6 +3053,7 @@ class GameEngine:
         reward = random.randint(900, 2_600)
         self.player.credits += reward
         self.sound.play("coin")
+        self.check_achievements()
         return [f"Transferred 15 fuel. Grateful crew awarded you {money(reward)} CR!"]
 
     def resolve_trader(self, enc: Dict[str, Any], accept: bool) -> List[str]:
@@ -3046,6 +3070,7 @@ class GameEngine:
         self.player.credits -= total
         self._acquire_cargo(good, qty, total / max(1, qty))
         self.sound.play("buy")
+        self.check_achievements()
         return [f"Deal accepted! Loaded {qty}x {COMMODITIES[good].name} for {money(total)} CR."]
 
     def resolve_asteroid_field(self, enc: Dict[str, Any], thread_needle: bool) -> List[str]:
@@ -3092,6 +3117,9 @@ class GameEngine:
             list(self.planets.values()),
             self.player.day,
             career_tier=self.career_tier(),
+            exclude_bounty_names={
+                m.bounty_target_name for m in self.player.active_missions if m.bounty_target_name
+            },
         )
         msgs = [f"The wormhole swallows your ship whole and vomits it out near {dest.name}!"]
         if random.random() < 0.3:
@@ -3562,6 +3590,7 @@ class GameEngine:
         if amount >= 1_000:
             self.player.credit_score = min(850, self.player.credit_score + 2)
         self.sound.play("coin")
+        self.check_achievements()
         msg = f"Repaid {money(amount)} CR loan."
         self.announce(msg)
         return True, msg
@@ -3642,7 +3671,7 @@ class GameEngine:
         msgs.append("EMERGENCY PODS DEPLOYED! Your vessel was destroyed, but the")
         msgs.append("insurance underwriters have you covered.")
         msgs.append(f"Lost {lost_cargo} cargo units and {money(credit_loss)} CR in the incident.")
-        msgs.append("A replacement hull (60% condition) has been dispatched to you.")
+        msgs.append("A replacement hull (60% hull, shields recharged after 2 days) has been dispatched.")
         if voided:
             msgs.append(
                 "Contracts voided by the loss (their cargo went down with you): "
@@ -3723,6 +3752,7 @@ class GameEngine:
         gain = int(clamp(amount / 500.0, 1, 8))
         applied = self.adjust_reputation(faction, gain)
         self.sound.play("coin")
+        self.check_achievements()
         msg = (f"The {faction} accepts your {money(amount)} CR contribution "
                f"with public gratitude (standing +{applied}).")
         self.announce(msg)
@@ -4081,6 +4111,9 @@ class GameEngine:
                 list(self.planets.values()),
                 self.player.day,
                 career_tier=self.career_tier(),
+                exclude_bounty_names={
+                    m.bounty_target_name for m in self.player.active_missions if m.bounty_target_name
+                },
             )
             self.check_achievements()
             self.sound.play("buy")
@@ -4278,12 +4311,14 @@ class CombatEncounter:
         enemy_ship_id: str,
         is_bounty: bool = False,
         bounty_reward: int = 0,
+        bounty_mission_id: Optional[str] = None,
     ):
         self.engine = engine
         self.enemy_name = enemy_name
         self.enemy_ship_id = enemy_ship_id
         self.is_bounty = is_bounty
         self.bounty_reward = bounty_reward
+        self.bounty_mission_id = bounty_mission_id
 
         tmpl = SHIP_TEMPLATES.get(enemy_ship_id, SHIP_TEMPLATES["sparrow"])
         self.enemy_ship_name = tmpl.name
@@ -4418,13 +4453,21 @@ class CombatEncounter:
         msgs: List[str] = []
         self.turn_count += 1
 
+        def _record_turn(turn_msgs: List[str]) -> List[str]:
+            if turn_msgs:
+                self.combat_log.append(f"— Turn {self.turn_count} —")
+                self.combat_log.extend(turn_msgs)
+                if len(self.combat_log) > 60:
+                    self.combat_log = self.combat_log[-60:]
+            return turn_msgs
+
         # Autonomous drones strike first.
         if self.drones_active and action != "drones":
             msgs.extend(self._drone_strike())
             if self.is_finished:
                 # The swarm already finished the fight — don't burn a missile
                 # or a volley on a wreck.
-                return msgs
+                return _record_turn(msgs)
 
         # Set when an action already resolves the enemy's counter-attack
         # internally (e.g. a repelled boarding attempt) — the enemy must not
@@ -4454,14 +4497,14 @@ class CombatEncounter:
             escaped, flee_msgs = self._player_flee()
             msgs.extend(flee_msgs)
             if escaped:
-                return msgs
+                return _record_turn(msgs)
 
         if self.is_finished:
-            return msgs
+            return _record_turn(msgs)
 
         if not enemy_responded:
             msgs.extend(self._enemy_turn())
-        return msgs
+        return _record_turn(msgs)
 
     # ------------------------------------------------------------------ #
     # Player offensive actions
@@ -4703,10 +4746,21 @@ class CombatEncounter:
             bounty_mult = 1.0 + RANK_BOUNTY_BONUS[self.engine.rank_index()]
             salvage += int(self.bounty_reward * bounty_mult)
             p.stats["bounties_claimed"] += 1
-            for m in list(p.active_missions):
-                if m.bounty_target_name == self.enemy_name:
-                    m.completed = True
-                    p.active_missions.remove(m)
+            matched = None
+            if self.bounty_mission_id:
+                matched = next(
+                    (m for m in p.active_missions if m.id == self.bounty_mission_id),
+                    None,
+                )
+            if matched is None:
+                matched = next(
+                    (m for m in p.active_missions
+                     if m.m_type == "bounty" and m.bounty_target_name == self.enemy_name),
+                    None,
+                )
+            if matched is not None:
+                matched.completed = True
+                p.active_missions.remove(matched)
         p.credits += salvage
         msgs.append(f"Salvaged {money(salvage)} credits from the wreckage.")
 
@@ -4840,7 +4894,10 @@ class CombatEncounter:
         if random.random() < chance:
             self.is_finished = True
             self.enemy_fled = True
-            return [f"The {self.enemy_name} engages a desperate burn and escapes into the dark!"]
+            msgs = [f"The {self.enemy_name} engages a desperate burn and escapes into the dark!"]
+            if self.is_bounty:
+                msgs.append("Target slipped away! Re-engage from Missions & Bounties while still in system.")
+            return msgs
         return [f"The {self.enemy_name} tries to flee but your guns keep them pinned!"]
 
     def _enemy_charge(self) -> List[str]:
@@ -4908,8 +4965,12 @@ def start_combat(engine: GameEngine, enc: Dict[str, Any]) -> CombatEncounter:
     enemy_name = enc.get("target_name") if is_bounty else enc.get("enemy_name", "Corsair Raider")
     enemy_ship = enc.get("target_ship") if is_bounty else enc.get("enemy_ship", "viper")
     reward = enc.get("reward", 0)
+    mission_id = enc.get("mission_id") if is_bounty else None
     engine.precombat_save()
-    return CombatEncounter(engine, enemy_name, enemy_ship, is_bounty=is_bounty, bounty_reward=reward)
+    return CombatEncounter(
+        engine, enemy_name, enemy_ship,
+        is_bounty=is_bounty, bounty_reward=reward, bounty_mission_id=mission_id,
+    )
 
 
 # ==============================================================================
@@ -5262,6 +5323,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       cursor: pointer;
       transition: all 0.2s;
     }
+    .map-planet-node.out-of-range { opacity: 0.45; }
+    .map-planet-node.out-of-range:hover { opacity: 0.85; }
     .map-planet-node:hover circle.planet-body {
       filter: drop-shadow(0 0 10px var(--cyan));
       stroke-width: 2.5;
@@ -5502,6 +5565,33 @@ HTML_PAGE = r"""<!DOCTYPE html>
     /* Damage callouts (used by combat floaters) — previously referenced but
        never defined, so hit numbers rendered default-white. */
     .dmg-red { color: var(--red); }
+    .dmg-cyan { color: var(--cyan); }
+    .dmg-gold { color: var(--gold); }
+    .dmg-green { color: var(--green); }
+    .clog-turn {
+      color: var(--cyan);
+      font-weight: 700;
+      margin-top: 4px;
+      border-top: 1px solid rgba(26, 44, 104, 0.4);
+      padding-top: 3px;
+    }
+    .clog-crit { color: var(--gold); font-weight: 700; }
+    .clog-warn { color: var(--red); font-weight: 700; }
+    .clog-win { color: var(--green); font-weight: 700; }
+    .qty-num-input {
+      background: var(--bg2);
+      border: 1px solid var(--panel-border-hi);
+      color: var(--cyan);
+      font-family: var(--font-mono);
+      font-size: 16px;
+      font-weight: 700;
+      width: 76px;
+      padding: 4px 8px;
+      border-radius: 6px;
+      text-align: right;
+      outline: none;
+    }
+    .qty-num-input:focus { border-color: var(--cyan); }
     @keyframes floatUpFade {
       0% { opacity: 1; transform: translateY(0) scale(1); }
       50% { transform: translateY(-22px) scale(1.1); }
@@ -6001,7 +6091,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <div class="panel-card-title">🧭 Deep Space Trade Route Advisor</div>
             <div class="panel-card-subtitle">Real-time algorithmic route optimization factoring travel time, fuel burn, and market spreads.</div>
           </div>
-          <button class="btn-action-sm" onclick="fetchTradeRoutes()">🔄 Re-calculate Routes</button>
+          <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+            <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-dim); cursor: pointer;">
+              <input type="checkbox" id="advisor-from-current" onchange="fetchTradeRoutes()"> Departing Current Port Only
+            </label>
+            <button class="btn-action-sm" onclick="fetchTradeRoutes()">🔄 Re-calculate Routes</button>
+          </div>
         </div>
 
         <div class="data-table-wrapper">
@@ -6386,9 +6481,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
 
       <div style="margin-bottom: 20px;">
-        <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; gap: 10px;">
           <span style="font-weight: 600;">Quantity:</span>
-          <span id="trade-qty-display" style="font-family: var(--font-mono); font-size: 18px; font-weight: 700; color: var(--cyan);">1</span>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <input type="number" id="trade-qty-input" class="qty-num-input" min="1" max="10" value="1" aria-label="Trade quantity" oninput="onTradeNumberInput(this.value)">
+            <span style="font-size: 13px; color: var(--fg-dim);">Units</span>
+            <span id="trade-qty-display" style="display: none;">1</span>
+          </div>
         </div>
         <input type="range" id="trade-slider" min="1" max="10" value="1" style="width: 100%; cursor: pointer;" oninput="onTradeSliderChange(this.value)">
         <div style="display: flex; justify-content: space-between; margin-top: 8px;">
@@ -6513,16 +6612,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       <!-- Action Commands -->
       <div id="combat-actions-bar" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; margin-bottom: 16px;">
-        <button class="btn-action-sm btn-buy" id="btn-combat-fire" onclick="sendCombatAction('fire')">⚡ Fire Batteries</button>
+        <button class="btn-action-sm btn-buy" id="btn-combat-fire" onclick="sendCombatAction('fire')">⚡ Fire Batteries [F]</button>
         <button class="btn-action-sm" id="btn-combat-target-weapons" onclick="sendCombatAction('target_weapons')">🎯 Target Weapons</button>
         <button class="btn-action-sm" id="btn-combat-target-engines" onclick="sendCombatAction('target_engines')">🎯 Target Thrusters</button>
         <button class="btn-action-sm" id="btn-combat-target-shields" onclick="sendCombatAction('target_shields')">🎯 Target Shields</button>
-        <button class="btn-action-sm btn-sell" id="btn-combat-missile" onclick="sendCombatAction('missile')">🚀 Fire Torpedo</button>
-        <button class="btn-action-sm" id="btn-combat-drones" onclick="sendCombatAction('drones')">🛸 Deploy Drones</button>
-        <button class="btn-action-sm" id="btn-combat-recharge" onclick="sendCombatAction('recharge')">🛡️ Boost Capacitor</button>
-        <button class="btn-action-sm" id="btn-combat-evade" onclick="sendCombatAction('evade')">💫 Evasive Maneuvers</button>
-        <button class="btn-action-sm" id="btn-combat-board" onclick="sendCombatAction('board')">🏴‍☠️ Board Vessel</button>
-        <button class="btn-action-sm" id="btn-combat-flee" style="color: var(--red);" onclick="sendCombatAction('flee')">🏃 Emergency Warp</button>
+        <button class="btn-action-sm btn-sell" id="btn-combat-missile" onclick="sendCombatAction('missile')">🚀 Fire Torpedo [M]</button>
+        <button class="btn-action-sm" id="btn-combat-drones" onclick="sendCombatAction('drones')">🛸 Deploy Drones [D]</button>
+        <button class="btn-action-sm" id="btn-combat-recharge" onclick="sendCombatAction('recharge')">🛡️ Boost Capacitor [R]</button>
+        <button class="btn-action-sm" id="btn-combat-evade" onclick="sendCombatAction('evade')">💫 Evasive Maneuvers [E]</button>
+        <button class="btn-action-sm" id="btn-combat-board" onclick="sendCombatAction('board')">🏴‍☠️ Board Vessel [B]</button>
+        <button class="btn-action-sm" id="btn-combat-flee" style="color: var(--red);" onclick="sendCombatAction('flee')">🏃 Emergency Warp [W]</button>
       </div>
 
       <!-- Combat Log Terminal -->
@@ -6637,7 +6736,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
         <div>
           <h4 style="color: var(--fg-dim); margin-bottom: 4px;">⌨️ Hotkeys & New Kit</h4>
-          <p><strong>1–9</strong> switch tabs · <strong>←/→</strong> move between tabs · <strong>F</strong> fire · <strong>M</strong> torpedo · <strong>R</strong> recharge · <strong>E</strong> evade · <strong>D</strong> drones · <strong>B</strong> board · <strong>Esc</strong> closes dialogs (except the combat and vessel-loss screens). Every dialog traps keyboard focus and hands it back when it closes, and the star map can be flown entirely from the keyboard. New equipment worth saving for: the <em>Bussard Ram-Scoop</em> (free fuel daily) and the <em>Heavy Extraction Rig</em> (double mining yields).</p>
+          <p><strong>1–9</strong> switch tabs · <strong>←/→</strong> move between tabs · <strong>F</strong> fire · <strong>M</strong> torpedo · <strong>R</strong> recharge · <strong>E</strong> evade · <strong>D</strong> drones · <strong>B</strong> board · <strong>W</strong> emergency warp · <strong>Esc</strong> closes dialogs (except the combat and vessel-loss screens). Every dialog traps keyboard focus and hands it back when it closes, and the star map can be flown entirely from the keyboard. New equipment worth saving for: the <em>Bussard Ram-Scoop</em> (free fuel daily) and the <em>Heavy Extraction Rig</em> (double mining yields).</p>
         </div>
       </div>
     </div>
@@ -7106,6 +7205,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
       gameState = state;
       renderAll();
+      if (currentTab === 'advisor') fetchTradeRoutes();
     }
 
     async function fetchState() {
@@ -7317,11 +7417,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const strokeWidth = isSelected ? '3' : '1.5';
         const nodeRadius = isCurrent ? 12 : 9;
         const hasMissions = p.active_missions && p.active_missions.length > 0;
+        const outOfRange = !p.in_range && !isCurrent;
 
         html += `
-          <g class="map-planet-node" role="button" tabindex="0"
-             aria-label="${escHtml(p.name)} — ${escHtml(p.subtitle)}${isCurrent ? ', current position' : ''}${hasMissions ? ', active contract destination' : ''}"
+          <g class="map-planet-node${outOfRange ? ' out-of-range' : ''}" role="button" tabindex="0"
+             aria-label="${escHtml(p.name)} — ${escHtml(p.subtitle)}${isCurrent ? ', current position' : ''}${outOfRange ? ', out of current fuel range' : ''}${hasMissions ? ', active contract destination' : ''}"
              onclick="selectPlanet('${escJs(p.name)}')"
+             ondblclick="${p.in_range && !isCurrent ? `selectedPlanetName='${escJs(p.name)}';executeTravel();` : ''}"
              onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectPlanet('${escJs(p.name)}'); }">
             <circle cx="${px}" cy="${py}" r="${nodeRadius + 4}" fill="${p.color}" opacity="0.15" />
             <circle class="planet-body" cx="${px}" cy="${py}" r="${nodeRadius}" fill="${p.color}" stroke="${strokeColor}" stroke-width="${strokeWidth}" />
@@ -7527,7 +7629,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <td>
               <strong style="color: var(--cyan);">${g.player_qty}</strong> T
               ${g.reserved_qty > 0 ? `<div style="font-size: 10px; color: var(--gold);">🔒 ${g.reserved_qty} T sealed</div>` : ''}
-              ${g.player_qty > 0 && g.cost_basis > 0 ? `<div style="font-size: 10px; color: ${g.unit_profit >= 0 ? 'var(--green)' : 'var(--red)'}; font-family: var(--font-mono);">${g.unit_profit >= 0 ? '+' : ''}${g.unit_profit} (${g.profit_pct >= 0 ? '+' : ''}${g.profit_pct}%)</div>` : ''}
+              ${g.player_qty > 0 && (g.has_cost_basis || g.cost_basis > 0) ? `<div style="font-size: 10px; color: ${g.unit_profit >= 0 ? 'var(--green)' : 'var(--red)'}; font-family: var(--font-mono);">${g.unit_profit >= 0 ? '+' : ''}${g.unit_profit} (${g.profit_pct >= 0 ? '+' : ''}${g.profit_pct}%)</div>` : ''}
             </td>
             <td>
               <div style="display: flex; gap: 4px;">
@@ -7582,9 +7684,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('trade-max-limit').textContent = `${maxQty} Units Max`;
 
       const slider = document.getElementById('trade-slider');
+      const numInput = document.getElementById('trade-qty-input');
       slider.max = maxQty;
+      if (numInput) numInput.max = maxQty;
       const initialVal = defaultMax ? maxQty : 1;
       slider.value = initialVal;
+      if (numInput) numInput.value = initialVal;
       onTradeSliderChange(initialVal);
 
       showModal('trade-modal');
@@ -7597,7 +7702,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function onTradeSliderChange(val) {
       const g = gameState.current_planet.market.find(item => item.id === selectedGoodId);
       if (!g) return;
-      const qty = parseInt(val, 10);
+      const slider = document.getElementById('trade-slider');
+      const maxLim = Math.max(1, parseInt(slider.max, 10) || 1);
+      const qty = Math.max(1, Math.min(maxLim, parseInt(val, 10) || 1));
+      slider.value = qty;
+      const numInput = document.getElementById('trade-qty-input');
+      if (numInput && document.activeElement !== numInput) numInput.value = qty;
       document.getElementById('trade-qty-display').textContent = qty;
       const unitP = tradeMode === 'buy' ? g.buy_price : g.sell_price;
       const total = tradeTotal(unitP, qty, tradeMode);
@@ -7609,7 +7719,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       const plNote = document.getElementById('trade-profit-note');
       if (plNote) {
-        if (tradeMode === 'sell' && g.cost_basis > 0) {
+        if (tradeMode === 'sell' && (g.has_cost_basis || g.cost_basis > 0)) {
           const estPL = Math.round(total - g.cost_basis * qty);
           plNote.style.color = estPL >= 0 ? 'var(--green)' : 'var(--red)';
           plNote.textContent = `Est. Net P/L: ${estPL >= 0 ? '+' : ''}${estPL.toLocaleString()} CR`;
@@ -7619,16 +7729,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
     }
 
+    function onTradeNumberInput(val) {
+      if (val === '') return;
+      const parsed = parseInt(val, 10);
+      if (isNaN(parsed)) return;
+      const slider = document.getElementById('trade-slider');
+      const maxLim = Math.max(1, parseInt(slider.max, 10) || 1);
+      const clamped = Math.max(1, Math.min(maxLim, parsed));
+      onTradeSliderChange(clamped);
+    }
+
     function setTradeQty(val) {
       const slider = document.getElementById('trade-slider');
-      slider.value = Math.min(parseInt(slider.max, 10), val);
-      onTradeSliderChange(slider.value);
+      const qty = Math.max(1, Math.min(parseInt(slider.max, 10), val));
+      const numInput = document.getElementById('trade-qty-input');
+      if (numInput) numInput.value = qty;
+      onTradeSliderChange(qty);
     }
 
     function setTradeQtyMax() {
       const slider = document.getElementById('trade-slider');
-      slider.value = slider.max;
-      onTradeSliderChange(slider.value);
+      const numInput = document.getElementById('trade-qty-input');
+      if (numInput) numInput.value = slider.max;
+      onTradeSliderChange(slider.max);
     }
 
     function executeTradeModal() {
@@ -7692,7 +7815,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // --- Trade Advisor ---
     async function fetchTradeRoutes() {
       try {
-        const res = await fetch('/api/routes');
+        const fcEl = document.getElementById('advisor-from-current');
+        const fromCurrent = fcEl && fcEl.checked ? '?from_current=1' : '';
+        const res = await fetch('/api/routes' + fromCurrent);
         const json = await res.json();
         if (json.success && json.routes) {
           const tbody = document.getElementById('advisor-table-body');
@@ -7700,10 +7825,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
             'Minimal': 'var(--green)', 'Low': 'var(--green)', 'Moderate': 'var(--gold)',
             'High': 'var(--red)', 'Severe': 'var(--red)', 'Extreme': 'var(--red)',
           };
+          const here = gameState && gameState.current_planet ? gameState.current_planet.name : '';
           let html = '';
           json.routes.forEach(r => {
             const riskColor = RISK_COLORS[r.risk] || 'var(--fg-dim)';
             const cr = (n) => Number(n).toLocaleString();
+            const isDockedAtSrc = (r.src === here);
             // Full cost breakdown: the player can see exactly where the
             // advertised profit goes.
             const breakdown =
@@ -7712,12 +7839,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
               + ` · depth fee ${cr(r.depth_fee)} CR`
               + ` · fuel ${cr(r.fuel_credits)} CR`
               + ` (${r.inbound_fuel} out + ${r.outbound_fuel} on)`;
+            const actionHtml = isDockedAtSrc
+              ? `<button class="btn-action-sm btn-buy" onclick="selectPlanet('${escJs(r.dst)}'); switchTab('map');">Plot → Dest</button>`
+              : `<div style="display: flex; gap: 4px; flex-wrap: wrap;">
+                   <button class="btn-action-sm btn-buy" onclick="selectPlanet('${escJs(r.src)}'); switchTab('map');">1. Fly to Source</button>
+                   <button class="btn-action-sm" title="Plot destination directly" onclick="selectPlanet('${escJs(r.dst)}'); switchTab('map');">→ Dest</button>
+                 </div>`;
             html += `
               <tr>
                 <td><strong style="color: var(--cyan);">${escHtml(r.good)}${r.is_contraband ? ' <span class="pill pill-red" style="font-size:9px;">ILLEGAL</span>' : ''}</strong>
                   <div style="font-size: 10px; color: var(--fg-dim); margin-top: 4px; line-height: 1.5;">${escHtml(breakdown)}</div>
                 </td>
-                <td>${escHtml(r.src)}</td>
+                <td>${escHtml(r.src)}${isDockedAtSrc ? ' <span class="pill pill-cyan" style="font-size:9px;">DOCKED</span>' : ''}</td>
                 <td><strong style="color: var(--gold);">${escHtml(r.dst)}</strong></td>
                 <td>${r.buy_price} / ${r.sell_price} CR</td>
                 <td><span class="pill pill-green">+${r.margin} CR (${r.margin_pct}%)</span></td>
@@ -7726,13 +7859,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 </td>
                 <td>${r.days} Days</td>
                 <td><strong style="color: ${riskColor};">${escHtml(r.risk || '—')}</strong></td>
-                <td>
-                  <button class="btn-action-sm btn-buy" onclick="selectPlanet('${escJs(r.dst)}'); switchTab('map');">Plot Course</button>
-                </td>
+                <td>${actionHtml}</td>
               </tr>
             `;
           });
-          tbody.innerHTML = html || '<tr><td colspan="9" style="text-align: center; color: var(--fg-dim);">No profitable routes identified currently.</td></tr>';
+          tbody.innerHTML = html || '<tr><td colspan="9" style="text-align: center; color: var(--fg-dim); padding: 18px;">No profitable routes identified currently.</td></tr>';
         }
       } catch (e) {
         console.error(e);
@@ -8416,16 +8547,62 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     // --- Tactical Combat ---
+    let lastCombatLogSignature = '';
+
+    function spawnCombatCallout(text, colorCls, side) {
+      const floatBox = document.getElementById('holo-float-text');
+      if (!floatBox) return;
+      const el = document.createElement('div');
+      el.className = 'dmg-float ' + colorCls;
+      if (side === 'left') el.style.left = '56px';
+      else el.style.right = '56px';
+      el.style.top = (18 + Math.floor(Math.random() * 16)) + 'px';
+      el.textContent = text;
+      floatBox.appendChild(el);
+      setTimeout(() => el.remove(), 1300);
+    }
+
+    function shakeHoloVessel(elId) {
+      const el = document.getElementById(elId);
+      if (!el) return;
+      el.classList.remove('shake-anim');
+      void el.offsetWidth;
+      el.classList.add('shake-anim');
+      setTimeout(() => el.classList.remove('shake-anim'), 420);
+    }
+
+    function formatCombatLogLine(line) {
+      const s = String(line || '');
+      let cls = '';
+      if (s.startsWith('— Turn ')) cls = 'clog-turn';
+      else if (s.includes('[CRITICAL HIT!]') || s.includes('EMITTERS FRIED') || s.includes('SYSTEM DISABLED')) cls = 'clog-crit';
+      else if (s.includes('WARNING:') || s.includes('destroyed!') || s.includes('CRITICAL!')) cls = 'clog-warn';
+      else if (s.includes('VICTORY!') || s.includes('SURRENDER') || s.includes('BOARDING SUCCESS')) cls = 'clog-win';
+      const prefix = cls === 'clog-turn' ? '' : '&gt; ';
+      return `<div${cls ? ` class="${cls}"` : ''}>${prefix}${escHtml(s)}</div>`;
+    }
+
     function checkCombat() {
       const c = gameState ? gameState.active_combat : null;
       if (!c) {
+        lastCombatLogSignature = '';
         hideModal('combat-modal');
         return;
       }
       showModal('combat-modal');
 
+      const p = gameState.player;
+      const pShipTitle = document.getElementById('combat-player-ship-title');
+      if (pShipTitle) {
+        pShipTitle.textContent = `Your Ship: ${p.ship_name || 'Vessel'} [${p.ship_class || 'Ship'}]`;
+      }
+      const eShipTitle = document.getElementById('combat-enemy-vessel-title');
+      if (eShipTitle) {
+        eShipTitle.textContent = `${c.enemy_name || 'Hostile'} [${c.enemy_ship_name || 'Raider'}]${c.is_bounty ? ' · BOUNTY' : ''}`;
+      }
+
       document.getElementById('combat-enemy-name').textContent = c.enemy_name;
-      document.getElementById('combat-enemy-ship').textContent = `Class: ${c.enemy_ship_name} · Behavior: ${c.personality.toUpperCase()} — ${c.personality_desc || ''}`;
+      document.getElementById('combat-enemy-ship').textContent = `Class: ${c.enemy_ship_name} · Behavior: ${(c.personality || 'aggressive').toUpperCase()} — ${c.personality_desc || ''}`;
       document.getElementById('combat-turn-counter').textContent = `Combat Turn ${c.turn_count}`;
 
       // Threat assessment pill
@@ -8439,7 +8616,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
 
       // Player combat gauges
-      const p = gameState.player;
       document.getElementById('combat-player-hull-val').textContent = `${p.hull} / ${p.max_hull}`;
       document.getElementById('combat-player-hull-bar').style.width = `${(p.hull / p.max_hull) * 100}%`;
       document.getElementById('combat-player-shield-val').textContent = `${p.shield} / ${p.max_shield}`;
@@ -8480,19 +8656,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
       });
 
       // Torpedo Button
-      document.getElementById('btn-combat-missile').textContent = `🚀 Fire Torpedo (${c.player_missiles} left)`;
+      document.getElementById('btn-combat-missile').textContent = `🚀 Fire Torpedo (${c.player_missiles} left) [M]`;
       document.getElementById('btn-combat-missile').disabled = (c.player_missiles <= 0);
 
       // Drone Bay Button
       const droneBtn = document.getElementById('btn-combat-drones');
       droneBtn.disabled = !c.has_drone_bay;
-      droneBtn.textContent = c.drones_active ? '🛸 Drones Active' : '🛸 Deploy Drones';
+      droneBtn.textContent = c.drones_active ? '🛸 Drones Active [D]' : '🛸 Deploy Drones [D]';
 
       // Evasive Maneuvers Button
       const evadeBtn = document.getElementById('btn-combat-evade');
       if (evadeBtn) {
         evadeBtn.disabled = !c.can_flee;
-        evadeBtn.textContent = c.evasive_active ? '💫 Evasive Active' : '💫 Evasive Maneuvers';
+        evadeBtn.textContent = c.evasive_active ? '💫 Evasive Active [E]' : '💫 Evasive Maneuvers [E]';
         evadeBtn.title = c.can_flee ? 'Halve the accuracy of the next enemy volley' : 'Thrusters damaged — no evasive work possible';
       }
 
@@ -8500,9 +8676,48 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById('btn-combat-board').disabled = !c.can_board;
 
       // Combat Terminal (escaped — logs may echo arbitrary content)
+      const logLines = Array.isArray(c.combat_log) ? c.combat_log : [];
       const term = document.getElementById('combat-terminal-log');
-      term.innerHTML = c.combat_log.map(l => `<div>> ${escHtml(l)}</div>`).join('');
+      term.innerHTML = logLines.map(formatCombatLogLine).join('');
       term.scrollTop = term.scrollHeight;
+
+      // Spawn truthful FX callouts only when combat log advances
+      const sig = `${c.turn_count}|${logLines.join('\n')}`;
+      if (lastCombatLogSignature && sig !== lastCombatLogSignature) {
+        const turnIdx = logLines.lastIndexOf(`— Turn ${c.turn_count} —`);
+        const latestSlice = turnIdx >= 0 ? logLines.slice(turnIdx + 1) : logLines.slice(-4);
+        const latestText = latestSlice.join(' ');
+        if (latestText.includes('EMITTERS FRIED')) {
+          spawnCombatCallout('EMITTERS FRIED!', 'dmg-gold', 'right');
+          shakeHoloVessel('holo-enemy-ship');
+        } else if (latestText.includes('SYSTEM DISABLED')) {
+          spawnCombatCallout('SYSTEM DISABLED!', 'dmg-gold', 'right');
+          shakeHoloVessel('holo-enemy-ship');
+        } else if (latestText.includes('[CRITICAL HIT!]') || latestText.includes('CRITICAL DETONATION')) {
+          spawnCombatCallout('CRITICAL HIT!', 'dmg-gold', 'right');
+          shakeHoloVessel('holo-enemy-ship');
+        } else if (latestText.includes('VICTORY!')) {
+          spawnCombatCallout('VICTORY!', 'dmg-green', 'right');
+          shakeHoloVessel('holo-enemy-ship');
+        } else if (latestText.includes('HAVOC MISSILE AWAY!')) {
+          spawnCombatCallout('TORPEDO IMPACT!', 'dmg-red', 'right');
+          shakeHoloVessel('holo-enemy-ship');
+        } else if (latestText.includes('hull damage into the enemy') || latestText.includes('enemy shield HP')) {
+          spawnCombatCallout('HIT!', 'dmg-red', 'right');
+          shakeHoloVessel('holo-enemy-ship');
+        } else if (latestText.includes('missed the target!') || latestText.includes('guidance failure')) {
+          spawnCombatCallout('MISSED!', 'dmg-cyan', 'right');
+        }
+        if (latestText.includes('Armor breached!')) {
+          spawnCombatCallout('HULL BREACHED!', 'dmg-red', 'left');
+          shakeHoloVessel('holo-player-ship');
+        } else if (latestText.includes('skillfully dodged')) {
+          spawnCombatCallout('DODGED!', 'dmg-green', 'left');
+        } else if (latestText.includes('struck your shields')) {
+          shakeHoloVessel('holo-player-ship');
+        }
+      }
+      lastCombatLogSignature = sig;
 
       // Result dismissal
       const resBox = document.getElementById('combat-result-box');
@@ -8542,8 +8757,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     function triggerCombatFx(actionType) {
       const arena = document.getElementById('combat-holo-arena');
       const overlay = document.getElementById('holo-fx-overlay');
-      const floatBox = document.getElementById('holo-float-text');
-      const enemyShip = document.getElementById('holo-enemy-ship');
       const playerShip = document.getElementById('holo-player-ship');
       if (!arena || !overlay) return;
 
@@ -8551,62 +8764,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const h = arena.clientHeight || 160;
 
       if (actionType === 'fire' || actionType.startsWith('target_')) {
-        // High-energy laser pulse from player to enemy
+        // High-energy laser pulse from player to enemy (result callout comes from server log)
         overlay.innerHTML = `
           <line x1="110" y1="${h / 2}" x2="${w - 110}" y2="${h / 2}" stroke="#00e5ff" stroke-width="3" class="laser-beam" stroke-linecap="round" />
           <line x1="110" y1="${h / 2 - 8}" x2="${w - 110}" y2="${h / 2 - 8}" stroke="#7986cb" stroke-width="2" class="laser-beam" stroke-linecap="round" />
         `;
-        setTimeout(() => {
-          if (enemyShip) {
-            enemyShip.classList.add('shake-anim');
-            setTimeout(() => enemyShip.classList.remove('shake-anim'), 400);
-          }
-          if (floatBox) {
-            const el = document.createElement('div');
-            el.className = 'dmg-float dmg-red';
-            el.style.right = '60px';
-            el.style.top = '25px';
-            el.textContent = actionType === 'fire' ? 'DIRECT HIT!' : 'SUBSYSTEM CRIT!';
-            floatBox.appendChild(el);
-            setTimeout(() => el.remove(), 1300);
-          }
-        }, 120);
         setTimeout(() => { overlay.innerHTML = ''; }, 500);
       } else if (actionType === 'missile') {
         overlay.innerHTML = `
           <line x1="110" y1="${h / 2 + 10}" x2="${w - 110}" y2="${h / 2}" stroke="#ffab00" stroke-width="4" stroke-dasharray="8 4" class="laser-beam" />
         `;
-        setTimeout(() => {
-          if (enemyShip) {
-            enemyShip.classList.add('shake-anim');
-            setTimeout(() => enemyShip.classList.remove('shake-anim'), 400);
-          }
-          if (floatBox) {
-            const el = document.createElement('div');
-            el.className = 'dmg-float dmg-red';
-            el.style.right = '60px';
-            el.style.top = '20px';
-            el.textContent = '💥 TORPEDO DETONATION!';
-            floatBox.appendChild(el);
-            setTimeout(() => el.remove(), 1300);
-          }
-        }, 150);
         setTimeout(() => { overlay.innerHTML = ''; }, 500);
-      } else if (actionType === 'flee') {
+      } else if (actionType === 'evade' || actionType === 'flee') {
         if (playerShip) {
-          playerShip.style.transform = 'scale(0.8) translateX(-20px)';
-          setTimeout(() => { playerShip.style.transform = ''; }, 500);
+          playerShip.style.transform = actionType === 'flee' ? 'scale(0.8) translateX(-20px)' : 'translateY(-10px)';
+          setTimeout(() => { playerShip.style.transform = ''; }, 450);
         }
       }
     }
 
     function sendCombatAction(combat_action) {
       triggerCombatFx(combat_action);
-      sendAction('combat_action', { combat_action });
+      return sendAction('combat_action', { combat_action });
     }
 
     function dismissCombat() {
-      sendAction('dismiss_combat');
+      return sendAction('dismiss_combat');
     }
 
     // The combat overlay's primary button. A destroyed vessel cannot be
@@ -8616,9 +8799,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const btn = document.getElementById('combat-btn-dismiss');
       if (btn && btn.dataset.mode === 'recover') {
         showModal('gameover-modal');
-        return;
+        return Promise.resolve(null);
       }
-      sendAction('dismiss_combat');
+      return sendAction('dismiss_combat');
     }
 
     // --- Save / Load Dialog ---
@@ -8631,16 +8814,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
           let html = '';
           json.slots.forEach(s => {
             const info = s.info;
+            const isSystemSlot = (s.slot === 'autosave' || s.slot === 'precombat');
+            const slotLabel = s.slot === 'autosave'
+              ? 'Autosave (Auto Snapshot)'
+              : (s.slot === 'precombat'
+                  ? 'Pre-Combat (Recovery Snapshot)'
+                  : `Slot ${s.slot.toUpperCase()}`);
             html += `
               <div style="background: var(--bg2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px; display: flex; justify-content: space-between; align-items: center;">
                 <div>
-                  <div style="font-weight: 700; color: var(--cyan);">Slot ${s.slot.toUpperCase()}</div>
+                  <div style="font-weight: 700; color: var(--cyan);">${escHtml(slotLabel)}</div>
                   <div style="font-size: 11px; color: var(--fg-dim);">
                     ${s.exists && info ? `${escHtml(info.name)} · Day ${escHtml(info.day)} · ${escHtml(info.location)} · ${Number(info.credits || 0).toLocaleString()} CR` : 'Empty Save Slot'}
                   </div>
                 </div>
                 <div style="display: flex; gap: 6px;">
-                  <button class="btn-action-sm btn-buy" onclick="saveGame('${s.slot}')">Save</button>
+                  ${isSystemSlot ? '' : `<button class="btn-action-sm btn-buy" onclick="saveGame('${s.slot}')">Save</button>`}
                   <button class="btn-action-sm btn-sell" ${!s.exists ? 'disabled' : ''} onclick="loadGame('${s.slot}')">Load</button>
                 </div>
               </div>
@@ -8833,9 +9022,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     // --- Keyboard Shortcuts ---
     window.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') {
-        // Enter confirms the amount modal while typing in it.
+        // Enter confirms the amount or trade modal while typing in it.
         if (e.key === 'Enter' && document.getElementById('amount-modal').classList.contains('active')) {
           confirmAmountModal();
+        } else if (e.key === 'Enter' && document.getElementById('trade-modal').classList.contains('active')) {
+          executeTradeModal();
         }
         return;
       }
@@ -8867,6 +9058,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         if (e.key === 'e' || e.key === 'E') sendCombatAction('evade');
         if (e.key === 'd' || e.key === 'D') sendCombatAction('drones');
         if (e.key === 'b' || e.key === 'B') sendCombatAction('board');
+        if (e.key === 'w' || e.key === 'W') sendCombatAction('flee');
       } else if (combat && combat.is_finished && (e.key === 'Enter')) {
         dismissCombat();
       }
@@ -8934,23 +9126,30 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
         if qty > 0 and gid in COMMODITIES:
             comm = COMMODITIES[gid]
             sell_price = engine.get_sell_price(gid)
+            has_basis = gid in player.cargo_cost_basis
             cost_basis = player.cargo_cost_basis.get(gid, float(sell_price))
+            sellable = player.sellable_cargo(gid)
+            reserved = player.reserved_cargo(gid)
             unit_profit = sell_price - cost_basis
-            profit_pct = round((unit_profit / max(1.0, cost_basis)) * 100.0, 1)
+            if cost_basis > 0:
+                profit_pct = round((unit_profit / cost_basis) * 100.0, 1)
+            else:
+                profit_pct = 100.0 if (has_basis and sell_price > 0) else 0.0
             cargo_detail.append({
                 "id": gid,
                 "name": comm.name,
                 "category": comm.category,
                 "qty": qty,
-                "reserved": player.reserved_cargo(gid),
-                "sellable": player.sellable_cargo(gid),
+                "reserved": reserved,
+                "sellable": sellable,
                 "base_price": comm.base_price,
                 "sell_price": sell_price,
+                "has_cost_basis": has_basis,
                 "cost_basis": round(cost_basis, 1),
                 "unit_profit": round(unit_profit, 1),
                 "profit_pct": profit_pct,
-                "total_profit": int(round(unit_profit * qty)),
-                "total_value": sell_price * qty,
+                "total_profit": int(round(unit_profit * sellable)),
+                "total_value": sell_price * sellable,
                 "is_contraband": comm.is_contraband,
                 "desc": comm.desc,
                 "icon": comm.icon,
@@ -9046,9 +9245,17 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
         avg_price = sum(history) / len(history) if history else comm.base_price
         pct_diff = round(((buy_p - comm.base_price) / max(1, comm.base_price)) * 100.0, 1)
 
-        p_cost_basis = round(player.cargo_cost_basis.get(gid, 0.0), 1) if p_qty > 0 else 0.0
-        p_unit_profit = round(sell_p - p_cost_basis, 1) if (p_qty > 0 and p_cost_basis > 0) else 0.0
-        p_profit_pct = round((p_unit_profit / max(1.0, p_cost_basis)) * 100.0, 1) if (p_qty > 0 and p_cost_basis > 0) else 0.0
+        has_basis = (p_qty > 0 and gid in player.cargo_cost_basis)
+        p_cost_basis = round(player.cargo_cost_basis.get(gid, 0.0), 1) if has_basis else 0.0
+        p_unit_profit = round(sell_p - p_cost_basis, 1) if has_basis else 0.0
+        if has_basis:
+            p_profit_pct = (
+                round((p_unit_profit / p_cost_basis) * 100.0, 1)
+                if p_cost_basis > 0
+                else (100.0 if sell_p > 0 else 0.0)
+            )
+        else:
+            p_profit_pct = 0.0
 
         market_items.append({
             "id": gid,
@@ -9061,6 +9268,7 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "player_qty": p_qty,
             "reserved_qty": player.reserved_cargo(gid),
             "sellable_qty": player.sellable_cargo(gid),
+            "has_cost_basis": has_basis,
             "cost_basis": p_cost_basis,
             "unit_profit": p_unit_profit,
             "profit_pct": p_profit_pct,
@@ -9199,7 +9407,7 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "turn_count": c.turn_count,
             "drones_active": c.drones_active,
             "evasive_active": c.evasive_until_turn >= c.turn_count,
-            "combat_log": c.combat_log[-12:],
+            "combat_log": c.combat_log[-18:],
             "is_finished": c.is_finished,
             "player_won": c.player_won,
             "player_escaped": c.player_escaped,
@@ -9219,6 +9427,7 @@ def serialize_game_state(session: GameSession) -> Dict[str, Any]:
             "player_evasion_pct": int(round(engine.player.evasion_chance() * 100)),
             "is_bounty": c.is_bounty,
             "bounty_reward": c.bounty_reward,
+            "bounty_mission_id": c.bounty_mission_id,
             "threat_level": c.threat_level(),
             "enemy_damage_lo": c.enemy_damage_range[0],
             "enemy_damage_hi": c.enemy_damage_range[1],
@@ -9797,8 +10006,34 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def _reject_post(self, status: int, message: str) -> None:
+        """Send an error JSON for an early POST rejection, half-close write
+        side, and drain a bounded unread request body so TCP close() never
+        emits an RST before the client reads the error response."""
+        self._fail(status, message)
+        raw_cl = self.headers.get("Content-Length", "").strip()
+        drain_limit = 0
+        if raw_cl.isascii() and raw_cl.isdecimal():
+            try:
+                drain_limit = min(int(raw_cl), MAX_BODY_BYTES * 2)
+            except ValueError:
+                drain_limit = 0
+        try:
+            self.connection.shutdown(socket.SHUT_WR)
+            if drain_limit > 0:
+                self.connection.settimeout(0.1)
+                remaining = drain_limit
+                while remaining > 0:
+                    chunk = self.rfile.read1(min(8192, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+        except OSError:
+            pass
+
     def _handle_get(self) -> None:
-        path = urllib.parse.urlparse(self.path).path
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
 
         if path == "/favicon.ico":
             self.send_response(204)
@@ -9825,8 +10060,10 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
                 payload = {"success": True, "state": serialize_game_state(session)}
             self._json(payload)
         elif path == "/api/routes":
+            qs = urllib.parse.parse_qs(parsed.query)
+            from_cur = qs.get("from_current", [""])[0].lower() in ("1", "true", "yes")
             with session.lock:
-                routes = session.engine.compute_best_trade_routes()[:12]
+                routes = session.engine.compute_best_trade_routes(from_current_only=from_cur)[:12]
             self._json({"success": True, "routes": routes})
         elif path == "/api/saves":
             with session.lock:
@@ -9844,12 +10081,12 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_post(self) -> None:
         if urllib.parse.urlparse(self.path).path != "/api/action":
-            self._fail(404, "Unknown endpoint.")
+            self._reject_post(404, "Unknown endpoint.")
             return
 
         # Cross-site requests from other web pages are never legitimate.
         if self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
-            self._fail(403, "Cross-site requests are not allowed.")
+            self._reject_post(403, "Cross-site requests are not allowed.")
             return
 
         # Browsers set Origin on fetch/XHR POSTs. When present, require the
@@ -9864,49 +10101,36 @@ class SpaceTraderWebHandler(http.server.BaseHTTPRequestHandler):
                     or parsed_origin.path not in ("",) or parsed_origin.query
                     or parsed_origin.fragment or parsed_origin.username
                     or parsed_origin.password):
-                self._fail(403, "Origin does not match this game server.")
+                self._reject_post(403, "Origin does not match this game server.")
                 return
 
         # Reject transfer encodings and repeated Content-Length headers before
         # reading a body, avoiding ambiguous framing and request-smuggling cases.
         if self.headers.get("Transfer-Encoding") is not None:
-            self._fail(400, "Transfer-Encoding is not supported.")
+            self._reject_post(400, "Transfer-Encoding is not supported.")
             return
         content_lengths = self.headers.get_all("Content-Length", [])
         if len(content_lengths) != 1:
-            self._fail(411, "Exactly one Content-Length header is required.")
+            self._reject_post(411, "Exactly one Content-Length header is required.")
             return
 
         content_type = self.headers.get("Content-Type", "")
         media_type = content_type.split(";", 1)[0].strip().lower()
         if media_type != "application/json":
-            self._fail(415, "Content-Type must be application/json.")
+            self._reject_post(415, "Content-Type must be application/json.")
             return
 
         raw_length = content_lengths[0].strip()
         if not raw_length.isascii() or not raw_length.isdecimal():
-            self._fail(400, "Invalid Content-Length.")
+            self._reject_post(400, "Invalid Content-Length.")
             return
         try:
             length = int(raw_length)
         except ValueError:
-            self._fail(400, "Invalid Content-Length.")
+            self._reject_post(400, "Invalid Content-Length.")
             return
         if length > MAX_BODY_BYTES:
-            self._fail(413, "Request body too large.")
-            # Half-close write side and drain bounded unread payload so Linux
-            # TCP close() does not send an RST before the client reads the 413 JSON.
-            try:
-                self.connection.shutdown(socket.SHUT_WR)
-                self.connection.settimeout(0.1)
-                remaining = min(length, MAX_BODY_BYTES * 2)
-                while remaining > 0:
-                    chunk = self.rfile.read1(min(8192, remaining))
-                    if not chunk:
-                        break
-                    remaining -= len(chunk)
-            except OSError:
-                pass
+            self._reject_post(413, "Request body too large.")
             return
 
         try:

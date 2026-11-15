@@ -807,6 +807,15 @@ class TestHttp(GameTestCase):
         [t.join() for t in ts]
         self.assertEqual(len({id(x) for x in seen}), 1)
 
+    def test_routes_from_current_query_param(self):
+        with urllib.request.urlopen(self.base + "/api/routes?from_current=1") as r:
+            self.assertEqual(r.status, 200)
+            payload = json.loads(r.read())
+        self.assertTrue(payload["success"])
+        cur_name = st.get_session().engine.current_planet.name
+        for route in payload["routes"]:
+            self.assertEqual(route["src"], cur_name)
+
     def test_death_leaves_the_player_able_to_recover_over_http(self):
         """Regression: a destroyed ship used to trap the player behind the
         combat overlay. The overlay's only button fired "dismiss_combat",
@@ -1122,6 +1131,116 @@ class TestEnhancementsAndFixes(GameTestCase):
         self.assertNotIn("Acc: ${w.accuracy}%", st.HTML_PAGE)
         self.assertNotIn("0.8% compound interest", st.HTML_PAGE)
         self.assertIn("openTradeModal('${escJs(c.id)}', 'sell', true)", st.HTML_PAGE)
+        self.assertIn('id="trade-qty-input"', st.HTML_PAGE)
+        self.assertIn('id="advisor-from-current"', st.HTML_PAGE)
+        self.assertIn("/api/routes' + fromCurrent", st.HTML_PAGE)
+        self.assertIn("e.key === 'w' || e.key === 'W'", st.HTML_PAGE)
+        self.assertIn("Autosave (Auto Snapshot)", st.HTML_PAGE)
+
+    def test_combat_log_records_turns_and_caps_history(self):
+        e = self.e
+        e.player.hull = 500
+        e.player.max_hull = 500
+        combat = st.CombatEncounter(e, "Raider", "viper")
+        combat.player_action("recharge")
+        self.assertTrue(any(line.startswith("— Turn 1 —") for line in combat.combat_log))
+        for _ in range(24):
+            if combat.is_finished:
+                break
+            combat.player_action("recharge")
+        self.assertLessEqual(len(combat.combat_log), 60)
+
+    def test_bounty_mission_id_isolates_duplicate_target_names(self):
+        s = st.GameSession(difficulty="normal", player_name="Hunter")
+        e = s.engine
+        m1 = st.Mission(
+            id="bnt_dup_1", title="Wanted: Red Claw", m_type="bounty",
+            origin="Mars", destination="Earth",
+            cargo_good=None, cargo_qty=0,
+            bounty_target_name="Red Claw", bounty_target_ship="viper",
+            reward_credits=2_000, days_left=10, desc="Eliminate Red Claw near Earth.",
+        )
+        m2 = st.Mission(
+            id="bnt_dup_2", title="Wanted: Red Claw", m_type="bounty",
+            origin="Titan", destination="Earth",
+            cargo_good=None, cargo_qty=0,
+            bounty_target_name="Red Claw", bounty_target_ship="viper",
+            reward_credits=4_000, days_left=10, desc="Eliminate Red Claw near Earth.",
+        )
+        e.player.active_missions.extend([m1, m2])
+        resp = st.handle_action(s, {"action": "engage_bounty", "mission_id": "bnt_dup_2"})
+        self.assertTrue(resp["success"])
+        self.assertEqual(s.active_combat.bounty_mission_id, "bnt_dup_2")
+        s.active_combat.enemy_hull = 0
+        s.active_combat._victory()
+        remaining_ids = [m.id for m in e.player.active_missions]
+        self.assertEqual(remaining_ids, ["bnt_dup_1"])
+
+    def test_faction_event_stock_bump_updates_history_in_place(self):
+        e = self.e
+        target_planet = next(p for p in e.planets.values() if p.faction in st.FACTION_STOCK_LINK)
+        sym = st.FACTION_STOCK_LINK[target_planet.faction]
+        stk = e.stocks[sym]
+        # Force deterministic positive event on that world and advance one day
+        target_planet.active_event = st.PlanetEvent(
+            name="Industrial Boom", good="ore", mult=1.4,
+            duration=5, desc="Strong demand", fresh=True,
+        )
+        hist_len_before = len(stk.history)
+        e.advance_day(1)
+        expected_len = min(30, hist_len_before + 1)
+        self.assertEqual(len(stk.history), expected_len)
+        self.assertEqual(stk.history[-1], stk.price)
+
+    def test_t800_repairs_hull_and_subsystems_overnight(self):
+        e = self.e
+        e.player.hired_crew = ["t800"]
+        e.player.hull = 50
+        e.player.max_hull = 100
+        e.player.weapons_damaged = True
+        e.player.shields_damaged = True
+        e.advance_day(1)
+        self.assertEqual(e.player.hull, 54)
+        self.assertFalse(e.player.weapons_damaged)
+        self.assertTrue(e.player.shields_damaged)
+        e.advance_day(1)
+        self.assertFalse(e.player.shields_damaged)
+
+    def test_repay_and_faction_gift_check_achievements_immediately(self):
+        e = self.e
+        e.player.credits = 100_000
+        e.player.loan = 50_000
+        ok, _ = e.repay(50_000)
+        self.assertTrue(ok)
+        self.assertIn("debt_slayer", e.player.achievements)
+
+        e.player.reputation["Sol Federation"] = 72
+        ok, _ = e.faction_gift("Sol Federation", 2_000)
+        self.assertTrue(ok)
+        self.assertIn("trusted_ally", e.player.achievements)
+
+    def test_cargo_detail_zero_cost_basis_and_sealed_contracts(self):
+        s = st.GameSession(difficulty="normal", player_name="Salvager")
+        e = s.engine
+        # Add 3 sealed units via delivery mission + 2 zero-cost salvaged units
+        m = st.Mission(
+            id="del_val", title="Haul Ore", m_type="delivery",
+            origin="Earth", destination="Mars",
+            cargo_good="ore", cargo_qty=3,
+            bounty_target_name="", bounty_target_ship="",
+            reward_credits=900, days_left=8, desc="Deliver 3 ore.",
+        )
+        e.player.active_missions.append(m)
+        e.player.cargo["ore"] = 5
+        e.player.cargo_cost_basis["ore"] = 0.0
+        snap = st.serialize_game_state(s)
+        detail = next(c for c in snap["player"]["cargo_detail"] if c["id"] == "ore")
+        self.assertEqual(detail["sellable"], 2)
+        self.assertEqual(detail["reserved"], 3)
+        self.assertTrue(detail["has_cost_basis"])
+        self.assertEqual(detail["profit_pct"], 100.0)
+        self.assertEqual(detail["total_value"], detail["sell_price"] * 2)
+        self.assertEqual(detail["total_profit"], detail["sell_price"] * 2)
 
 
 if __name__ == "__main__":
