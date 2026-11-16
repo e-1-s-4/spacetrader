@@ -1,5 +1,5 @@
 # Space Trader: Odyssey — Nebula Edition
-
+<iframe width="849" height="477" src="https://www.youtube.com/embed/uYgGsZUHogs" title="idkyk" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
 A single-file science-fiction trading, exploration and tactical-combat RPG. The
 engine, economy, combat, persistence, HTTP API and browser client all live in
 **`spacetrader.py`**. Runtime dependencies: the Python standard library only.
@@ -11,6 +11,7 @@ python3 spacetrader.py                      # http://127.0.0.1:3000
 python3 spacetrader.py --port 8080 --player "Nova" --difficulty hard --seed 42
 python3 spacetrader.py --version
 ```
+<img width="1180" height="441" alt="image" src="https://github.com/user-attachments/assets/e2bd3301-9aff-4a3d-9b2a-04a1c121fc77" />
 
 Goal: reach **500,000 CR** net worth by trading, contracts, investing and combat.
 `--difficulty` is `easy`, `normal`, `hard` or `nightmare`. Saves live next to the
