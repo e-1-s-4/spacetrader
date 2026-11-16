@@ -1,9 +1,5 @@
 # Space Trader: Odyssey — Nebula Edition
-
-
-https://github.com/user-attachments/assets/e3ff4aa2-4382-42ec-ac9e-0296c82e538b
-
-
+<img width="1280" height="720" alt="y" src="https://www.youtube.com/watch?v=uYgGsZUHogs" />
 A single-file science-fiction trading, exploration and tactical-combat RPG. The
 engine, economy, combat, persistence, HTTP API and browser client all live in
 **`spacetrader.py`**. Runtime dependencies: the Python standard library only.
